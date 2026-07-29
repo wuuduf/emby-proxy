@@ -32,6 +32,8 @@ sudo ./setup-emby-proxy.sh
 2. 对外访问域名，例如 `emby.example.com`；
 3. Emby 源站，例如 `origin.example.com`、`https://origin.example.com` 或 `http://1.2.3.4:8096`。
 
+如果输入的域名已经是一个手工配置的 Caddy 站点，脚本会先要求输入 `/a`、`/emby2` 等非根路径，检查与现有路径没有重叠后，再询问 Emby 源站。原站点的 `/`、证书、其他指令和日志设置保持不变。
+
 输入根路径源站后，可以继续添加任意数量的路径源站，例如：
 
 ```text
@@ -52,7 +54,7 @@ sudo ./setup-emby-proxy.sh
 - 如果两种服务同时运行，为避免误伤现有站点，脚本会停止并要求先人工确认入口关系；
 - 非交互运行时，`--engine` 表示明确同意复用对应的现有服务。
 
-复用现有服务时，脚本不会覆盖其他站点：Caddy 为每个域名维护独立托管块，Nginx 为每个域名维护独立的 `emby-proxy-域名.conf`。重复运行同一域名只更新该域名；运行另一个域名会保留此前由脚本创建的站点。如果目标域名已经出现在其他配置中，或者完整配置验证失败，脚本会在 reload 前停止；reload 失败则自动恢复备份。
+复用现有服务时，脚本不会覆盖其他站点：Caddy 为每个新域名维护独立托管块；如果域名已经有且只能定位到一个明确的顶层 Caddy 站点块，则按“域名 + 路径”维护独立片段。Nginx 为每个域名维护独立的 `emby-proxy-域名.conf`。完整配置验证失败时不会 reload；reload 失败则自动恢复备份。
 
 旧版本生成的 Caddy 单一托管块会在该域名下次更新时自动转换成带域名的托管块；旧版 Nginx `emby-proxy-managed.conf` 会先原样备份并迁移为每域名文件，再进行更新。
 
@@ -68,6 +70,18 @@ sudo ./setup-emby-proxy.sh \
   --domain emby.example.com \
   --upstream origin.example.com
 ```
+
+向一个已经存在的 Caddy 域名追加 `/emby2`，不会接管原来的根路径：
+
+```bash
+sudo ./setup-emby-proxy.sh \
+  --engine caddy \
+  --domain existing.example.com \
+  --path /emby2 \
+  --upstream https://origin.example.com
+```
+
+只有在域名能唯一定位到 `/etc/caddy` 下的一个显式顶层站点块、路径不是 `/` 且没有与已有路径重叠时，脚本才会自动插入。目标文件会先备份，随后对主 `/etc/caddy/Caddyfile` 做完整验证；验证或 reload 失败都会恢复。复杂、重复或无法唯一定位的配置会安全停止。
 
 Nginx：
 
@@ -114,6 +128,8 @@ curl -fsS https://emby.example.com/_emby_proxy_health
 
 正常返回 `ok` 和 HTTP 200。这个地址不会连接任意外部目标，也不会暴露源站信息；它表示代理入口与证书可用，不等同于每个 Emby 源站的持续健康状态。安装时脚本仍会逐个探测源站，并逐路径完成一次端到端验证。
 
+追加到已有 Caddy 域名时，健康地址跟随新增路径，例如 `/emby2/_emby_proxy_health`，避免占用原站点的根级健康路径。
+
 详细访问日志位置：
 
 - Caddy：`/var/log/caddy/emby-proxy-域名-access.log`，JSON 格式，100 MiB 轮转，最多保留 5 个历史文件/30 天；
@@ -132,6 +148,8 @@ sudo tail -F /var/log/nginx/emby-proxy-emby.example.com-access.log \
 ```
 
 Nginx 日志只记录 `$uri`，不记录查询参数；Caddy 会隐藏常见 `api_key`、`token`、`X-Emby-Token` 和 `X-MediaBrowser-Token`。日志仍可能包含客户端 IP、媒体 ID 等运维信息，文件权限默认为 `0640`，不要公开分享原始日志。
+
+向手工配置的现有 Caddy 域名追加路径时，脚本沿用该站点原来的日志设置，不会为了单个路径擅自改变整站日志。
 
 ## URL 改写范围
 
@@ -160,7 +178,8 @@ Nginx 日志只记录 `$uri`，不记录查询参数；Caddy 会隐藏常见 `ap
 - 检查 80/443 端口冲突，避免覆盖另一种 Web 服务；
 - 运行前识别已有 Caddy/Nginx，并优先安全复用已有服务；
 - 支持连续管理多个反代域名，更新一个域名时保留其他脚本托管站点，并兼容迁移旧版单域名配置；
-- 检测目标域名是否已存在于其他站点配置，避免覆盖或重复 `server_name`；
+- 已有手工 Caddy 域名可追加独立非根路径；自动定位唯一站点块、检查路径重叠，并按“域名 + 路径”幂等更新；
+- 无法安全定位、根路径接管、路径重叠或重复站点会被拒绝；
 - 自动为启用中的 UFW/firewalld 放行 TCP 80/443；
 - 修改前备份配置；
 - 使用 `caddy validate` 或 `nginx -t` 验证后才 reload；
@@ -206,7 +225,7 @@ Nginx 日志只记录 `$uri`，不记录查询参数；Caddy 会隐藏常见 `ap
 bash tests/test-config-generation.sh
 ```
 
-测试会检查多域名互不覆盖、旧 Caddy 标记迁移、Nginx 每域名变量隔离、ACME 阶段没有明文 `proxy_pass`、`X-Forwarded-For` 防伪造，以及子路径响应头改写幂等性。如果本机已安装 Caddy，还会额外执行完整 Caddy 配置验证；正式部署仍会在 reload 前运行 VPS 上的 `caddy validate` 或 `nginx -t`。
+测试会检查已有 Caddy 站点路径插入及更新、路径冲突拒绝、多域名互不覆盖、旧 Caddy 标记迁移、Nginx 每域名变量隔离、ACME 阶段没有明文 `proxy_pass`、`X-Forwarded-For` 防伪造，以及子路径响应头改写幂等性。如果本机已安装 Caddy，还会额外执行完整 Caddy 配置验证；正式部署仍会在 reload 前运行 VPS 上的 `caddy validate` 或 `nginx -t`。
 
 ## 手动恢复
 
@@ -217,6 +236,8 @@ sudo cp /etc/caddy/Caddyfile.bak-日期时间 /etc/caddy/Caddyfile
 sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 sudo systemctl reload caddy
 ```
+
+如果路径被加入某个导入的 `.caddy`/`.conf` 文件，备份会保存在该文件旁边，脚本完成时会输出准确路径；恢复该文件后仍使用主 `/etc/caddy/Caddyfile` 执行验证和 reload。
 
 Nginx 备份按域名保存，例如 `/etc/nginx/conf.d/emby-proxy-emby.example.com.conf.bak-日期时间`：
 

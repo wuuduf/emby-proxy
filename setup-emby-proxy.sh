@@ -19,6 +19,7 @@ HAS_NGINX=0
 CADDY_ACTIVE=0
 NGINX_ACTIVE=0
 PROXY_DOMAIN=""
+PRIMARY_ROUTE_INPUT=""
 UPSTREAM_INPUT=""
 UPSTREAM_URL=""
 UPSTREAM_HOST=""
@@ -28,6 +29,10 @@ NGINX_ID=""
 NGINX_CONFIG=""
 CADDY_ACCESS_LOG=""
 NGINX_ACCESS_LOG=""
+CADDY_ATTACH_EXISTING=0
+CADDY_EXISTING_SITE_FILE=""
+CADDY_EXISTING_SITE_OPEN_LINE=0
+CADDY_EXISTING_SITE_CLOSE_LINE=0
 declare -a ROUTE_SPECS=()
 declare -a ROUTE_PATHS=()
 declare -a ROUTE_INPUTS=()
@@ -55,6 +60,7 @@ usage() {
 选项：
   -e, --engine ENGINE       反代程序：caddy 或 nginx；不填写时交互选择
   -d, --domain DOMAIN       对外访问的反代域名（必须已解析到本 VPS）
+  -p, --path PATH           主源站的访问路径，默认 /；已有 Caddy 域名必须填写非根路径
   -u, --upstream ADDRESS    Emby 源站域名或 URL，可带端口
                             例如 origin.example.com、https://origin.example.com、http://1.2.3.4:8096
   -r, --route PATH=ADDRESS  增加一个路径源站，可重复使用；例如 /a=https://emby-a.example.com
@@ -72,6 +78,9 @@ while (($#)); do
     -d|--domain)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       PROXY_DOMAIN="$2"; shift 2 ;;
+    -p|--path)
+      [[ $# -ge 2 ]] || die "$1 缺少参数。"
+      PRIMARY_ROUTE_INPUT="$2"; shift 2 ;;
     -u|--upstream)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       UPSTREAM_INPUT="$2"; shift 2 ;;
@@ -92,6 +101,7 @@ require_root() {
     info "需要管理员权限，正在通过 sudo 重新运行……"
     [[ -n "$PROXY_ENGINE" ]] && sudo_args+=(--engine "$PROXY_ENGINE")
     [[ -n "$PROXY_DOMAIN" ]] && sudo_args+=(--domain "$PROXY_DOMAIN")
+    [[ -n "$PRIMARY_ROUTE_INPUT" ]] && sudo_args+=(--path "$PRIMARY_ROUTE_INPUT")
     [[ -n "$UPSTREAM_INPUT" ]] && sudo_args+=(--upstream "$UPSTREAM_INPUT")
     local route_spec
     for route_spec in "${ROUTE_SPECS[@]}"; do
@@ -234,7 +244,7 @@ confirm_existing_service() {
   if [[ ! -t 0 ]]; then
     die "检测到现有 $engine 服务。非交互运行时请显式添加 --engine $engine，确认在原服务上新增独立站点。"
   fi
-  printf '\n检测到现有 %s。是否在其原配置基础上新增 Emby 反代域名？[Y/n]：' "$engine"
+  printf '\n检测到现有 %s。是否在其原配置基础上新增 Emby 反代域名或路径？[Y/n]：' "$engine"
   read -r answer
   if [[ "$answer" =~ ^[Nn]$ ]]; then
     die "已取消。为避免影响现有服务，脚本不会自动改用另一套 Web 服务。"
@@ -328,8 +338,151 @@ select_proxy_engine() {
   fi
 }
 
+# 输出“起始行<TAB>结束行”。只接受顶层、显式写出域名且结束大括号独占一行的站点块；
+# 复杂或无法唯一定位的配置一律不自动修改。
+find_caddy_site_in_file() {
+  local source_file="$1" domain="$2"
+  awk -v wanted="$domain" '
+    function structural(s,    i,ch,q,esc,out) {
+      line_opens=0; line_closes=0; q=""; esc=0; out=""
+      for (i=1; i<=length(s); i++) {
+        ch=substr(s,i,1)
+        if (q != "") {
+          if (esc) { esc=0; continue }
+          if (ch == "\\" && q == "\"") { esc=1; continue }
+          if (ch == q) q=""
+          continue
+        }
+        if (ch == "#") break
+        if (ch == "\"" || ch == "`") { q=ch; continue }
+        out=out ch
+        if (ch == "{") line_opens++
+        else if (ch == "}") line_closes++
+      }
+      return out
+    }
+    function trim(s) { sub(/^[[:space:]]+/,"",s); sub(/[[:space:]]+$/,"",s); return s }
+    function header_has_domain(header,    n,i,a,t) {
+      gsub(/,/," ",header)
+      n=split(header,a,/[[:space:]]+/)
+      for (i=1; i<=n; i++) {
+        t=a[i]
+        sub(/^https?:\/\//,"",t)
+        sub(/:[0-9]+$/,"",t)
+        if (t == wanted) return 1
+      }
+      return 0
+    }
+    {
+      clean=structural($0)
+      before=depth
+      if (!found && before == 0 && line_opens > 0) {
+        header=clean
+        sub(/\{.*/,"",header)
+        header=trim(header)
+        if (header_has_domain(header)) { found=1; start=NR }
+      }
+      depth += line_opens-line_closes
+      if (found && depth == 0) {
+        closing=clean
+        closing=trim(closing)
+        if (start == NR || closing != "}") exit 4
+        print start "\t" NR
+        exit
+      }
+      if (depth < 0) exit 5
+    }
+    END { if (found && depth != 0) exit 6 }
+  ' "$source_file"
+}
+
+caddy_domain_is_script_managed() {
+  local domain_begin legacy_domain
+  [[ -f "$CADDYFILE" ]] || return 1
+  domain_begin="$(caddy_domain_begin_marker)"
+  grep -Fx "$domain_begin" "$CADDYFILE" >/dev/null 2>&1 && return 0
+  legacy_domain="$(legacy_caddy_managed_domain "$CADDYFILE")"
+  [[ "$legacy_domain" == "$PROXY_DOMAIN" ]]
+}
+
+locate_existing_caddy_site() {
+  local scan_root="${CADDY_SCAN_ROOT:-/etc/caddy}" file location matches=0
+  CADDY_EXISTING_SITE_FILE=""
+  CADDY_EXISTING_SITE_OPEN_LINE=0
+  CADDY_EXISTING_SITE_CLOSE_LINE=0
+  [[ -d "$scan_root" ]] || return 1
+  while IFS= read -r -d '' file; do
+    location="$(find_caddy_site_in_file "$file" "$PROXY_DOMAIN" 2>/dev/null || true)"
+    [[ -n "$location" ]] || continue
+    ((matches+=1))
+    CADDY_EXISTING_SITE_FILE="$file"
+    CADDY_EXISTING_SITE_OPEN_LINE="${location%%$'\t'*}"
+    CADDY_EXISTING_SITE_CLOSE_LINE="${location##*$'\t'}"
+  done < <(find "$scan_root" -type f \( -name 'Caddyfile' -o -name '*.caddy' -o -name '*.conf' \) \
+    ! -name '*.bak-*' ! -name 'Caddyfile.candidate.*' -print0 2>/dev/null)
+  [[ $matches -eq 1 ]] || {
+    if (( matches > 1 )); then
+      die "域名 $PROXY_DOMAIN 出现在多个可修改的 Caddy 站点块中，无法安全确定目标文件。"
+    fi
+    return 1
+  }
+}
+
+existing_caddy_route_begin_marker() { printf '# BEGIN MANAGED EMBY EXISTING ROUTE: %s %s' "$PROXY_DOMAIN" "$1"; }
+existing_caddy_route_end_marker()   { printf '# END MANAGED EMBY EXISTING ROUTE: %s %s' "$PROXY_DOMAIN" "$1"; }
+
+existing_caddy_route_is_managed() {
+  local route_path="$1" marker
+  marker="$(existing_caddy_route_begin_marker "$route_path")"
+  grep -Fx "$marker" "$CADDY_EXISTING_SITE_FILE" >/dev/null 2>&1
+}
+
+check_existing_caddy_route_conflict() {
+  local route_path="$1" token base conflict="" scan_file location open_line close_line temp=""
+  scan_file="$CADDY_EXISTING_SITE_FILE"
+  if existing_caddy_route_is_managed "$route_path"; then
+    temp="$(mktemp /tmp/emby-caddy-conflict.XXXXXX)"
+    strip_existing_caddy_route_block "$scan_file" "$temp" "$route_path"
+    scan_file="$temp"
+    location="$(find_caddy_site_in_file "$scan_file" "$PROXY_DOMAIN" 2>/dev/null || true)"
+    [[ -n "$location" ]] || { rm -f "$temp"; die "移除旧托管路径后无法重新定位 Caddy 站点。"; }
+    open_line="${location%%$'\t'*}"
+    close_line="${location##*$'\t'}"
+  else
+    open_line="$CADDY_EXISTING_SITE_OPEN_LINE"
+    close_line="$CADDY_EXISTING_SITE_CLOSE_LINE"
+  fi
+  while IFS= read -r token; do
+    [[ "$token" == //* ]] && continue
+    token="${token%\*}"
+    while [[ "$token" != "/" && "$token" == */ ]]; do token="${token%/}"; done
+    [[ "$token" != "/" && -n "$token" ]] || continue
+    base="$token"
+    if [[ "$route_path" == "$base" || "$route_path" == "$base"/* || "$base" == "$route_path"/* ]]; then
+      conflict="$token"
+      break
+    fi
+  done < <(
+    sed -n "${open_line},${close_line}p" "$scan_file" |
+      sed 's/[[:space:]]*#.*$//' | grep -Eo '/[A-Za-z0-9._~*/-]+' || true
+  )
+  [[ -z "$temp" ]] || rm -f "$temp"
+  [[ -z "$conflict" ]] || \
+    die "已有 Caddy 站点 $PROXY_DOMAIN 中检测到与 $route_path 重叠的路径 $conflict。为避免覆盖原路由，脚本已停止。"
+}
+
+detect_existing_caddy_domain_mode() {
+  [[ "$PROXY_ENGINE" == "caddy" && -f "$CADDYFILE" ]] || return 0
+  caddy_domain_is_script_managed && return 0
+  if locate_existing_caddy_site; then
+    CADDY_ATTACH_EXISTING=1
+    info "域名 $PROXY_DOMAIN 已存在于 $CADDY_EXISTING_SITE_FILE。"
+    info "将只在该站点内新增独立非根路径，不会替换原站点或原有根路径。"
+  fi
+}
+
 prompt_inputs() {
-  local interactive_upstream=0
+  local interactive_upstream=0 primary_route="/" i
   select_proxy_engine
 
   if [[ -z "$PROXY_DOMAIN" ]]; then
@@ -338,6 +491,20 @@ prompt_inputs() {
     read -r PROXY_DOMAIN
   fi
   normalize_proxy_domain "$PROXY_DOMAIN"
+  detect_existing_caddy_domain_mode
+
+  if (( CADDY_ATTACH_EXISTING )); then
+    if [[ -z "$PRIMARY_ROUTE_INPUT" ]]; then
+      [[ -t 0 ]] || die "域名已存在。非交互运行时必须使用 --path /a 指定要新增的非根路径。"
+      printf '%s请输入要添加到现有域名的访问路径%s（例如 /a 或 /emby2）：' "$BOLD" "$RESET"
+      read -r PRIMARY_ROUTE_INPUT
+    fi
+    primary_route="$(normalize_route_path "$PRIMARY_ROUTE_INPUT")"
+    [[ "$primary_route" != "/" ]] || die "已有域名不能自动接管根路径 /，请使用 /a、/emby2 等独立路径。"
+  elif [[ -n "$PRIMARY_ROUTE_INPUT" ]]; then
+    primary_route="$(normalize_route_path "$PRIMARY_ROUTE_INPUT")"
+    [[ "$primary_route" == "/" ]] || die "--path 的非根路径模式仅用于向已有 Caddy 域名追加路由；新域名主源站固定使用 /。"
+  fi
 
   if [[ -z "$UPSTREAM_INPUT" ]]; then
     [[ -t 0 ]] || die "非交互环境请使用 --engine、--domain 和 --upstream。"
@@ -346,7 +513,7 @@ prompt_inputs() {
     interactive_upstream=1
   fi
 
-  ROUTE_PATHS=("/")
+  ROUTE_PATHS=("$primary_route")
   ROUTE_INPUTS=("$UPSTREAM_INPUT")
 
   if [[ -t 0 && $interactive_upstream -eq 1 ]]; then
@@ -363,6 +530,12 @@ prompt_inputs() {
     done
   fi
   parse_route_specs
+  if (( CADDY_ATTACH_EXISTING )); then
+    for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
+      [[ "${ROUTE_PATHS[$i]}" != "/" ]] || die "已有 Caddy 域名只能新增非根路径。"
+      check_existing_caddy_route_conflict "${ROUTE_PATHS[$i]}"
+    done
+  fi
 }
 
 normalize_route_path() {
@@ -372,6 +545,10 @@ normalize_route_path() {
   [[ "$value" == /* ]] || value="/$value"
   while [[ "$value" != "/" && "$value" == */ ]]; do value="${value%/}"; done
   [[ ${#value} -le 128 ]] || die "路径过长：$value"
+  if [[ "$value" == "/" ]]; then
+    printf '/'
+    return
+  fi
   [[ "$value" =~ ^/([A-Za-z0-9._~-]+/)*[A-Za-z0-9._~-]+$ ]] || \
     die "路径格式无效：$value。只允许字母、数字、点、下划线、波浪线、连字符和斜杠。"
   lower="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
@@ -943,7 +1120,9 @@ show_plan() {
   local i
   printf '\n%s即将应用以下配置：%s\n' "$BOLD" "$RESET"
   printf '  反代程序： %s\n' "$PROXY_ENGINE"
-  if (( USING_EXISTING_SERVICE )); then
+  if (( CADDY_ATTACH_EXISTING )); then
+    printf '  部署方式： 保留现有 Caddy 域名，仅新增/更新独立路径\n'
+  elif (( USING_EXISTING_SERVICE )); then
     printf '  部署方式： 复用现有服务，仅新增/更新脚本托管站点\n'
   else
     printf '  部署方式： 未发现现有服务，将全新安装\n'
@@ -953,11 +1132,15 @@ show_plan() {
   for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
     printf '    %-16s -> %s\n' "${ROUTE_PATHS[$i]}" "${ROUTE_URLS[$i]}"
   done
-  if [[ ${#ROUTE_PATHS[@]} -gt 1 ]]; then
+  if [[ ${#ROUTE_PATHS[@]} -gt 1 || "${ROUTE_PATHS[0]}" != "/" ]]; then
     warn "子路径会在回源前被剥离。Emby Web 通常可测试使用，但部分原生客户端或 Emby Connect 可能不支持额外子路径。"
   fi
   if [[ "$PROXY_ENGINE" == "caddy" ]]; then
-    printf '  配置文件： %s（会先创建带时间戳备份）\n\n' "$CADDYFILE"
+    if (( CADDY_ATTACH_EXISTING )); then
+      printf '  配置文件： %s（仅修改对应站点块，会先创建带时间戳备份）\n\n' "$CADDY_EXISTING_SITE_FILE"
+    else
+      printf '  配置文件： %s（会先创建带时间戳备份）\n\n' "$CADDYFILE"
+    fi
   else
     printf '  配置文件： %s（会先创建带时间戳备份）\n\n' "$NGINX_CONFIG"
   fi
@@ -1046,6 +1229,75 @@ emit_caddy_header_rewrites() {
   fi
 }
 
+strip_existing_caddy_route_block() {
+  local source_file="$1" target_file="$2" route_path="$3" begin end begins ends
+  begin="$(existing_caddy_route_begin_marker "$route_path")"
+  end="$(existing_caddy_route_end_marker "$route_path")"
+  begins="$(grep -cFx "$begin" "$source_file" 2>/dev/null || true)"
+  ends="$(grep -cFx "$end" "$source_file" 2>/dev/null || true)"
+  [[ "$begins" == "$ends" && "$begins" -le 1 ]] || \
+    die "路径 $route_path 的脚本托管标记不完整或重复，请检查 $CADDY_EXISTING_SITE_FILE。"
+  awk -v begin="$begin" -v end="$end" '
+    $0 == begin { skipping=1; next }
+    skipping && $0 == end { skipping=0; next }
+    !skipping { print }
+  ' "$source_file" >"$target_file"
+}
+
+emit_existing_caddy_route() {
+  local route_index="$1" route_path upstream upstream_host health_path begin end
+  route_path="${ROUTE_PATHS[$route_index]}"
+  upstream="${ROUTE_URLS[$route_index]}"
+  upstream_host="${ROUTE_HOSTS[$route_index]}"
+  health_path="${route_path}${HEALTH_PATH}"
+  begin="$(existing_caddy_route_begin_marker "$route_path")"
+  end="$(existing_caddy_route_end_marker "$route_path")"
+  cat <<EOF
+$begin
+    redir $route_path ${route_path}/ 308
+    handle $health_path {
+        respond "ok" 200
+    }
+    handle_path ${route_path}/* {
+        reverse_proxy $upstream {
+            header_up X-Forwarded-Prefix $route_path
+            header_up Host {upstream_hostport}
+EOF
+  emit_caddy_header_rewrites "$route_path" "$upstream_host"
+  cat <<EOF
+        }
+    }
+$end
+EOF
+}
+
+build_existing_caddy_candidate() {
+  local source_file="$1" candidate="$2" work next location close_line i
+  work="$(mktemp /tmp/emby-caddy-existing-work.XXXXXX)"
+  cp -a "$source_file" "$work"
+  for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
+    next="$(mktemp /tmp/emby-caddy-existing-strip.XXXXXX)"
+    strip_existing_caddy_route_block "$work" "$next" "${ROUTE_PATHS[$i]}"
+    mv "$next" "$work"
+  done
+  location="$(find_caddy_site_in_file "$work" "$PROXY_DOMAIN" 2>/dev/null || true)"
+  [[ -n "$location" ]] || {
+    rm -f "$work"
+    die "更新前无法再次定位 $PROXY_DOMAIN 的站点结束位置；原配置未修改。"
+  }
+  close_line="${location##*$'\t'}"
+  {
+    if (( close_line > 1 )); then sed -n "1,$((close_line-1))p" "$work"; fi
+    printf '\n'
+    for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
+      emit_existing_caddy_route "$i"
+      printf '\n'
+    done
+    sed -n "${close_line},\$p" "$work"
+  } >"$candidate"
+  rm -f "$work"
+}
+
 build_candidate_config() {
   local source_file="$1" candidate="$2"
   local i route_path upstream upstream_host length domain_begin domain_end
@@ -1120,6 +1372,7 @@ EOF
 
 check_caddy_domain_conflict() {
   local cleaned other_conflict="" domain_pattern
+  (( CADDY_ATTACH_EXISTING )) && return 0
   domain_pattern="$(domain_token_regex "$PROXY_DOMAIN")"
   cleaned="$(mktemp /tmp/emby-caddy-existing.XXXXXX)"
   if [[ -f "$CADDYFILE" ]]; then
@@ -1156,8 +1409,42 @@ configure_firewall() {
   return 0
 }
 
+apply_existing_caddy_routes() {
+  local timestamp candidate target="$CADDY_EXISTING_SITE_FILE"
+  timestamp="$(date +%Y%m%d-%H%M%S)"
+  [[ -f "$target" ]] || die "已有 Caddy 站点文件不存在：$target"
+  BACKUP_FILE="${target}.bak-${timestamp}"
+  cp -a "$target" "$BACKUP_FILE"
+  candidate="$(mktemp /tmp/emby-caddy-existing-candidate.XXXXXX)"
+  trap 'rm -f "${candidate:-}"' RETURN
+  build_existing_caddy_candidate "$target" "$candidate"
+  install -o root -g root -m 0644 "$candidate" "$target"
+
+  info "验证包含原有站点和新增路径的完整 Caddy 配置……"
+  if ! caddy validate --config "$CADDYFILE" --adapter caddyfile; then
+    cp -a "$BACKUP_FILE" "$target"
+    trap - RETURN
+    rm -f "$candidate"
+    die "新增路径的候选配置验证失败，已恢复原文件：$BACKUP_FILE"
+  fi
+  if ! systemctl reload caddy; then
+    cp -a "$BACKUP_FILE" "$target"
+    systemctl reload caddy >/dev/null 2>&1 || true
+    trap - RETURN
+    rm -f "$candidate"
+    die "Caddy 重载失败，已恢复原站点配置。查看日志：journalctl -u caddy -n 100 --no-pager"
+  fi
+  trap - RETURN
+  rm -f "$candidate"
+  ok "已在原 Caddy 域名中加入独立路径；原站点内容保留，备份：$BACKUP_FILE"
+}
+
 apply_config() {
   local timestamp candidate
+  if (( CADDY_ATTACH_EXISTING )); then
+    apply_existing_caddy_routes
+    return
+  fi
   timestamp="$(date +%Y%m%d-%H%M%S)"
   mkdir -p /etc/caddy
   if id caddy >/dev/null 2>&1; then
@@ -1211,13 +1498,19 @@ apply_config() {
 }
 
 verify_result() {
-  local attempt code="" health_code="" max_attempts=18 service log_command access_log i request_path all_ok
+  local attempt code="" health_code="" health_request_path="$HEALTH_PATH" max_attempts=18
+  local service log_command access_log i request_path all_ok
   local -a route_codes=()
   service="$PROXY_ENGINE"
   if [[ "$PROXY_ENGINE" == "caddy" ]]; then
     info "等待 Caddy 申请证书并验证 HTTPS（最多约 90 秒）……"
     log_command="journalctl -u caddy -n 100 --no-pager"
-    access_log="$CADDY_ACCESS_LOG"
+    if (( CADDY_ATTACH_EXISTING )); then
+      health_request_path="${ROUTE_PATHS[0]}${HEALTH_PATH}"
+      access_log=""
+    else
+      access_log="$CADDY_ACCESS_LOG"
+    fi
   else
     info "验证 Nginx HTTPS 反代……"
     log_command="journalctl -u nginx -n 100 --no-pager"
@@ -1228,7 +1521,7 @@ verify_result() {
     route_codes=()
     health_code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
       --resolve "$PROXY_DOMAIN:443:127.0.0.1" \
-      --connect-timeout 5 --max-time 15 "https://$PROXY_DOMAIN$HEALTH_PATH" 2>/dev/null || true)"
+      --connect-timeout 5 --max-time 15 "https://$PROXY_DOMAIN$health_request_path" 2>/dev/null || true)"
     [[ "$health_code" == "200" ]] || all_ok=0
     for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
       request_path="${ROUTE_PATHS[$i]}"
@@ -1240,7 +1533,7 @@ verify_result() {
       [[ "$code" =~ ^[1-4][0-9][0-9]$ && "$code" != "000" ]] || all_ok=0
     done
     if (( all_ok )); then
-      ok "代理存活检查通过：https://$PROXY_DOMAIN$HEALTH_PATH（HTTP 200）。"
+      ok "代理存活检查通过：https://$PROXY_DOMAIN$health_request_path（HTTP 200）。"
       for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
         ok "路径 ${ROUTE_PATHS[$i]} 反代验证通过（HTTP ${route_codes[$i]}）。"
       done
@@ -1253,21 +1546,25 @@ verify_result() {
           printf '  %shttps://%s%s/%s\n' "$BOLD" "$PROXY_DOMAIN" "${ROUTE_PATHS[$i]}" "$RESET"
         fi
       done
-      if [[ ${#ROUTE_PATHS[@]} -gt 1 ]]; then
+      if [[ ${#ROUTE_PATHS[@]} -gt 1 || "${ROUTE_PATHS[0]}" != "/" ]]; then
         warn "路径模式会剥离 /a 等前缀再回源；请用完整路径测试 Web 与客户端。部分 Emby 客户端/Connect 可能不支持额外子路径。"
       fi
-      printf '健康检查： %shttps://%s%s%s\n' "$BOLD" "$PROXY_DOMAIN" "$HEALTH_PATH" "$RESET"
-      printf '请求日志： %s%s%s（含响应字节数、总耗时及回源耗时，不记录 Nginx 查询参数；Caddy 会隐藏常见 Emby token）\n' \
-        "$BOLD" "$access_log" "$RESET"
-      printf '实时查看： sudo tail -F %q\n' "$access_log"
-      printf '媒体过滤： sudo tail -F %q | grep -Ei '\''/Videos/|/Audio/|/stream|\\.m3u8'\''\n' "$access_log"
+      printf '健康检查： %shttps://%s%s%s\n' "$BOLD" "$PROXY_DOMAIN" "$health_request_path" "$RESET"
+      if [[ -n "$access_log" ]]; then
+        printf '请求日志： %s%s%s（含响应字节数、总耗时及回源耗时，不记录 Nginx 查询参数；Caddy 会隐藏常见 Emby token）\n' \
+          "$BOLD" "$access_log" "$RESET"
+        printf '实时查看： sudo tail -F %q\n' "$access_log"
+        printf '媒体过滤： sudo tail -F %q | grep -Ei '\''/Videos/|/Audio/|/stream|\\.m3u8'\''\n' "$access_log"
+      else
+        printf '请求日志： 沿用现有 Caddy 站点的日志设置；脚本不会擅自改变整站日志。\n'
+      fi
       return 0
     fi
     sleep 5
   done
 
   error "$service 已运行，但健康检查或至少一个路径的 HTTPS 端到端验证未通过。"
-  printf '  健康检查 %-16s HTTP %s\n' "$HEALTH_PATH" "${health_code:-无响应}" >&2
+  printf '  健康检查 %-16s HTTP %s\n' "$health_request_path" "${health_code:-无响应}" >&2
   for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
     printf '  路径 %-16s HTTP %s，源站 %s\n' "${ROUTE_PATHS[$i]}" "${route_codes[$i]:-无响应}" "${ROUTE_URLS[$i]}" >&2
   done
