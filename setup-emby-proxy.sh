@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 在 Debian/Ubuntu VPS 上安装 Caddy 或 Nginx，并为 Emby 配置 HTTPS 反向代理。
+# 在 Debian/Ubuntu VPS 上安装 Caddy 或 Nginx，并为 Emby 配置域名 HTTPS 或 IP HTTP 反向代理。
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -13,6 +13,13 @@ readonly NGINX_ACME_ROOT="/var/www/emby-proxy-acme"
 readonly HEALTH_PATH="/_emby_proxy_health"
 
 PROXY_ENGINE=""
+ACCESS_MODE=""
+ACCESS_SCHEME=""
+PROXY_IP=""
+LISTEN_PORT=""
+PUBLIC_AUTHORITY=""
+PUBLIC_BASE_URL=""
+PROXY_KEY=""
 USING_EXISTING_SERVICE=0
 HAS_CADDY=0
 HAS_NGINX=0
@@ -56,10 +63,14 @@ usage() {
 用法：
   sudo ./${SCRIPT_NAME}
   sudo ./${SCRIPT_NAME} --engine nginx --domain emby.example.com --upstream origin.example.com
+  sudo ./${SCRIPT_NAME} --engine caddy --mode ip --listen-port 8080 --upstream origin.example.com
 
 选项：
   -e, --engine ENGINE       反代程序：caddy 或 nginx；不填写时交互选择
+  -m, --mode MODE           访问模式：domain（域名 HTTPS）或 ip（公网 IPv4 + HTTP）
   -d, --domain DOMAIN       对外访问的反代域名（必须已解析到本 VPS）
+  -i, --ip-address IPV4     IP 模式的对外访问 IPv4；不填写时自动检测公网 IPv4
+  -l, --listen-port PORT    IP 模式的独立 HTTP 端口，默认 8080（范围 1024-65535）
   -p, --path PATH           主源站的访问路径，默认 /；已有 Caddy 域名必须填写非根路径
   -u, --upstream ADDRESS    Emby 源站域名或 URL，可带端口
                             例如 origin.example.com、https://origin.example.com、http://1.2.3.4:8096
@@ -75,9 +86,18 @@ while (($#)); do
     -e|--engine)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       PROXY_ENGINE="$2"; shift 2 ;;
+    -m|--mode)
+      [[ $# -ge 2 ]] || die "$1 缺少参数。"
+      ACCESS_MODE="$2"; shift 2 ;;
     -d|--domain)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       PROXY_DOMAIN="$2"; shift 2 ;;
+    -i|--ip-address)
+      [[ $# -ge 2 ]] || die "$1 缺少参数。"
+      PROXY_IP="$2"; shift 2 ;;
+    -l|--listen-port)
+      [[ $# -ge 2 ]] || die "$1 缺少参数。"
+      LISTEN_PORT="$2"; shift 2 ;;
     -p|--path)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       PRIMARY_ROUTE_INPUT="$2"; shift 2 ;;
@@ -100,7 +120,10 @@ require_root() {
     command -v sudo >/dev/null 2>&1 || die "请切换到 root 后重新运行：su -c 'bash ${SCRIPT_NAME}'"
     info "需要管理员权限，正在通过 sudo 重新运行……"
     [[ -n "$PROXY_ENGINE" ]] && sudo_args+=(--engine "$PROXY_ENGINE")
+    [[ -n "$ACCESS_MODE" ]] && sudo_args+=(--mode "$ACCESS_MODE")
     [[ -n "$PROXY_DOMAIN" ]] && sudo_args+=(--domain "$PROXY_DOMAIN")
+    [[ -n "$PROXY_IP" ]] && sudo_args+=(--ip-address "$PROXY_IP")
+    [[ -n "$LISTEN_PORT" ]] && sudo_args+=(--listen-port "$LISTEN_PORT")
     [[ -n "$PRIMARY_ROUTE_INPUT" ]] && sudo_args+=(--path "$PRIMARY_ROUTE_INPUT")
     [[ -n "$UPSTREAM_INPUT" ]] && sudo_args+=(--upstream "$UPSTREAM_INPUT")
     local route_spec
@@ -137,6 +160,56 @@ valid_domain() {
     [[ "$d" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
 }
 
+valid_ipv4() {
+  local value="$1" octet
+  local -a octets=()
+  [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS='.' read -r -a octets <<<"$value"
+  [[ ${#octets[@]} -eq 4 ]] || return 1
+  for octet in "${octets[@]}"; do
+    ((10#$octet >= 0 && 10#$octet <= 255)) || return 1
+  done
+}
+
+normalize_access_mode() {
+  ACCESS_MODE="$(printf '%s' "$(trim "$ACCESS_MODE")" | tr '[:upper:]' '[:lower:]')"
+  case "$ACCESS_MODE" in
+    1|domain|https) ACCESS_MODE="domain" ;;
+    2|ip|http) ACCESS_MODE="ip" ;;
+    *) die "访问模式只能选择 1/domain 或 2/ip。" ;;
+  esac
+}
+
+normalize_listen_port() {
+  LISTEN_PORT="$(trim "${LISTEN_PORT:-8080}")"
+  [[ "$LISTEN_PORT" =~ ^[0-9]{1,5}$ ]] || die "监听端口必须是数字：$LISTEN_PORT"
+  ((10#$LISTEN_PORT >= 1024 && 10#$LISTEN_PORT <= 65535)) || \
+    die "为避免影响现有 Web 服务，IP 模式只使用 1024-65535 的独立端口。"
+  LISTEN_PORT="$((10#$LISTEN_PORT))"
+}
+
+set_ip_access_target() {
+  PROXY_IP="$(trim "$PROXY_IP")"
+  if [[ -z "$PROXY_IP" ]]; then
+    info "正在检测本机公网 IPv4……"
+    PROXY_IP="$(public_ip 4 -4 https://api.ipify.org)"
+    [[ -n "$PROXY_IP" ]] || die "无法自动检测公网 IPv4，请重新运行并使用 --ip-address 1.2.3.4 指定。"
+  fi
+  valid_ipv4 "$PROXY_IP" || die "访问 IPv4 格式无效：$PROXY_IP"
+  normalize_listen_port
+  PROXY_DOMAIN="$PROXY_IP"
+  ACCESS_SCHEME="http"
+  PUBLIC_AUTHORITY="${PROXY_IP}:${LISTEN_PORT}"
+  PUBLIC_BASE_URL="http://${PUBLIC_AUTHORITY}"
+  PROXY_KEY="ip-${PROXY_IP}-${LISTEN_PORT}"
+  NGINX_ID="ip_${PROXY_IP//./_}_${LISTEN_PORT}"
+  NGINX_CONFIG="/etc/nginx/conf.d/emby-proxy-${PROXY_KEY}.conf"
+  CADDY_ACCESS_LOG="/var/log/caddy/emby-proxy-${PROXY_KEY}-access.log"
+  NGINX_ACCESS_LOG="/var/log/nginx/emby-proxy-${PROXY_KEY}-access.log"
+  ok "IP 访问入口：$PUBLIC_BASE_URL"
+  warn "IP HTTP 模式不提供传输加密；登录凭据和媒体流会以明文经过客户端到本 VPS 的网络。"
+}
+
 domain_token_regex() {
   local escaped="${1//./\\.}"
   printf '(^|[^A-Za-z0-9.-])%s([^A-Za-z0-9.-]|$)' "$escaped"
@@ -154,6 +227,10 @@ normalize_proxy_domain() {
     die "反代访问地址只能填写域名，不能带端口、路径、参数或账号信息。"
   valid_domain "$value" || die "反代域名格式无效：$value（示例：emby.example.com）"
   PROXY_DOMAIN="$value"
+  ACCESS_SCHEME="https"
+  PUBLIC_AUTHORITY="$PROXY_DOMAIN"
+  PUBLIC_BASE_URL="https://$PROXY_DOMAIN"
+  PROXY_KEY="$PROXY_DOMAIN"
   # 点和连字符使用不同编码，避免 a-b.example.com 与 a.b.example.com 生成同名 Nginx 变量。
   NGINX_ID="${PROXY_DOMAIN//-/_dash_}"
   NGINX_ID="${NGINX_ID//./_dot_}"
@@ -192,7 +269,13 @@ parse_upstream() {
   fi
   [[ "$host" =~ ^[A-Za-z0-9.-]+$ && "$host" != .* && "$host" != *. && "$host" != *..* ]] || die "源站主机名无效：$host"
   host_lower="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
-  [[ "$host_lower" != "$PROXY_DOMAIN" ]] || die "源站域名不能与反代域名相同，否则会形成代理循环。"
+  if [[ "$host_lower" == "$PROXY_DOMAIN" ]]; then
+    if [[ "$ACCESS_MODE" == "domain" ]]; then
+      die "源站域名不能与反代域名相同，否则会形成代理循环。"
+    elif [[ -n "$port" && "$port" == "$LISTEN_PORT" ]]; then
+      die "源站不能指向当前 IP 入口的同一端口 $LISTEN_PORT，否则会形成代理循环。"
+    fi
+  fi
   UPSTREAM_HOST="$host_lower"
 
   if [[ -n "$scheme" ]]; then
@@ -482,16 +565,51 @@ detect_existing_caddy_domain_mode() {
 }
 
 prompt_inputs() {
-  local interactive_upstream=0 primary_route="/" i
+  local interactive_upstream=0 primary_route="/" i mode_choice=""
   select_proxy_engine
 
-  if [[ -z "$PROXY_DOMAIN" ]]; then
-    [[ -t 0 ]] || die "非交互环境请使用 --engine、--domain 和 --upstream。"
-    printf '%s请输入对外访问的反代域名%s（例如 emby.example.com）：' "$BOLD" "$RESET"
-    read -r PROXY_DOMAIN
+  if [[ -z "$ACCESS_MODE" ]]; then
+    if [[ -n "$PROXY_DOMAIN" ]]; then
+      ACCESS_MODE="domain"
+    elif [[ -n "$PROXY_IP" || -n "$LISTEN_PORT" ]]; then
+      ACCESS_MODE="ip"
+    else
+      [[ -t 0 ]] || die "非交互环境请使用 --mode ip，或提供 --domain。"
+      printf '\n请选择对外访问方式：\n'
+      printf '  1) 域名 + HTTPS（需要域名解析）\n'
+      printf '  2) 公网 IPv4 + HTTP 独立端口（不需要域名）\n'
+      printf '请输入 1 或 2（默认 1）：'
+      read -r mode_choice
+      ACCESS_MODE="${mode_choice:-1}"
+    fi
   fi
-  normalize_proxy_domain "$PROXY_DOMAIN"
-  detect_existing_caddy_domain_mode
+  normalize_access_mode
+
+  if [[ "$ACCESS_MODE" == "domain" ]]; then
+    [[ -z "$PROXY_IP" && -z "$LISTEN_PORT" ]] || die "域名模式不能同时使用 --ip-address 或 --listen-port。"
+    if [[ -z "$PROXY_DOMAIN" ]]; then
+      [[ -t 0 ]] || die "域名模式非交互运行时必须使用 --domain。"
+      printf '%s请输入对外访问的反代域名%s（例如 emby.example.com）：' "$BOLD" "$RESET"
+      read -r PROXY_DOMAIN
+    fi
+    normalize_proxy_domain "$PROXY_DOMAIN"
+    detect_existing_caddy_domain_mode
+  else
+    [[ -z "$PROXY_DOMAIN" ]] || die "IP 模式不需要 --domain，请删除该参数。"
+    LISTEN_PORT="${LISTEN_PORT:-8080}"
+    normalize_listen_port
+    if [[ -t 0 && -z "$PROXY_IP" ]]; then
+      printf '%s请输入对外访问的公网 IPv4%s（直接回车自动检测）：' "$BOLD" "$RESET"
+      read -r PROXY_IP
+    fi
+    [[ -z "$PROXY_IP" ]] || valid_ipv4 "$(trim "$PROXY_IP")" || die "访问 IPv4 格式无效：$PROXY_IP"
+    if [[ -t 0 ]]; then
+      printf '%s请输入独立 HTTP 监听端口%s（默认 %s）：' "$BOLD" "$RESET" "$LISTEN_PORT"
+      read -r mode_choice
+      [[ -z "$mode_choice" ]] || LISTEN_PORT="$mode_choice"
+      normalize_listen_port
+    fi
+  fi
 
   if (( CADDY_ATTACH_EXISTING )); then
     if [[ -z "$PRIMARY_ROUTE_INPUT" ]]; then
@@ -503,11 +621,11 @@ prompt_inputs() {
     [[ "$primary_route" != "/" ]] || die "已有域名不能自动接管根路径 /，请使用 /a、/emby2 等独立路径。"
   elif [[ -n "$PRIMARY_ROUTE_INPUT" ]]; then
     primary_route="$(normalize_route_path "$PRIMARY_ROUTE_INPUT")"
-    [[ "$primary_route" == "/" ]] || die "--path 的非根路径模式仅用于向已有 Caddy 域名追加路由；新域名主源站固定使用 /。"
+    [[ "$primary_route" == "/" ]] || die "--path 的非根路径模式仅用于向已有 Caddy 域名追加路由；新入口的主源站固定使用 /。"
   fi
 
   if [[ -z "$UPSTREAM_INPUT" ]]; then
-    [[ -t 0 ]] || die "非交互环境请使用 --engine、--domain 和 --upstream。"
+    [[ -t 0 ]] || die "非交互环境请使用 --engine、访问模式参数和 --upstream。"
     printf '%s请输入 Emby 源站域名或 URL%s（例如 origin.example.com）：' "$BOLD" "$RESET"
     read -r UPSTREAM_INPUT
     interactive_upstream=1
@@ -678,6 +796,14 @@ check_dns() {
   ok "DNS 预检通过。"
 }
 
+prepare_access_target() {
+  if [[ "$ACCESS_MODE" == "ip" ]]; then
+    set_ip_access_target
+  else
+    check_dns
+  fi
+}
+
 probe_url() {
   local url="$1" code
   code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 20 "$url/" 2>/dev/null || true)"
@@ -717,7 +843,28 @@ probe_upstream() {
 }
 
 check_port_conflicts() {
-  local listeners foreign allowed_pattern
+  local listeners foreign allowed_pattern own_marker
+  if [[ "$ACCESS_MODE" == "ip" ]]; then
+    listeners="$(ss -H -lntp 2>/dev/null | awk -v port=":$LISTEN_PORT" '$4 ~ (port "$") {print}' || true)"
+    [[ -z "$listeners" ]] && return 0
+    own_marker="# MANAGED EMBY SITE: $PROXY_KEY"
+    if [[ "$PROXY_ENGINE" == "caddy" && -f "$CADDYFILE" ]] && \
+       grep -F "$(caddy_domain_begin_marker)" "$CADDYFILE" >/dev/null 2>&1 && \
+       ! printf '%s\n' "$listeners" | grep -vi caddy >/dev/null 2>&1; then
+      info "端口 $LISTEN_PORT 已由本脚本管理的 Caddy IP 站点监听，将安全更新配置。"
+      return 0
+    fi
+    if [[ "$PROXY_ENGINE" == "nginx" && -f "$NGINX_CONFIG" ]] && \
+       grep -Fx "$own_marker" "$NGINX_CONFIG" >/dev/null 2>&1 && \
+       ! printf '%s\n' "$listeners" | grep -vi nginx >/dev/null 2>&1; then
+      info "端口 $LISTEN_PORT 已由本脚本管理的 Nginx IP 站点监听，将安全更新配置。"
+      return 0
+    fi
+    error "独立端口 $LISTEN_PORT 已被占用，脚本不会修改或抢占它："
+    printf '%s\n' "$listeners" >&2
+    printf '修复方法：重新运行脚本并选择其他 1024-65535 端口，例如 18080；同时在云安全组中放行该端口。\n' >&2
+    exit 1
+  fi
   listeners="$(ss -H -lntp 2>/dev/null | awk '$4 ~ /:80$|:443$/ {print}' || true)"
   [[ -z "$listeners" ]] && return 0
   allowed_pattern="$PROXY_ENGINE"
@@ -762,14 +909,23 @@ install_nginx() {
   export DEBIAN_FRONTEND=noninteractive
   if command -v nginx >/dev/null 2>&1 && systemctl cat nginx.service >/dev/null 2>&1; then
     ok "检测到 Nginx：$(nginx -v 2>&1)"
-    apt-get install -y --no-install-recommends certbot >/dev/null
+    [[ "$ACCESS_MODE" == "ip" ]] || apt-get install -y --no-install-recommends certbot >/dev/null
   else
-    info "从 Debian/Ubuntu 软件源安装 Nginx 与 Certbot……"
-    apt-get install -y nginx certbot >/dev/null
+    if [[ "$ACCESS_MODE" == "ip" ]]; then
+      info "从 Debian/Ubuntu 软件源安装 Nginx……"
+      apt-get install -y nginx >/dev/null
+    else
+      info "从 Debian/Ubuntu 软件源安装 Nginx 与 Certbot……"
+      apt-get install -y nginx certbot >/dev/null
+    fi
   fi
   command -v nginx >/dev/null 2>&1 || die "Nginx 安装后仍未找到可执行文件。"
-  command -v certbot >/dev/null 2>&1 || die "Certbot 安装后仍未找到可执行文件。"
-  ok "Nginx/Certbot 已就绪：$(nginx -v 2>&1)"
+  if [[ "$ACCESS_MODE" == "ip" ]]; then
+    ok "Nginx 已就绪：$(nginx -v 2>&1)"
+  else
+    command -v certbot >/dev/null 2>&1 || die "Certbot 安装后仍未找到可执行文件。"
+    ok "Nginx/Certbot 已就绪：$(nginx -v 2>&1)"
+  fi
 }
 
 emit_nginx_header_maps() {
@@ -786,8 +942,8 @@ emit_nginx_header_maps() {
     cat <<EOF
 map \$upstream_http_location \$$location_var {
     default \$upstream_http_location;
-    "~*^https?://${escaped_host}(?::[0-9]+)?\$" "https://$PROXY_DOMAIN${public_prefix}/";
-    "~*^https?://${escaped_host}(?::[0-9]+)?/(.*)\$" "https://$PROXY_DOMAIN${public_prefix}/\$1";
+    "~*^https?://${escaped_host}(?::[0-9]+)?\$" "$PUBLIC_BASE_URL${public_prefix}/";
+    "~*^https?://${escaped_host}(?::[0-9]+)?/(.*)\$" "$PUBLIC_BASE_URL${public_prefix}/\$1";
 EOF
     if [[ "$route_path" != "/" ]]; then
       escaped_route="${route_path//./\\.}"
@@ -799,8 +955,8 @@ EOF
 
 map \$upstream_http_content_location \$$content_var {
     default \$upstream_http_content_location;
-    "~*^https?://${escaped_host}(?::[0-9]+)?\$" "https://$PROXY_DOMAIN${public_prefix}/";
-    "~*^https?://${escaped_host}(?::[0-9]+)?/(.*)\$" "https://$PROXY_DOMAIN${public_prefix}/\$1";
+    "~*^https?://${escaped_host}(?::[0-9]+)?\$" "$PUBLIC_BASE_URL${public_prefix}/";
+    "~*^https?://${escaped_host}(?::[0-9]+)?/(.*)\$" "$PUBLIC_BASE_URL${public_prefix}/\$1";
 EOF
     if [[ "$route_path" != "/" ]]; then
       printf '    "~*^%s(?:/|$)" $upstream_http_content_location;\n' "$escaped_route"
@@ -979,6 +1135,42 @@ EOF
   } >"$target"
 }
 
+write_nginx_ip_config() {
+  local target="$1" i
+  {
+    cat <<EOF
+# MANAGED EMBY SITE: $PROXY_KEY
+# 由 $SCRIPT_NAME 自动管理；这是固定公网 IPv4 + 独立端口的明文 HTTP 入口。
+EOF
+    emit_nginx_http_prelude
+    cat <<EOF
+server {
+    listen $LISTEN_PORT;
+    listen [::]:$LISTEN_PORT;
+    server_name $PROXY_IP;
+
+    access_log $NGINX_ACCESS_LOG emby_proxy_${NGINX_ID}_v1;
+
+    # 只接受当前 IP 作为 Host；客户端不能借 Host 选择其他回源。
+    if (\$host != $PROXY_IP) { return 444; }
+
+    client_max_body_size 0;
+
+    location = $HEALTH_PATH {
+        default_type text/plain;
+        return 200 "ok";
+    }
+
+EOF
+    for ((i=1; i<${#ROUTE_PATHS[@]}; i++)); do
+      emit_nginx_proxy_location "$i" "${ROUTE_PATHS[$i]}" "${ROUTE_URLS[$i]}" "${ROUTE_HOSTS[$i]}"
+      printf '\n'
+    done
+    emit_nginx_proxy_location 0 "/" "${ROUTE_URLS[0]}" "${ROUTE_HOSTS[0]}"
+    printf '}\n'
+  } >"$target"
+}
+
 rollback_nginx() {
   if (( NGINX_HAD_CONFIG )); then
     cp -a "$BACKUP_FILE" "$NGINX_CONFIG"
@@ -1037,8 +1229,61 @@ check_nginx_domain_conflict() {
   fi
 }
 
+check_nginx_ip_conflict() {
+  local conflict="" marker="# MANAGED EMBY SITE: $PROXY_KEY"
+  if [[ -f "$NGINX_CONFIG" ]] && ! grep -Fx "$marker" "$NGINX_CONFIG" >/dev/null 2>&1; then
+    die "目标配置文件已存在但不是本脚本管理：$NGINX_CONFIG。为避免覆盖，脚本已停止。"
+  fi
+  if [[ -d /etc/nginx ]]; then
+    conflict="$(grep -RIlE --include='*.conf' --exclude="$(basename "$NGINX_CONFIG")" \
+      "listen[[:space:]]+([^[:space:];]*:)?${LISTEN_PORT}([[:space:];]|$)" /etc/nginx 2>/dev/null | head -n 1 || true)"
+  fi
+  [[ -z "$conflict" ]] || die "Nginx 配置 $conflict 已声明端口 $LISTEN_PORT。为避免监听冲突，请选择其他独立端口。"
+}
+
+apply_nginx_ip_config() {
+  local timestamp candidate
+  timestamp="$(date +%Y%m%d-%H%M%S)"
+  candidate="$(mktemp /tmp/emby-nginx-ip.XXXXXX.conf)"
+  mkdir -p "$(dirname "$NGINX_CONFIG")"
+  check_nginx_ip_conflict
+
+  if [[ -f "$NGINX_CONFIG" ]]; then
+    NGINX_HAD_CONFIG=1
+    BACKUP_FILE="${NGINX_CONFIG}.bak-${timestamp}"
+    cp -a "$NGINX_CONFIG" "$BACKUP_FILE"
+  else
+    NGINX_HAD_CONFIG=0
+    BACKUP_FILE="首次创建，无旧文件"
+  fi
+
+  write_nginx_ip_config "$candidate"
+  install -o root -g root -m 0644 "$candidate" "$NGINX_CONFIG"
+  if ! nginx -t; then
+    rollback_nginx
+    rm -f "$candidate"
+    die "Nginx IP HTTP 候选配置验证失败，已恢复原配置。"
+  fi
+  if ! nginx -T 2>&1 | grep -F "configuration file $NGINX_CONFIG:" >/dev/null; then
+    rollback_nginx
+    rm -f "$candidate"
+    die "主 nginx.conf 没有加载 $NGINX_CONFIG。请确认 http 块中包含：include /etc/nginx/conf.d/*.conf;"
+  fi
+  if ! reload_or_start_nginx; then
+    rollback_nginx
+    rm -f "$candidate"
+    die "Nginx 重载失败，已恢复原配置。查看日志：journalctl -u nginx -n 100 --no-pager"
+  fi
+  rm -f "$candidate"
+  ok "Nginx IP HTTP 配置已生效；备份：$BACKUP_FILE"
+}
+
 apply_nginx_config() {
   local timestamp candidate cert_dir
+  if [[ "$ACCESS_MODE" == "ip" ]]; then
+    apply_nginx_ip_config
+    return
+  fi
   timestamp="$(date +%Y%m%d-%H%M%S)"
   candidate="$(mktemp /tmp/emby-nginx.XXXXXX.conf)"
   cert_dir="/etc/letsencrypt/live/$PROXY_DOMAIN"
@@ -1120,6 +1365,11 @@ show_plan() {
   local i
   printf '\n%s即将应用以下配置：%s\n' "$BOLD" "$RESET"
   printf '  反代程序： %s\n' "$PROXY_ENGINE"
+  if [[ "$ACCESS_MODE" == "ip" ]]; then
+    printf '  访问模式： 公网 IPv4 + HTTP 独立端口（不申请域名证书）\n'
+  else
+    printf '  访问模式： 域名 + HTTPS\n'
+  fi
   if (( CADDY_ATTACH_EXISTING )); then
     printf '  部署方式： 保留现有 Caddy 域名，仅新增/更新独立路径\n'
   elif (( USING_EXISTING_SERVICE )); then
@@ -1127,7 +1377,7 @@ show_plan() {
   else
     printf '  部署方式： 未发现现有服务，将全新安装\n'
   fi
-  printf '  访问地址： https://%s\n' "$PROXY_DOMAIN"
+  printf '  访问地址： %s\n' "$PUBLIC_BASE_URL"
   printf '  路径映射：\n'
   for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
     printf '    %-16s -> %s\n' "${ROUTE_PATHS[$i]}" "${ROUTE_URLS[$i]}"
@@ -1146,8 +1396,8 @@ show_plan() {
   fi
 }
 
-caddy_domain_begin_marker() { printf '%s: %s' "$BEGIN_MARKER" "$PROXY_DOMAIN"; }
-caddy_domain_end_marker()   { printf '%s: %s' "$END_MARKER" "$PROXY_DOMAIN"; }
+caddy_domain_begin_marker() { printf '%s: %s' "$BEGIN_MARKER" "$PROXY_KEY"; }
+caddy_domain_end_marker()   { printf '%s: %s' "$END_MARKER" "$PROXY_KEY"; }
 
 legacy_caddy_managed_domain() {
   local source_file="$1"
@@ -1206,14 +1456,14 @@ emit_caddy_header_rewrites() {
   [[ "$route_path" == "/" ]] || public_prefix="$route_path"
 
   # 仅识别当前固定源站和根相对 URL。由源站返回的第三方绝对 URL 不会被改写。
-  printf '            header_down Location "(?i)^https?://%s(?::[0-9]+)?$" "https://%s%s/"\n' \
-    "$escaped_host" "$PROXY_DOMAIN" "$public_prefix"
-  printf '            header_down Location "(?i)^https?://%s(?::[0-9]+)?/(.*)$" "https://%s%s/$1"\n' \
-    "$escaped_host" "$PROXY_DOMAIN" "$public_prefix"
-  printf '            header_down Content-Location "(?i)^https?://%s(?::[0-9]+)?$" "https://%s%s/"\n' \
-    "$escaped_host" "$PROXY_DOMAIN" "$public_prefix"
-  printf '            header_down Content-Location "(?i)^https?://%s(?::[0-9]+)?/(.*)$" "https://%s%s/$1"\n' \
-    "$escaped_host" "$PROXY_DOMAIN" "$public_prefix"
+  printf '            header_down Location "(?i)^https?://%s(?::[0-9]+)?$" "%s%s/"\n' \
+    "$escaped_host" "$PUBLIC_BASE_URL" "$public_prefix"
+  printf '            header_down Location "(?i)^https?://%s(?::[0-9]+)?/(.*)$" "%s%s/$1"\n' \
+    "$escaped_host" "$PUBLIC_BASE_URL" "$public_prefix"
+  printf '            header_down Content-Location "(?i)^https?://%s(?::[0-9]+)?$" "%s%s/"\n' \
+    "$escaped_host" "$PUBLIC_BASE_URL" "$public_prefix"
+  printf '            header_down Content-Location "(?i)^https?://%s(?::[0-9]+)?/(.*)$" "%s%s/$1"\n' \
+    "$escaped_host" "$PUBLIC_BASE_URL" "$public_prefix"
   if [[ "$route_path" == "/" ]]; then
     printf '            header_down Location "^/(.*)$" "/$1"\n'
     printf '            header_down Content-Location "^/(.*)$" "/$1"\n'
@@ -1299,17 +1549,20 @@ build_existing_caddy_candidate() {
 }
 
 build_candidate_config() {
-  local source_file="$1" candidate="$2"
+  local source_file="$1" candidate="$2" site_address
   local i route_path upstream upstream_host length domain_begin domain_end
   validate_caddy_managed_markers "$source_file"
   strip_current_caddy_managed "$source_file" "$candidate"
   domain_begin="$(caddy_domain_begin_marker)"
   domain_end="$(caddy_domain_end_marker)"
 
+  site_address="$PROXY_DOMAIN"
+  [[ "$ACCESS_MODE" == "ip" ]] && site_address="http://${PROXY_IP}:${LISTEN_PORT}"
+
   # 上游地址经过严格白名单校验，可安全写入 Caddyfile。
   {
     printf '\n%s\n' "$domain_begin"
-    printf '%s {\n' "$PROXY_DOMAIN"
+    printf '%s {\n' "$site_address"
     cat <<EOF
     log {
         output file $CADDY_ACCESS_LOG {
@@ -1373,7 +1626,12 @@ EOF
 check_caddy_domain_conflict() {
   local cleaned other_conflict="" domain_pattern
   (( CADDY_ATTACH_EXISTING )) && return 0
-  domain_pattern="$(domain_token_regex "$PROXY_DOMAIN")"
+  if [[ "$ACCESS_MODE" == "ip" ]]; then
+    # 同一端口上的其他显式主机可以由 Caddy 安全分流；但精确 IP 或 :PORT 通配站点会与本入口重叠。
+    domain_pattern="(http://${PROXY_IP//./\\.}:${LISTEN_PORT}([[:space:]]|\\{|,|$)|^[[:space:]]*(http://)?(:|\\*:)${LISTEN_PORT}([[:space:]]|\\{|,|$))"
+  else
+    domain_pattern="$(domain_token_regex "$PROXY_DOMAIN")"
+  fi
   cleaned="$(mktemp /tmp/emby-caddy-existing.XXXXXX)"
   if [[ -f "$CADDYFILE" ]]; then
     validate_caddy_managed_markers "$CADDYFILE"
@@ -1396,14 +1654,24 @@ check_caddy_domain_conflict() {
 
 configure_firewall() {
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    info "检测到 UFW 已启用，放行 TCP 80/443……"
-    ufw allow 80/tcp >/dev/null
-    ufw allow 443/tcp >/dev/null
+    if [[ "$ACCESS_MODE" == "ip" ]]; then
+      info "检测到 UFW 已启用，放行 TCP $LISTEN_PORT……"
+      ufw allow "$LISTEN_PORT/tcp" >/dev/null
+    else
+      info "检测到 UFW 已启用，放行 TCP 80/443……"
+      ufw allow 80/tcp >/dev/null
+      ufw allow 443/tcp >/dev/null
+    fi
   fi
   if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-    info "检测到 firewalld 已启用，放行 HTTP/HTTPS……"
-    firewall-cmd --permanent --add-service=http >/dev/null
-    firewall-cmd --permanent --add-service=https >/dev/null
+    if [[ "$ACCESS_MODE" == "ip" ]]; then
+      info "检测到 firewalld 已启用，放行 TCP $LISTEN_PORT……"
+      firewall-cmd --permanent --add-port="$LISTEN_PORT/tcp" >/dev/null
+    else
+      info "检测到 firewalld 已启用，放行 HTTP/HTTPS……"
+      firewall-cmd --permanent --add-service=http >/dev/null
+      firewall-cmd --permanent --add-service=https >/dev/null
+    fi
     firewall-cmd --reload >/dev/null
   fi
   return 0
@@ -1497,12 +1765,33 @@ apply_config() {
   ok "配置已生效；备份：$BACKUP_FILE"
 }
 
+entry_status_code() {
+  local request_path="$1"
+  if [[ "$ACCESS_MODE" == "ip" ]]; then
+    curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+      -H "Host: $PROXY_IP" --connect-timeout 5 --max-time 15 \
+      "http://127.0.0.1:${LISTEN_PORT}${request_path}" 2>/dev/null || true
+  else
+    curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+      --resolve "$PROXY_DOMAIN:443:127.0.0.1" \
+      --connect-timeout 5 --max-time 15 "https://$PROXY_DOMAIN$request_path" 2>/dev/null || true
+  fi
+}
+
 verify_result() {
   local attempt code="" health_code="" health_request_path="$HEALTH_PATH" max_attempts=18
   local service log_command access_log i request_path all_ok
   local -a route_codes=()
   service="$PROXY_ENGINE"
-  if [[ "$PROXY_ENGINE" == "caddy" ]]; then
+  if [[ "$ACCESS_MODE" == "ip" ]]; then
+    info "验证 $PROXY_ENGINE IP HTTP 反代……"
+    log_command="journalctl -u $PROXY_ENGINE -n 100 --no-pager"
+    if [[ "$PROXY_ENGINE" == "caddy" ]]; then
+      access_log="$CADDY_ACCESS_LOG"
+    else
+      access_log="$NGINX_ACCESS_LOG"
+    fi
+  elif [[ "$PROXY_ENGINE" == "caddy" ]]; then
     info "等待 Caddy 申请证书并验证 HTTPS（最多约 90 秒）……"
     log_command="journalctl -u caddy -n 100 --no-pager"
     if (( CADDY_ATTACH_EXISTING )); then
@@ -1519,21 +1808,17 @@ verify_result() {
   for ((attempt=1; attempt<=max_attempts; attempt++)); do
     all_ok=1
     route_codes=()
-    health_code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
-      --resolve "$PROXY_DOMAIN:443:127.0.0.1" \
-      --connect-timeout 5 --max-time 15 "https://$PROXY_DOMAIN$health_request_path" 2>/dev/null || true)"
+    health_code="$(entry_status_code "$health_request_path")"
     [[ "$health_code" == "200" ]] || all_ok=0
     for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
       request_path="${ROUTE_PATHS[$i]}"
       [[ "$request_path" == "/" ]] || request_path="${request_path}/"
-      code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
-        --resolve "$PROXY_DOMAIN:443:127.0.0.1" \
-        --connect-timeout 5 --max-time 15 "https://$PROXY_DOMAIN$request_path" 2>/dev/null || true)"
+      code="$(entry_status_code "$request_path")"
       route_codes+=("$code")
       [[ "$code" =~ ^[1-4][0-9][0-9]$ && "$code" != "000" ]] || all_ok=0
     done
     if (( all_ok )); then
-      ok "代理存活检查通过：https://$PROXY_DOMAIN$health_request_path（HTTP 200）。"
+      ok "代理存活检查通过：$PUBLIC_BASE_URL$health_request_path（HTTP 200）。"
       for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
         ok "路径 ${ROUTE_PATHS[$i]} 反代验证通过（HTTP ${route_codes[$i]}）。"
       done
@@ -1541,15 +1826,18 @@ verify_result() {
       printf '可用的 Emby 反代地址：\n'
       for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
         if [[ "${ROUTE_PATHS[$i]}" == "/" ]]; then
-          printf '  %shttps://%s/%s\n' "$BOLD" "$PROXY_DOMAIN" "$RESET"
+          printf '  %s%s/%s\n' "$BOLD" "$PUBLIC_BASE_URL" "$RESET"
         else
-          printf '  %shttps://%s%s/%s\n' "$BOLD" "$PROXY_DOMAIN" "${ROUTE_PATHS[$i]}" "$RESET"
+          printf '  %s%s%s/%s\n' "$BOLD" "$PUBLIC_BASE_URL" "${ROUTE_PATHS[$i]}" "$RESET"
         fi
       done
       if [[ ${#ROUTE_PATHS[@]} -gt 1 || "${ROUTE_PATHS[0]}" != "/" ]]; then
         warn "路径模式会剥离 /a 等前缀再回源；请用完整路径测试 Web 与客户端。部分 Emby 客户端/Connect 可能不支持额外子路径。"
       fi
-      printf '健康检查： %shttps://%s%s%s\n' "$BOLD" "$PROXY_DOMAIN" "$health_request_path" "$RESET"
+      printf '健康检查： %s%s%s%s\n' "$BOLD" "$PUBLIC_BASE_URL" "$health_request_path" "$RESET"
+      if [[ "$ACCESS_MODE" == "ip" ]]; then
+        warn "当前入口是明文 HTTP。请勿在不可信网络中直接传输管理员账号；长期公网使用建议完成备案后切换域名 HTTPS。"
+      fi
       if [[ -n "$access_log" ]]; then
         printf '请求日志： %s%s%s（含响应字节数、总耗时及回源耗时，不记录 Nginx 查询参数；Caddy 会隐藏常见 Emby token）\n' \
           "$BOLD" "$access_log" "$RESET"
@@ -1563,12 +1851,24 @@ verify_result() {
     sleep 5
   done
 
-  error "$service 已运行，但健康检查或至少一个路径的 HTTPS 端到端验证未通过。"
+  error "$service 已运行，但健康检查或至少一个路径的端到端验证未通过。"
   printf '  健康检查 %-16s HTTP %s\n' "$health_request_path" "${health_code:-无响应}" >&2
   for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
     printf '  路径 %-16s HTTP %s，源站 %s\n' "${ROUTE_PATHS[$i]}" "${route_codes[$i]:-无响应}" "${ROUTE_URLS[$i]}" >&2
   done
-  cat >&2 <<EOF
+  if [[ "$ACCESS_MODE" == "ip" ]]; then
+    cat >&2 <<EOF
+请按顺序检查：
+  1. 云厂商安全组是否放行入站 TCP $LISTEN_PORT；
+  2. 查看代理日志：$log_command
+  3. 查看端口监听：ss -lntp | grep -E ':${LISTEN_PORT}\\b'
+  4. 本机入口测试：curl -v -H 'Host: $PROXY_IP' 'http://127.0.0.1:${LISTEN_PORT}/'
+  5. 按上方列表逐个测试源站：curl -v --connect-timeout 10 '源站地址/'
+
+配置验证及重载已经成功，因此没有自动回滚。原配置备份在：$BACKUP_FILE
+EOF
+  else
+    cat >&2 <<EOF
 请按顺序检查：
   1. 云厂商安全组/防火墙是否放行入站 TCP 80、443；
   2. DNS A/AAAA 是否仍指向本 VPS，Cloudflare 是否为“仅 DNS（灰云）”；
@@ -1578,16 +1878,17 @@ verify_result() {
 
 配置验证及重载已经成功，因此没有自动回滚。原配置备份在：$BACKUP_FILE
 EOF
+  fi
   return 1
 }
 
 main() {
   require_root
-  printf '%sEmby HTTPS 一键反向代理配置器（Caddy / Nginx）%s\n\n' "$BOLD" "$RESET"
+  printf '%sEmby 一键反向代理配置器（域名 HTTPS / IP HTTP，Caddy / Nginx）%s\n\n' "$BOLD" "$RESET"
   check_platform
   prompt_inputs
   apt_install_prerequisites
-  check_dns
+  prepare_access_target
   prepare_routes
   check_port_conflicts
   if [[ "$PROXY_ENGINE" == "caddy" ]]; then

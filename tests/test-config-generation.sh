@@ -19,10 +19,10 @@ assert_count() {
 EMBY_PROXY_LIB_ONLY=1 source "$SCRIPT"
 
 SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY_LIB_ONLY=1 bash -c '
-  set -- --path /media
+  set -- --mode ip --ip-address 203.0.113.10 --listen-port 18080 --path /media
   source "$SCRIPT_UNDER_TEST"
-  [[ "$PRIMARY_ROUTE_INPUT" == /media ]]
-' || fail "--path 参数解析失败"
+  [[ "$ACCESS_MODE" == ip && "$PROXY_IP" == 203.0.113.10 && "$LISTEN_PORT" == 18080 && "$PRIMARY_ROUTE_INPUT" == /media ]]
+' || fail "IP 模式命令行参数解析失败"
 
 # 域名冲突检测按完整 token 匹配，不能把 a.example.com 错认成 ba.example.com。
 domain_pattern="$(domain_token_regex 'a.example.com')"
@@ -30,6 +30,7 @@ printf '%s\n' 'ba.example.com {' | grep -E "$domain_pattern" >/dev/null && fail 
 printf '%s\n' 'a.example.com {' | grep -E "$domain_pattern" >/dev/null || fail "域名 token 未匹配完整域名"
 
 set_domain() {
+  ACCESS_MODE="domain"
   PROXY_DOMAIN="$1"
   normalize_proxy_domain "$PROXY_DOMAIN"
   ROUTE_PATHS=("/" "/a")
@@ -82,6 +83,37 @@ assert_contains "$TMP_DIR/Caddyfile.final" 'header_down Location "^/a(?:/(.*))?$
 assert_contains "$TMP_DIR/Caddyfile.final" 'header_down Location "^emby-proxy-prefix-preserved://(.*)$" "/a/$1"'
 assert_contains "$TMP_DIR/Caddyfile.final" 'header_down Content-Location "^emby-proxy-prefix-preserved://(.*)$" "/a/$1"'
 assert_not_contains "$TMP_DIR/Caddyfile.final" 'reverse_proxy {'
+
+# 无域名 IP HTTP 模式：使用独立高位端口，不生成 TLS/ACME 配置，响应头改写为 IP URL。
+ACCESS_MODE="ip"
+PROXY_IP="203.0.113.10"
+LISTEN_PORT="18080"
+set_ip_access_target >/dev/null
+parse_upstream http://203.0.113.10:8096
+[[ "$UPSTREAM_URL" == http://203.0.113.10:8096 ]] || fail "IP 模式错误拒绝了同机不同端口源站"
+if (parse_upstream http://203.0.113.10:18080) >/dev/null 2>&1; then fail "IP 模式未拒绝入口端口代理循环"; fi
+ROUTE_PATHS=("/" "/a")
+ROUTE_URLS=("http://127.0.0.1:8096" "https://origin-two.example.net")
+ROUTE_HOSTS=("127.0.0.1" "origin-two.example.net")
+write_nginx_ip_config "$TMP_DIR/nginx-ip.conf"
+assert_contains "$TMP_DIR/nginx-ip.conf" '# MANAGED EMBY SITE: ip-203.0.113.10-18080'
+assert_contains "$TMP_DIR/nginx-ip.conf" 'listen 18080;'
+assert_contains "$TMP_DIR/nginx-ip.conf" 'server_name 203.0.113.10;'
+assert_contains "$TMP_DIR/nginx-ip.conf" '"http://203.0.113.10:18080/a/$1";'
+assert_contains "$TMP_DIR/nginx-ip.conf" 'proxy_set_header X-Forwarded-For $remote_addr;'
+assert_not_contains "$TMP_DIR/nginx-ip.conf" 'ssl_certificate'
+assert_not_contains "$TMP_DIR/nginx-ip.conf" 'acme-challenge'
+
+: >"$TMP_DIR/Caddyfile.ip-empty"
+build_candidate_config "$TMP_DIR/Caddyfile.ip-empty" "$TMP_DIR/Caddyfile.ip"
+assert_contains "$TMP_DIR/Caddyfile.ip" '# BEGIN MANAGED EMBY REVERSE PROXY: ip-203.0.113.10-18080'
+assert_contains "$TMP_DIR/Caddyfile.ip" 'http://203.0.113.10:18080 {'
+assert_contains "$TMP_DIR/Caddyfile.ip" 'header_down Location "(?i)^https?://127\.0\.0\.1(?::[0-9]+)?$" "http://203.0.113.10:18080/"'
+assert_not_contains "$TMP_DIR/Caddyfile.ip" 'https://203.0.113.10:18080'
+
+valid_ipv4 203.0.113.10 || fail "合法 IPv4 被拒绝"
+valid_ipv4 999.0.0.1 && fail "非法 IPv4 未被拒绝"
+if (LISTEN_PORT=443; normalize_listen_port) >/dev/null 2>&1; then fail "IP 模式允许了受保护端口 443"; fi
 
 # 旧版无域名托管标记在更新旧域名时应迁移，新域名不能把它删除。
 cat >"$TMP_DIR/Caddyfile.legacy" <<'EOF'
@@ -173,6 +205,9 @@ if command -v caddy >/dev/null 2>&1; then
     "$TMP_DIR/Caddyfile.final" >"$validation_dir/Caddyfile"
   caddy adapt --config "$validation_dir/Caddyfile" --adapter caddyfile --validate >/dev/null
   caddy adapt --config "$existing_dir/updated.caddy" --adapter caddyfile --validate >/dev/null
+  sed "s#/var/log/caddy/emby-proxy-ip-[^ ]*-access.log#$validation_dir/ip-access.log#g" \
+    "$TMP_DIR/Caddyfile.ip" >"$validation_dir/Caddyfile.ip"
+  caddy adapt --config "$validation_dir/Caddyfile.ip" --adapter caddyfile --validate >/dev/null
 fi
 
-printf 'PASS: config generation, existing-site path attach, multi-domain isolation, ACME-only HTTP, XFF hardening, idempotent rewrites\n'
+printf 'PASS: domain HTTPS, IP HTTP, existing-site path attach, multi-domain isolation, ACME-only HTTP, XFF hardening, idempotent rewrites\n'
