@@ -43,6 +43,7 @@ set_domain one.example.com
 write_nginx_https_config "$TMP_DIR/nginx-one.conf"
 write_nginx_http_config "$TMP_DIR/nginx-one-acme.conf"
 assert_contains "$TMP_DIR/nginx-one.conf" 'proxy_set_header X-Forwarded-For $remote_addr;'
+assert_contains "$TMP_DIR/nginx-one.conf" '"ts":$msec'
 assert_not_contains "$TMP_DIR/nginx-one.conf" '$proxy_add_x_forwarded_for'
 assert_contains "$TMP_DIR/nginx-one.conf" '$emby_connection_upgrade_one_dot_example_dot_com'
 assert_contains "$TMP_DIR/nginx-one.conf" '"~*^/a(?:/|$)" $upstream_http_location;'

@@ -4,15 +4,22 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.0.0-stage1"
+readonly VERSION="2.1.0-stage2"
 readonly STATE_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
 readonly CADDYFILE="${EMBY_PROXY_CADDYFILE:-/etc/caddy/Caddyfile}"
 readonly NGINX_CONF_DIR="${EMBY_PROXY_NGINX_CONF_DIR:-/etc/nginx/conf.d}"
+readonly CADDY_LOG_DIR="${EMBY_PROXY_CADDY_LOG_DIR:-/var/log/caddy}"
+readonly NGINX_LOG_DIR="${EMBY_PROXY_NGINX_LOG_DIR:-/var/log/nginx}"
 readonly HEALTH_PATH="/_emby_proxy_health"
-readonly INSTALLED_BACKEND="/usr/local/lib/emby-proxy/setup-emby-proxy.sh"
+readonly INSTALLED_BACKEND="${EMBY_PROXY_INSTALLED_BACKEND:-/usr/local/lib/emby-proxy/setup-emby-proxy.sh}"
+readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
+readonly UPDATE_BASE_URL="${EMBY_PROXY_UPDATE_BASE_URL:-https://raw.githubusercontent.com/wuuduf/emby-reverse-proxy-installer/main}"
 LOCK_FD=""
+DOCTOR_OK=0
+DOCTOR_WARN=0
+DOCTOR_ERROR=0
 
 if [[ -t 1 ]]; then
   RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
@@ -42,7 +49,27 @@ Emby Reverse Proxy Manager $VERSION
   sudo emby-proxy delete <入口ID>          删除整个托管入口
   sudo emby-proxy import                  导入旧版脚本配置
   sudo emby-proxy config test             验证完整 Caddy/Nginx 配置
+  sudo emby-proxy doctor [入口ID]         运行环境与端到端诊断
+  sudo emby-proxy logs <入口ID> [模式]    查看/跟踪/过滤访问日志
+  sudo emby-proxy stats <入口ID>          统计请求、流量、错误和慢请求
+  sudo emby-proxy backup list             查看管理器备份
+  sudo emby-proxy backup restore <备份ID> 安全恢复备份
+  sudo emby-proxy service status          查看或管理 Web 服务
+  sudo emby-proxy update [--check]        检查或安装管理器更新
   emby-proxy version
+
+日志模式：
+  --follow                 实时跟踪
+  --media                  最近 200 条中的媒体请求
+  --errors                 最近 200 条中的 4xx/5xx
+  --slow [秒]              最近 200 条中超过阈值的请求（默认 2 秒）
+
+其他常用参数：
+  stats <入口ID> --since 24h
+  backup show <备份ID>
+  backup clean [保留数量] [--yes]
+  service reload|restart|logs caddy|nginx
+  update --force           强制重新安装当前版本
 EOF
 }
 
@@ -159,6 +186,23 @@ health_url_for_file() {
   fi
 }
 
+local_health_code() {
+  local file="$1" health_url mode domain ip port request_path public_url
+  health_url="$(health_url_for_file "$file")"
+  public_url="$(jq -r '.public_url' "$file")"
+  request_path="${health_url#"$public_url"}"
+  mode="$(jq -r '.mode' "$file")"
+  if [[ "$mode" == "ip" ]]; then
+    ip="$(jq -r '.ip' "$file")"; port="$(jq -r '.listen_port' "$file")"
+    curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' -H "Host: $ip" \
+      --connect-timeout 3 --max-time 8 "http://127.0.0.1:${port}${request_path}" 2>/dev/null || true
+  else
+    domain="$(jq -r '.domain' "$file")"
+    curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --resolve "$domain:443:127.0.0.1" \
+      --connect-timeout 3 --max-time 8 "https://${domain}${request_path}" 2>/dev/null || true
+  fi
+}
+
 list_sites() {
   local file id url engine routes kind index=0
   ensure_state_dirs
@@ -178,7 +222,7 @@ list_sites() {
 }
 
 show_site() {
-  local file id="$1" health_url code path upstream mode domain ip port request_path
+  local file id="$1" health_url code path upstream
   file="$(require_site "$id")"
   printf '%s入口详情%s\n\n' "$BOLD" "$RESET"
   jq -r '
@@ -195,17 +239,7 @@ show_site() {
     printf '  %-16s -> %s\n' "$path" "$upstream"
   done < <(jq -r '.routes[] | [.path,.upstream] | @tsv' "$file")
   health_url="$(health_url_for_file "$file")"
-  mode="$(jq -r '.mode' "$file")"
-  request_path="${health_url#$(jq -r '.public_url' "$file")}"
-  if [[ "$mode" == "ip" ]]; then
-    ip="$(jq -r '.ip' "$file")"; port="$(jq -r '.listen_port' "$file")"
-    code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' -H "Host: $ip" \
-      --connect-timeout 3 --max-time 8 "http://127.0.0.1:${port}${request_path}" 2>/dev/null || true)"
-  else
-    domain="$(jq -r '.domain' "$file")"
-    code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --resolve "$domain:443:127.0.0.1" \
-      --connect-timeout 3 --max-time 8 "https://${domain}${request_path}" 2>/dev/null || true)"
-  fi
+  code="$(local_health_code "$file")"
   printf '\n健康地址：%s\n' "$health_url"
   if [[ "$code" == "200" ]]; then
     ok "入口健康检查 HTTP 200"
@@ -213,6 +247,239 @@ show_site() {
     [[ "$code" == "000" ]] && code="无响应"
     warn "入口健康检查 HTTP ${code:-无响应}"
   fi
+}
+
+doctor_ok()    { ((DOCTOR_OK+=1)); printf '%s[正常]%s %s\n' "$GREEN" "$RESET" "$*"; }
+doctor_warn()  { ((DOCTOR_WARN+=1)); printf '%s[提醒]%s %s\n' "$YELLOW" "$RESET" "$*"; }
+doctor_error() { ((DOCTOR_ERROR+=1)); printf '%s[错误]%s %s\n' "$RED" "$RESET" "$*"; }
+
+doctor_config_quiet() {
+  local engine="$1"
+  if [[ "$engine" == "caddy" ]]; then
+    command -v caddy >/dev/null 2>&1 && [[ -f "$CADDYFILE" ]] && \
+      caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1
+  else
+    command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1
+  fi
+}
+
+doctor_certificate() {
+  local domain="$1" pem enddate
+  command -v openssl >/dev/null 2>&1 || { doctor_warn "${domain}：缺少 openssl，未检查证书。"; return; }
+  pem="$(timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$domain" -showcerts </dev/null 2>/dev/null || true)"
+  enddate="$(openssl x509 -noout -enddate 2>/dev/null <<<"$pem" | sed 's/^notAfter=//' || true)"
+  if [[ -n "$enddate" ]] && openssl x509 -noout -checkend 604800 >/dev/null 2>&1 <<<"$pem"; then
+    doctor_ok "${domain}：证书有效且至少还有 7 天（到期 ${enddate}）。"
+  elif [[ -n "$enddate" ]]; then
+    doctor_warn "${domain}：证书可读取，但将在 7 天内到期（${enddate}）。"
+  else
+    doctor_error "${domain}：无法从本机 443 获取有效证书。"
+  fi
+}
+
+doctor_dns() {
+  local domain="$1" public_ipv4="$2" records
+  if command -v dig >/dev/null 2>&1; then
+    records="$(dig +time=3 +tries=1 +short A "$domain" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u | paste -sd, - || true)"
+  else
+    records="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd, - || true)"
+  fi
+  if [[ -z "$records" ]]; then
+    doctor_error "${domain}：未解析到 IPv4 A 记录。"
+  elif [[ -n "$public_ipv4" && ",$records," != *",$public_ipv4,"* ]]; then
+    doctor_warn "${domain}：A 记录为 ${records}，与检测到的本机公网 IPv4 $public_ipv4 不同（如使用 CDN 可忽略）。"
+  else
+    doctor_ok "${domain}：DNS A 记录 ${records}。"
+  fi
+}
+
+doctor_firewall() {
+  local port="$1"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    if ufw status 2>/dev/null | grep -Eq "(^|[[:space:]])${port}/tcp([[:space:]]|$)|(^|[[:space:]])${port}([[:space:]]|$)"; then
+      doctor_ok "UFW 已显示放行 TCP ${port}。"
+    else
+      doctor_warn "UFW 已启用，但未明确看到 TCP $port 放行规则。"
+    fi
+  elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    firewall-cmd --query-port="${port}/tcp" >/dev/null 2>&1 && \
+      doctor_ok "firewalld 已放行 TCP ${port}。" || doctor_warn "firewalld 未显示 TCP $port 放行规则。"
+  else
+    doctor_warn "未检测到启用中的 UFW/firewalld；云安全组仍需在厂商控制台确认 TCP ${port}。"
+  fi
+}
+
+doctor_site() {
+  local file="$1" id engine mode config port code path upstream upstream_code domain public_ipv4="$2"
+  id="$(jq -r '.id' "$file")"; engine="$(jq -r '.engine' "$file")"; mode="$(jq -r '.mode' "$file")"
+  config="$(jq -r '.config_file' "$file")"
+  printf '\n%s入口：%s%s\n' "$BOLD" "$id" "$RESET"
+  jq -e '.schema_version==1 and (.routes|type=="array") and (.routes|length>0)' "$file" >/dev/null 2>&1 && \
+    doctor_ok "管理索引结构有效。" || doctor_error "管理索引损坏或没有路径：$file"
+  [[ -f "$config" ]] && doctor_ok "配置文件存在：$config" || doctor_error "配置文件不存在：$config"
+  if systemctl is-active --quiet "$engine" 2>/dev/null; then doctor_ok "$engine 服务运行中。"; else doctor_error "$engine 服务未运行。"; fi
+  doctor_config_quiet "$engine" && doctor_ok "$engine 完整配置验证通过。" || doctor_error "$engine 完整配置验证失败。"
+  if [[ "$mode" == "domain" ]]; then
+    domain="$(jq -r '.domain' "$file")"; port=443
+    doctor_dns "$domain" "$public_ipv4"
+    doctor_certificate "$domain"
+  else
+    port="$(jq -r '.listen_port' "$file")"
+    if ss -H -lnt 2>/dev/null | awk -v port=":$port" '$4 ~ (port "$") {found=1} END{exit !found}'; then
+      doctor_ok "TCP $port 正在监听。"
+    else
+      doctor_error "TCP $port 没有监听。"
+    fi
+  fi
+  doctor_firewall "$port"
+  code="$(local_health_code "$file")"
+  [[ "$code" == "200" ]] && doctor_ok "本机入口健康检查 HTTP 200。" || doctor_error "本机入口健康检查 HTTP ${code:-无响应}。"
+  while IFS=$'\t' read -r path upstream; do
+    upstream_code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 "${upstream%/}/" 2>/dev/null || true)"
+    if [[ "$upstream_code" =~ ^[1-4][0-9][0-9]$ && "$upstream_code" != "000" ]]; then
+      doctor_ok "路径 $path 源站可访问：${upstream}（HTTP ${upstream_code}）。"
+    elif [[ "$upstream_code" =~ ^5[0-9][0-9]$ ]]; then
+      doctor_warn "路径 $path 源站返回 HTTP ${upstream_code}：$upstream"
+    else
+      doctor_error "路径 $path 无法连接源站：$upstream"
+    fi
+  done < <(jq -r '.routes[] | [.path,.upstream] | @tsv' "$file")
+}
+
+run_doctor() {
+  local id="${1:-}" file public_ipv4="" os_name
+  DOCTOR_OK=0; DOCTOR_WARN=0; DOCTOR_ERROR=0
+  printf '%sEmby Proxy 运行诊断%s\n' "$BOLD" "$RESET"
+  if [[ -r /etc/os-release ]]; then
+    os_name="$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-unknown}")"
+    doctor_ok "系统：$os_name / $(uname -m)"
+  else
+    doctor_error "缺少 /etc/os-release。"
+  fi
+  public_ipv4="$(curl -4 --noproxy '*' -fsS --connect-timeout 3 --max-time 6 https://api.ipify.org 2>/dev/null || true)"
+  [[ -n "$public_ipv4" ]] && doctor_ok "本机公网 IPv4：$public_ipv4" || doctor_warn "无法自动检测本机公网 IPv4。"
+  if [[ -n "$id" ]]; then
+    file="$(require_site "$id")"; doctor_site "$file" "$public_ipv4"
+  else
+    while IFS= read -r file; do doctor_site "$file" "$public_ipv4"; done < <(find "$SITES_DIR" -type f -name '*.json' -print | sort)
+    (( $(site_count) > 0 )) || doctor_warn "没有管理索引；可运行 emby-proxy import。"
+  fi
+  printf '\n诊断汇总：正常 %s，提醒 %s，错误 %s\n' "$DOCTOR_OK" "$DOCTOR_WARN" "$DOCTOR_ERROR"
+  (( DOCTOR_ERROR == 0 ))
+}
+
+access_log_for_file() {
+  local file="$1" engine mode key kind
+  engine="$(jq -r '.engine' "$file")"; mode="$(jq -r '.mode' "$file")"; kind="$(jq -r '.managed_kind' "$file")"
+  [[ "$kind" != "caddy_attached" ]] || return 1
+  if [[ "$mode" == "ip" ]]; then
+    key="ip-$(jq -r '.ip' "$file")-$(jq -r '.listen_port' "$file")"
+  else
+    key="$(jq -r '.domain' "$file")"
+  fi
+  if [[ "$engine" == "caddy" ]]; then
+    printf '%s/emby-proxy-%s-access.log' "$CADDY_LOG_DIR" "$key"
+  else
+    printf '%s/emby-proxy-%s-access.log' "$NGINX_LOG_DIR" "$key"
+  fi
+}
+
+normalized_log_jq() {
+  cat <<'JQ'
+def norm:
+  {
+    time:(.time // (if .ts? != null then (.ts|floor|todateiso8601) else "-" end)),
+    client:(.client // .request.remote_ip // .request.client_ip // "-"),
+    method:(.method // .request.method // "-"),
+    path:(.path // .request.uri // "-"),
+    status:((.status // 0)|tonumber),
+    bytes:((.bytes_sent // .size // 0)|tonumber),
+    duration:((.request_time // .duration // 0)|tonumber),
+    upstream:(.upstream // "-")
+  };
+norm
+JQ
+}
+
+view_logs() {
+  local id="$1" mode="${2:---recent}" file log engine threshold="${3:-2}" jq_filter base_filter
+  file="$(require_site "$id")"; engine="$(jq -r '.engine' "$file")"
+  if ! log="$(access_log_for_file "$file")"; then
+    warn "该入口附加在手工 Caddy 站点中，日志位置由原站点决定；改为显示 Caddy 服务日志。"
+    journalctl -u caddy -n 100 --no-pager
+    return
+  fi
+  [[ -r "$log" ]] || die "访问日志不存在或不可读：$log"
+  base_filter="$(normalized_log_jq)"
+  case "$mode" in
+    --follow|-f) jq_filter="$base_filter | [.time,.client,.method,.path,(.status|tostring),(.bytes|tostring),(.duration|tostring)]|@tsv" ;;
+    --media) jq_filter="$base_filter | select(.path|test(\"/Videos/|/Audio/|/stream|\\\\.m3u8\";\"i\")) | [.time,.client,.path,(.status|tostring),(.bytes|tostring),(.duration|tostring)]|@tsv" ;;
+    --errors) jq_filter="$base_filter | select(.status>=400) | [.time,.client,.method,.path,(.status|tostring),(.upstream)]|@tsv" ;;
+    --slow) [[ "$threshold" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "慢请求阈值必须是秒数。"
+      jq_filter="$base_filter | select(.duration>=$threshold) | [.time,.client,.path,(.status|tostring),(.duration|tostring)]|@tsv" ;;
+    --recent|"") jq_filter="$base_filter | [.time,.client,.method,.path,(.status|tostring),(.bytes|tostring),(.duration|tostring)]|@tsv" ;;
+    *) die "日志模式支持：--follow、--media、--errors、--slow [秒]。" ;;
+  esac
+  info "日志文件：$log"
+  if [[ "$mode" == "--follow" || "$mode" == "-f" ]]; then
+    tail -n 20 -F "$log" | jq --unbuffered -Rr "fromjson? | $jq_filter"
+  else
+    tail -n 1000 "$log" | jq -Rr "fromjson? | $jq_filter" | tail -n 100
+  fi
+}
+
+duration_to_seconds() {
+  local value="$1" number unit
+  [[ "$value" =~ ^([0-9]+)([smhd])$ ]] || die "时间范围格式无效：${value}（示例：30m、24h、7d）"
+  number="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+  case "$unit" in s) printf '%s' "$number";; m) printf '%s' "$((number*60))";; h) printf '%s' "$((number*3600))";; d) printf '%s' "$((number*86400))";; esac
+}
+
+human_bytes() {
+  local bytes="$1"
+  if command -v numfmt >/dev/null 2>&1; then numfmt --to=iec-i --suffix=B "$bytes"; else printf '%s B' "$bytes"; fi
+}
+
+show_stats() {
+  local id="$1" since="${2:-24h}" file log seconds cutoff result requests bytes errors slow avg top
+  file="$(require_site "$id")"
+  log="$(access_log_for_file "$file")" || die "附加在手工 Caddy 站点中的入口没有独立日志，无法自动统计。"
+  [[ -r "$log" ]] || die "访问日志不存在或不可读：$log"
+  seconds="$(duration_to_seconds "$since")"; cutoff="$(($(date +%s)-seconds))"
+  result="$(jq -Rn --argjson cutoff "$cutoff" '
+    def epoch:
+      if .ts? != null then (.ts|tonumber)
+      elif .time? != null then try (
+        (.time|capture("^(?<base>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?<sign>[+-])(?<hh>[0-9]{2}):(?<mm>[0-9]{2})$")) as $t |
+        (($t.base+"Z"|fromdateiso8601) - (((($t.hh|tonumber)*3600)+(($t.mm|tonumber)*60)) * (if $t.sign=="+" then 1 else -1 end)))) catch 0
+      else 0 end;
+    def norm:
+      {client:(.client // .request.remote_ip // .request.client_ip // "unknown"),
+       path:(.path // .request.uri // "unknown"),status:((.status // 0)|tonumber),
+       bytes:((.bytes_sent // .size // 0)|tonumber),duration:((.request_time // .duration // 0)|tonumber)};
+    reduce (inputs|fromjson?) as $r
+      ({requests:0,bytes:0,errors:0,slow:0,duration:0,clients:{},paths:{}};
+       ($r|epoch) as $epoch | if $epoch >= $cutoff then ($r|norm) as $n |
+         .requests += 1 | .bytes += $n.bytes | .duration += $n.duration |
+         .errors += (if $n.status>=400 then 1 else 0 end) |
+         .slow += (if $n.duration>=2 then 1 else 0 end) |
+         .clients[$n.client] = ((.clients[$n.client] // 0)+$n.bytes) |
+         .paths[$n.path] = ((.paths[$n.path] // 0)+1)
+       else . end) |
+    . + {top_clients:(.clients|to_entries|sort_by(-.value)|.[0:5]),top_paths:(.paths|to_entries|sort_by(-.value)|.[0:5])}
+  ' "$log")"
+  requests="$(jq -r '.requests' <<<"$result")"; bytes="$(jq -r '.bytes' <<<"$result")"
+  errors="$(jq -r '.errors' <<<"$result")"; slow="$(jq -r '.slow' <<<"$result")"
+  avg="$(jq -r 'if .requests>0 then (.duration/.requests) else 0 end' <<<"$result")"
+  printf '%s最近 %s 流量统计%s\n\n' "$BOLD" "$since" "$RESET"
+  printf '  请求数：%s\n  输出流量：%s\n  4xx/5xx：%s\n  慢请求（>=2s）：%s\n  平均耗时：%.3f 秒\n' \
+    "$requests" "$(human_bytes "$bytes")" "$errors" "$slow" "$avg"
+  printf '\n  流量最高客户端：\n'
+  while IFS=$'\t' read -r top bytes; do [[ -n "$top" ]] && printf '    %-30s %s\n' "$top" "$(human_bytes "$bytes")"; done \
+    < <(jq -r '.top_clients[]|[.key,(.value|tostring)]|@tsv' <<<"$result")
+  printf '\n  请求最多路径：\n'
+  while IFS=$'\t' read -r top requests; do [[ -n "$top" ]] && printf '    %-50s %s\n' "$top" "$requests"; done \
+    < <(jq -r '.top_paths[]|[.key,(.value|tostring)]|@tsv' <<<"$result")
 }
 
 write_state_json() {
@@ -407,11 +674,127 @@ route_upsert() {
 }
 
 backup_target() {
-  local id="$1" target="$2" timestamp dir
+  local id="$1" target="$2" reason="${3:-config-change}" timestamp dir suffix=0 state engine="unknown" filename hash now
   timestamp="$(date +%Y%m%d-%H%M%S)"; dir="$BACKUPS_DIR/${timestamp}-${id}"
+  while [[ -e "$dir" ]]; do ((suffix+=1)); dir="$BACKUPS_DIR/${timestamp}-${id}-${suffix}"; done
   install_managed_dir 0750 "$dir"
-  cp -a "$target" "$dir/$(basename "$target")"
+  filename="$(basename "$target")"; cp -a "$target" "$dir/$filename"
+  state="$(state_file "$id")"
+  if [[ -f "$state" ]]; then
+    engine="$(jq -r '.engine // "unknown"' "$state")"
+    cp -a "$state" "$dir/site-state.json"
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then hash="$(sha256sum "$dir/$filename" | awk '{print $1}')";
+  else hash="$(shasum -a 256 "$dir/$filename" | awk '{print $1}')"; fi
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  jq -n --arg backup_id "$(basename "$dir")" --arg site_id "$id" --arg engine "$engine" \
+    --arg target "$target" --arg filename "$filename" --arg sha256 "$hash" --arg reason "$reason" --arg created_at "$now" \
+    '{schema_version:1,backup_id:$backup_id,site_id:$site_id,engine:$engine,target:$target,
+      filename:$filename,sha256:$sha256,reason:$reason,created_at:$created_at}' >"$dir/metadata.json"
+  chmod 0640 "$dir/metadata.json"
   printf '%s' "$dir"
+}
+
+backup_dir() {
+  local backup_id="$1"
+  [[ "$backup_id" =~ ^[0-9]{8}-[0-9]{6}-(domain|ip)-[A-Za-z0-9._:-]+(-[0-9]+)?$ ]] || die "备份 ID 格式无效：$backup_id"
+  [[ -d "$BACKUPS_DIR/$backup_id" ]] || die "找不到备份：$backup_id"
+  printf '%s/%s' "$BACKUPS_DIR" "$backup_id"
+}
+
+backup_list() {
+  local dir meta id site reason created size count=0
+  printf '%-48s %-28s %-14s %s\n' "备份ID" "入口" "原因" "大小"
+  while IFS= read -r dir; do
+    meta="$dir/metadata.json"; id="$(basename "$dir")"
+    if [[ -f "$meta" ]]; then
+      site="$(jq -r '.site_id // "unknown"' "$meta")"; reason="$(jq -r '.reason // "unknown"' "$meta")"
+    else site="旧版备份"; reason="unknown"; fi
+    size="$(du -sh "$dir" 2>/dev/null | awk '{print $1}')"
+    printf '%-48s %-28s %-14s %s\n' "$id" "$site" "$reason" "${size:-0}"
+    ((count+=1))
+  done < <(find "$BACKUPS_DIR" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort -r)
+  (( count > 0 )) || warn "还没有管理器备份。"
+}
+
+backup_show() {
+  local dir meta target filename
+  dir="$(backup_dir "$1")"; meta="$dir/metadata.json"
+  [[ -f "$meta" ]] || die "这是没有 metadata.json 的旧版备份，只能人工检查：$dir"
+  jq . "$meta"
+  target="$(jq -r '.target' "$meta")"; filename="$(jq -r '.filename' "$meta")"
+  if [[ -f "$target" && -f "$dir/$filename" ]]; then
+    printf '\n%s与当前配置的差异：%s\n' "$BOLD" "$RESET"
+    diff -u "$target" "$dir/$filename" || true
+  fi
+}
+
+verify_backup_hash() {
+  local file="$1" expected="$2" actual
+  if command -v sha256sum >/dev/null 2>&1; then actual="$(sha256sum "$file" | awk '{print $1}')";
+  else actual="$(shasum -a 256 "$file" | awk '{print $1}')"; fi
+  [[ "$actual" == "$expected" ]] || die "备份 SHA256 校验失败，文件可能已损坏：$file"
+}
+
+target_is_managed_config() {
+  local target="$1" caddy_root nginx_root target_real
+  target_real="$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")"
+  caddy_root="$(readlink -f "$(dirname "$CADDYFILE")")"; nginx_root="$(readlink -f "$NGINX_CONF_DIR")"
+  [[ "$target_real" == "$caddy_root"/* || "$target_real" == "$nginx_root"/* ]]
+}
+
+restore_backup() {
+  local backup_id="$1" dir meta target filename expected engine site answer current_backup="" staged backup_file target_existed=0
+  dir="$(backup_dir "$backup_id")"; meta="$dir/metadata.json"
+  [[ -f "$meta" ]] || die "旧版备份缺少 metadata.json，不能自动恢复。"
+  target="$(jq -r '.target' "$meta")"; filename="$(jq -r '.filename' "$meta")"
+  expected="$(jq -r '.sha256' "$meta")"; engine="$(jq -r '.engine' "$meta")"; site="$(jq -r '.site_id' "$meta")"
+  backup_file="$dir/$filename"; [[ -f "$backup_file" ]] || die "备份文件不存在：$backup_file"
+  verify_backup_hash "$backup_file" "$expected"
+  target_is_managed_config "$target" || die "备份目标不在 Caddy/Nginx 配置目录内，拒绝恢复：$target"
+  [[ -f "$target" ]] && target_existed=1
+  (( target_existed )) || [[ "$engine" == "nginx" ]] || die "当前 Caddy 目标文件不存在，拒绝创建未知文件：$target"
+  printf '将用备份 %s 覆盖 %s，确认？[y/N]：' "$backup_id" "$target"; read -r answer
+  [[ "$answer" =~ ^[Yy]$ ]] || die "已取消。"
+  acquire_lock
+  (( target_existed == 0 )) || current_backup="$(backup_target "$site" "$target" pre-restore)"
+  staged="$(mktemp "${target}.restore.XXXXXX")"; cat "$backup_file" >"$staged"
+  if (( target_existed )); then chown --reference="$target" "$staged"; chmod --reference="$target" "$staged"; else chmod 0644 "$staged"; fi
+  mv "$staged" "$target"
+  if [[ "$engine" == "caddy" ]]; then
+    if ! caddy validate --config "$CADDYFILE" --adapter caddyfile || ! systemctl reload caddy; then
+      if (( target_existed )); then cp -a "$current_backup/$(basename "$target")" "$target"; else rm -f "$target"; fi
+      systemctl reload caddy >/dev/null 2>&1 || true
+      die "恢复后 Caddy 验证/reload 失败，已回到恢复前配置：$current_backup"
+    fi
+  elif [[ "$engine" == "nginx" ]]; then
+    if ! nginx -t || ! systemctl reload nginx; then
+      if (( target_existed )); then cp -a "$current_backup/$(basename "$target")" "$target"; else rm -f "$target"; fi
+      systemctl reload nginx >/dev/null 2>&1 || true
+      die "恢复后 Nginx 验证/reload 失败，已回到恢复前配置：$current_backup"
+    fi
+  else
+    if (( target_existed )); then cp -a "$current_backup/$(basename "$target")" "$target"; else rm -f "$target"; fi
+    die "备份未记录有效引擎，已取消恢复。"
+  fi
+  release_lock
+  if [[ -f "$dir/site-state.json" ]]; then
+    install_managed_file 0640 "$dir/site-state.json" "$(state_file "$site")"
+  fi
+  if [[ -n "$current_backup" ]]; then ok "备份已恢复；恢复前状态另存于：$current_backup"; else ok "备份已恢复到原 Nginx 配置路径。"; fi
+}
+
+backup_clean() {
+  local keep="${1:-20}" yes="${2:-}" answer dir index=0 removed=0
+  [[ "$keep" =~ ^[0-9]+$ ]] && ((keep>=1)) || die "保留数量必须是正整数。"
+  [[ "$yes" == "--yes" ]] || { printf '将只保留最新 %s 个管理器备份，确认？[y/N]：' "$keep"; read -r answer; [[ "$answer" =~ ^[Yy]$ ]] || die "已取消。"; }
+  acquire_lock
+  while IFS= read -r dir; do
+    ((index+=1)); (( index <= keep )) && continue
+    [[ "$(dirname "$dir")" == "$BACKUPS_DIR" ]] || die "备份路径越界：$dir"
+    rm -rf -- "$dir"; ((removed+=1))
+  done < <(find "$BACKUPS_DIR" -mindepth 1 -maxdepth 1 -type d -print | sort -r)
+  release_lock; ok "已清理 $removed 个旧备份。"
 }
 
 apply_caddy_removal() {
@@ -525,6 +908,88 @@ config_test() {
   (( failed == 0 )) || return 1
 }
 
+service_control() {
+  local action="${1:-status}" engine="${2:-}"
+  case "$action" in
+    status)
+      printf '%s\n%s\n' "$(service_line caddy caddy)" "$(service_line nginx nginx)" ;;
+    reload|restart)
+      [[ "$engine" == "caddy" || "$engine" == "nginx" ]] || die "用法：emby-proxy service $action caddy|nginx"
+      doctor_config_quiet "$engine" || die "$engine 配置验证失败，拒绝 ${action}。"
+      systemctl "$action" "$engine"
+      systemctl is-active --quiet "$engine" || die "$engine 在 $action 后未处于运行状态。"
+      ok "$engine 已安全执行 ${action}。" ;;
+    logs)
+      [[ "$engine" == "caddy" || "$engine" == "nginx" ]] || die "用法：emby-proxy service logs caddy|nginx"
+      journalctl -u "$engine" -n 100 --no-pager ;;
+    *) die "服务操作支持：status、reload、restart、logs。" ;;
+  esac
+}
+
+verify_update_checksums() {
+  local dir="$1" expected file actual manager_seen=0 backend_seen=0
+  [[ -f "$dir/checksums.txt" ]] || die "更新源缺少 checksums.txt。"
+  while IFS=' ' read -r expected file; do
+    [[ "$file" == "emby-proxy" || "$file" == "setup-emby-proxy.sh" ]] || continue
+    [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die "更新文件 $file 的 SHA256 格式无效。"
+    expected="$(printf '%s' "$expected" | tr 'A-F' 'a-f')"
+    [[ -f "$dir/$file" ]] || die "更新包缺少：$file"
+    if command -v sha256sum >/dev/null 2>&1; then actual="$(sha256sum "$dir/$file" | awk '{print $1}')";
+    else actual="$(shasum -a 256 "$dir/$file" | awk '{print $1}')"; fi
+    [[ "$actual" == "$expected" ]] || die "更新文件 $file 的 SHA256 不匹配。"
+    [[ "$file" == "emby-proxy" ]] && manager_seen=1 || backend_seen=1
+  done <"$dir/checksums.txt"
+  (( manager_seen == 1 && backend_seen == 1 )) || die "checksums.txt 必须同时包含 emby-proxy 和 setup-emby-proxy.sh。"
+}
+
+atomic_install_executable() {
+  local source="$1" target="$2" staged
+  install_managed_dir 0755 "$(dirname "$target")"
+  staged="$(mktemp "$(dirname "$target")/.emby-update.XXXXXX")"
+  cat "$source" >"$staged"; chmod 0755 "$staged"
+  [[ ${EUID:-$(id -u)} -ne 0 ]] || chown root:root "$staged"
+  mv "$staged" "$target"
+}
+
+self_update() {
+  local option="${1:-}" temp latest_version answer backup_dir timestamp manager_backup="" backend_backup=""
+  [[ -z "$option" || "$option" == "--check" || "$option" == "--force" ]] || die "用法：emby-proxy update [--check|--force]"
+  temp="$(mktemp -d /tmp/emby-proxy-update.XXXXXX)"
+  info "正在从更新源获取管理器和安装后端……"
+  curl -fsSL --connect-timeout 8 --max-time 30 "$UPDATE_BASE_URL/emby-proxy" -o "$temp/emby-proxy" || die "下载 emby-proxy 失败。"
+  curl -fsSL --connect-timeout 8 --max-time 30 "$UPDATE_BASE_URL/setup-emby-proxy.sh" -o "$temp/setup-emby-proxy.sh" || die "下载安装后端失败。"
+  curl -fsSL --connect-timeout 8 --max-time 30 "$UPDATE_BASE_URL/checksums.txt" -o "$temp/checksums.txt" || die "下载校验文件失败。"
+  verify_update_checksums "$temp"
+  bash -n "$temp/emby-proxy" "$temp/setup-emby-proxy.sh" || die "更新文件语法验证失败。"
+  latest_version="$(sed -n 's/^readonly VERSION="\([^"]*\)"/\1/p' "$temp/emby-proxy" | head -n1)"
+  [[ -n "$latest_version" ]] || die "无法识别更新版本。"
+  printf '当前版本：%s\n远端版本：%s\n' "$VERSION" "$latest_version"
+  if [[ "$option" == "--check" ]]; then
+    [[ "$latest_version" == "$VERSION" ]] && ok "当前已是最新版本。" || info "发现可更新版本：$latest_version"
+    rm -rf "$temp"
+    return
+  fi
+  if [[ "$latest_version" == "$VERSION" && "$option" != "--force" ]]; then ok "当前已是最新版本。"; rm -rf "$temp"; return; fi
+  if [[ "$option" != "--force" ]]; then
+    printf '确认更新管理命令和安装后端？[y/N]：'; read -r answer; [[ "$answer" =~ ^[Yy]$ ]] || die "已取消。"
+  fi
+  acquire_lock
+  timestamp="$(date +%Y%m%d-%H%M%S)"; backup_dir="$BACKUPS_DIR/update-$timestamp"
+  install_managed_dir 0750 "$backup_dir"
+  if [[ -f "$MANAGER_BIN" ]]; then cp -a "$MANAGER_BIN" "$backup_dir/emby-proxy"; manager_backup=1; fi
+  if [[ -f "$INSTALLED_BACKEND" ]]; then cp -a "$INSTALLED_BACKEND" "$backup_dir/setup-emby-proxy.sh"; backend_backup=1; fi
+  if ! atomic_install_executable "$temp/emby-proxy" "$MANAGER_BIN" || \
+     ! atomic_install_executable "$temp/setup-emby-proxy.sh" "$INSTALLED_BACKEND"; then
+    [[ -z "$manager_backup" ]] || cp -a "$backup_dir/emby-proxy" "$MANAGER_BIN"
+    [[ -z "$backend_backup" ]] || cp -a "$backup_dir/setup-emby-proxy.sh" "$INSTALLED_BACKEND"
+    release_lock; die "更新安装失败，已恢复旧文件：$backup_dir"
+  fi
+  release_lock
+  rm -rf "$temp"
+  ok "已更新到 ${latest_version}；旧版本备份：$backup_dir"
+  info "重新运行 sudo emby-proxy 即可使用新版本。"
+}
+
 select_site_id() {
   local -a ids=() file choice
   while IFS= read -r file; do ids+=("$(jq -r '.id' "$file")"); done < <(find "$SITES_DIR" -type f -name '*.json' -print 2>/dev/null | sort)
@@ -544,7 +1009,10 @@ manage_site_menu() {
   1. 新增路径
   2. 修改路径源站
   3. 删除路径
-  4. 删除整个入口
+  4. 运行入口诊断
+  5. 查看最近访问日志
+  6. 查看最近 24h 流量统计
+  7. 删除整个入口
   0. 返回
 EOF
     printf '请选择：'; read -r choice
@@ -552,11 +1020,86 @@ EOF
       1) route_upsert add "$id" ;;
       2) route_upsert set "$id" ;;
       3) route_delete "$id" ;;
-      4) delete_site "$id"; return ;;
+      4) run_doctor "$id" || true ;;
+      5) view_logs "$id" --recent ;;
+      6) show_stats "$id" 24h ;;
+      7) delete_site "$id"; return ;;
       0) return ;;
       *) warn "请输入有效序号。" ;;
     esac
   done
+}
+
+logs_stats_menu() {
+  local id choice threshold
+  id="$(select_site_id)"
+  cat <<EOF
+
+  1. 最近请求
+  2. 实时跟踪
+  3. 媒体请求
+  4. 错误请求
+  5. 慢请求
+  6. 最近 24h 流量统计
+  7. 最近 7d 流量统计
+  0. 返回
+EOF
+  printf '请选择：'; read -r choice
+  case "$choice" in
+    1) view_logs "$id" --recent ;;
+    2) view_logs "$id" --follow ;;
+    3) view_logs "$id" --media ;;
+    4) view_logs "$id" --errors ;;
+    5) printf '慢请求阈值秒数（默认 2）：'; read -r threshold; view_logs "$id" --slow "${threshold:-2}" ;;
+    6) show_stats "$id" 24h ;;
+    7) show_stats "$id" 7d ;;
+    0) return ;;
+    *) warn "请输入有效序号。" ;;
+  esac
+}
+
+backup_menu() {
+  local choice id keep
+  cat <<EOF
+
+  1. 查看备份列表
+  2. 查看备份详情和差异
+  3. 恢复备份
+  4. 清理旧备份
+  0. 返回
+EOF
+  printf '请选择：'; read -r choice
+  case "$choice" in
+    1) backup_list ;;
+    2) printf '请输入备份 ID：'; read -r id; backup_show "$id" ;;
+    3) printf '请输入备份 ID：'; read -r id; restore_backup "$id" ;;
+    4) printf '保留最近多少个备份（默认 20）：'; read -r keep; backup_clean "${keep:-20}" ;;
+    0) return ;;
+    *) warn "请输入有效序号。" ;;
+  esac
+}
+
+service_menu() {
+  local choice engine
+  cat <<EOF
+
+  1. 查看服务状态
+  2. 安全 Reload
+  3. Restart
+  4. 查看服务日志
+  5. 验证完整配置
+  0. 返回
+EOF
+  printf '请选择：'; read -r choice
+  case "$choice" in
+    1) service_control status ;;
+    2|3|4)
+      printf '请输入 caddy 或 nginx：'; read -r engine
+      case "$choice" in 2) service_control reload "$engine";; 3) service_control restart "$engine";; 4) service_control logs "$engine";; esac ;;
+    5) config_test ;;
+    0) return ;;
+    *) warn "请输入有效序号。" ;;
+  esac
 }
 
 main_menu() {
@@ -573,8 +1116,12 @@ main_menu() {
   2. 查看入口详情
   3. 新增反代入口
   4. 管理已有入口/路径
-  5. 导入旧版脚本配置
-  6. 验证 Caddy/Nginx 配置
+  5. 运行环境与入口诊断
+  6. 日志与流量统计
+  7. 备份、差异与恢复
+  8. Caddy/Nginx 服务管理
+  9. 导入旧版脚本配置
+ 10. 检查/更新管理程序
   0. 退出
 EOF
     printf '请选择：'; read -r choice
@@ -583,8 +1130,12 @@ EOF
       2) id="$(select_site_id)"; show_site "$id" ;;
       3) backend="$(backend_path)"; "$backend" ;;
       4) id="$(select_site_id)"; manage_site_menu "$id" ;;
-      5) import_existing ;;
-      6) config_test ;;
+      5) run_doctor || true ;;
+      6) logs_stats_menu ;;
+      7) backup_menu ;;
+      8) service_menu ;;
+      9) import_existing ;;
+      10) self_update ;;
       0) return ;;
       *) warn "请输入有效序号。" ;;
     esac
@@ -606,6 +1157,22 @@ main() {
     show) [[ $# -ge 2 ]] || die "用法：emby-proxy show <入口ID>"; show_site "$2" ;;
     add) shift; "$(backend_path)" "$@" ;;
     import) import_existing ;;
+    doctor) run_doctor "${2:-}" ;;
+    logs) [[ $# -ge 2 ]] || die "用法：emby-proxy logs <入口ID> [--follow|--media|--errors|--slow 秒]"
+      view_logs "$2" "${3:---recent}" "${4:-2}" ;;
+    stats)
+      [[ $# -ge 2 ]] || die "用法：emby-proxy stats <入口ID> [--since 24h]"
+      if [[ "${3:-}" == "--since" ]]; then show_stats "$2" "${4:-24h}"; else show_stats "$2" "${3:-24h}"; fi ;;
+    backup)
+      case "${2:-list}" in
+        list) backup_list ;;
+        show) [[ $# -ge 3 ]] || die "用法：emby-proxy backup show <备份ID>"; backup_show "$3" ;;
+        restore) [[ $# -ge 3 ]] || die "用法：emby-proxy backup restore <备份ID>"; restore_backup "$3" ;;
+        clean) backup_clean "${3:-20}" "${4:-}" ;;
+        *) die "备份操作支持：list、show、restore、clean。" ;;
+      esac ;;
+    service) service_control "${2:-status}" "${3:-}" ;;
+    update) self_update "${2:-}" ;;
     delete) [[ $# -ge 2 ]] || die "用法：emby-proxy delete <入口ID>"; delete_site "$2" ;;
     route)
       [[ $# -ge 3 ]] || die "用法：emby-proxy route add|set|delete <入口ID>"

@@ -36,7 +36,7 @@ sudo /tmp/setup-emby-proxy.sh --manager-only
 
 该模式会安装命令并尝试导入旧版脚本配置，然后直接进入长期管理流程。
 
-## `emby-proxy` 管理命令（第一阶段）
+## `emby-proxy` 管理命令（第二阶段）
 
 常用命令：
 
@@ -53,6 +53,34 @@ sudo emby-proxy route delete domain-emby.example.com
 sudo emby-proxy delete domain-emby.example.com
 sudo emby-proxy import
 sudo emby-proxy config test
+
+# 环境、DNS、证书、服务、入口和每个源站的联合诊断
+sudo emby-proxy doctor
+sudo emby-proxy doctor domain-emby.example.com
+
+# 日志过滤与流量统计
+sudo emby-proxy logs domain-emby.example.com
+sudo emby-proxy logs domain-emby.example.com --follow
+sudo emby-proxy logs domain-emby.example.com --media
+sudo emby-proxy logs domain-emby.example.com --errors
+sudo emby-proxy logs domain-emby.example.com --slow 2
+sudo emby-proxy stats domain-emby.example.com --since 24h
+
+# 备份、差异、恢复和清理
+sudo emby-proxy backup list
+sudo emby-proxy backup show 备份ID
+sudo emby-proxy backup restore 备份ID
+sudo emby-proxy backup clean 20
+
+# 安全管理服务（reload/restart 前先验证完整配置）
+sudo emby-proxy service status
+sudo emby-proxy service reload caddy
+sudo emby-proxy service restart nginx
+sudo emby-proxy service logs caddy
+
+# 校验远端 SHA256 后检查或安装更新
+sudo emby-proxy update --check
+sudo emby-proxy update
 ```
 
 管理数据保存在：
@@ -66,7 +94,11 @@ sudo emby-proxy config test
 
 新增或修改路径时，管理器把完整入口状态重新交给经过验证的安装后端：先检查环境和源站，再生成候选配置、备份、运行 `caddy validate`/`nginx -t`、reload 和端到端检查。删除操作只识别脚本的精确托管标记或独立 Nginx 文件；标记缺失、重复或不完整时会拒绝自动删除。
 
-管理器与安装后端共同使用 `/run/lock/emby-proxy.lock`，避免两个 SSH 窗口同时修改配置。第一阶段不包含流量统计、定时健康检查和自动更新，这些功能将在后续阶段加入。
+管理器与安装后端共同使用 `/run/lock/emby-proxy.lock`，避免两个 SSH 窗口同时修改配置。第二阶段已经包含按需诊断、日志过滤、流量统计、备份恢复、服务管理和带 SHA256 校验的自更新；尚未加入 systemd 定时巡检、消息告警和 Web 管理页面。
+
+`doctor` 会检查管理索引、实际配置文件、完整配置语法、systemd 服务、DNS、证书剩余时间、监听端口、本机防火墙、入口健康地址和每个固定源站。它只做读取与探测，不会自动修改配置；末尾会汇总“正常/提醒/错误”，便于按提示修复。
+
+配置删除和恢复前生成的管理器备份位于 `/etc/emby-proxy/backups/`，新备份带有 `metadata.json`、目标路径和 SHA256。`backup restore` 会先校验备份、再次备份当前配置、执行完整语法验证并 reload；失败时回滚到恢复前状态。自更新会同时校验 `emby-proxy` 与安装后端，执行 `bash -n`，并把旧版本保存在同一备份目录中。
 
 ## 交互式使用
 
@@ -223,6 +255,16 @@ sudo tail -F /var/log/nginx/emby-proxy-emby.example.com-access.log \
   | grep -Ei '/Videos/|/Audio/|/stream|\.m3u8'
 ```
 
+第二阶段管理命令可直接完成常见过滤和汇总，不需要手写 `jq`/`grep`。`stats` 支持 `30m`、`24h`、`7d` 等时间范围，显示请求数、输出流量、4xx/5xx、慢请求、平均耗时、流量最高客户端和请求最多路径：
+
+```bash
+sudo emby-proxy logs domain-emby.example.com --media
+sudo emby-proxy logs domain-emby.example.com --slow 2
+sudo emby-proxy stats domain-emby.example.com --since 7d
+```
+
+为保证统计时间准确，新生成的 Nginx JSON 日志同时写入 Unix 时间戳 `ts` 和可读时间 `time`。管理器仍兼容没有 `ts` 的旧日志。Caddy 附加路径沿用手工站点的日志配置，因此没有独立日志文件时，管理器只能显示 Caddy 服务日志，不能自动做入口级流量统计。
+
 Nginx 日志只记录 `$uri`，不记录查询参数；Caddy 会隐藏常见 `api_key`、`token`、`X-Emby-Token` 和 `X-MediaBrowser-Token`。日志仍可能包含客户端 IP、媒体 ID 等运维信息，文件权限默认为 `0640`，不要公开分享原始日志。
 
 向手工配置的现有 Caddy 域名追加路径时，脚本沿用该站点原来的日志设置，不会为了单个路径擅自改变整站日志。
@@ -303,9 +345,10 @@ Nginx 日志只记录 `$uri`，不记录查询参数；Caddy 会隐藏常见 `ap
 ```bash
 bash tests/test-config-generation.sh
 bash tests/test-manager.sh
+bash tests/test-manager-stage2.sh
 ```
 
-测试会检查域名 HTTPS 与 IP HTTP 配置生成、独立端口、已有 Caddy 站点路径插入及更新、路径冲突拒绝、多域名互不覆盖、旧 Caddy 标记迁移、Nginx 每域名变量隔离、管理索引持久化、旧配置导入、状态到安装参数的无损回放、ACME 阶段没有明文 `proxy_pass`、`X-Forwarded-For` 防伪造，以及子路径响应头改写幂等性。如果本机已安装 Caddy，还会额外执行完整 Caddy 配置验证；正式部署仍会在 reload 前运行 VPS 上的 `caddy validate` 或 `nginx -t`。
+测试会检查域名 HTTPS 与 IP HTTP 配置生成、独立端口、已有 Caddy 站点路径插入及更新、路径冲突拒绝、多域名互不覆盖、旧 Caddy 标记迁移、Nginx 每域名变量隔离、管理索引持久化、旧配置导入、状态到安装参数的无损回放、ACME 阶段没有明文 `proxy_pass`、`X-Forwarded-For` 防伪造、子路径响应头改写幂等性，以及第二阶段的诊断、日志过滤、流量统计、备份校验/恢复和校验式自更新。如果本机已安装 Caddy，还会额外执行完整 Caddy 配置验证；正式部署仍会在 reload 前运行 VPS 上的 `caddy validate` 或 `nginx -t`。
 
 ## 手动恢复
 

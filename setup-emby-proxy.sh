@@ -957,7 +957,7 @@ probe_upstream() {
       fi
     fi
   fi
-  ok "源站可访问：${UPSTREAM_URL}（HTTP $code）"
+  ok "源站可访问：${UPSTREAM_URL}（HTTP ${code}）"
   if [[ "$UPSTREAM_URL" == http://* ]]; then
     warn "源站链路使用明文 HTTP；仅在可信内网或本机回源时推荐。"
   fi
@@ -1100,7 +1100,7 @@ map \$http_upgrade \$emby_connection_upgrade_$NGINX_ID {
 
 # 不记录查询参数，避免 api_key/token 落盘；每条请求仍记录状态、字节数与耗时。
 log_format emby_proxy_${NGINX_ID}_v1 escape=json
-    '{"time":"\$time_iso8601","client":"\$remote_addr","method":"\$request_method",'
+    '{"ts":\$msec,"time":"\$time_iso8601","client":"\$remote_addr","method":"\$request_method",'
     '"host":"\$host","path":"\$uri","status":\$status,"bytes_sent":\$body_bytes_sent,'
     '"request_time":\$request_time,"upstream_time":"\$upstream_response_time",'
     '"upstream_status":"\$upstream_status","upstream":"\$upstream_addr"}';
@@ -1328,7 +1328,7 @@ migrate_legacy_nginx_config() {
     die "无法从旧配置 $NGINX_LEGACY_CONFIG 识别唯一域名。为避免影响现有站点，请先人工确认。"
   destination="/etc/nginx/conf.d/emby-proxy-${legacy_domain}.conf"
   [[ ! -e "$destination" ]] || \
-    die "旧配置和每域名配置同时存在：$NGINX_LEGACY_CONFIG、${destination}。请人工去重后重试。"
+    die "旧配置和每域名配置同时存在：${NGINX_LEGACY_CONFIG}、${destination}。请人工去重后重试。"
   migration_backup="${NGINX_LEGACY_CONFIG}.bak-migration-$(date +%Y%m%d-%H%M%S)"
   cp -a "$NGINX_LEGACY_CONFIG" "$migration_backup"
   mv "$NGINX_LEGACY_CONFIG" "$destination"
@@ -1336,7 +1336,7 @@ migrate_legacy_nginx_config() {
     mv "$destination" "$NGINX_LEGACY_CONFIG"
     die "旧 Nginx 配置迁移后的完整配置验证失败，已恢复原文件；备份：$migration_backup"
   fi
-  ok "已把旧版单域名 Nginx 配置迁移为：${destination}（内容未改变，备份：$migration_backup）"
+  ok "已把旧版单域名 Nginx 配置迁移为：${destination}（内容未改变，备份：${migration_backup}）"
 }
 
 check_nginx_domain_conflict() {
@@ -1777,7 +1777,7 @@ check_caddy_domain_conflict() {
 configure_firewall() {
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
     if [[ "$ACCESS_MODE" == "ip" ]]; then
-      info "检测到 UFW 已启用，放行 TCP $LISTEN_PORT……"
+      info "检测到 UFW 已启用，放行 TCP ${LISTEN_PORT}……"
       ufw allow "$LISTEN_PORT/tcp" >/dev/null
     else
       info "检测到 UFW 已启用，放行 TCP 80/443……"
@@ -1787,7 +1787,7 @@ configure_firewall() {
   fi
   if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
     if [[ "$ACCESS_MODE" == "ip" ]]; then
-      info "检测到 firewalld 已启用，放行 TCP $LISTEN_PORT……"
+      info "检测到 firewalld 已启用，放行 TCP ${LISTEN_PORT}……"
       firewall-cmd --permanent --add-port="$LISTEN_PORT/tcp" >/dev/null
     else
       info "检测到 firewalld 已启用，放行 HTTP/HTTPS……"
