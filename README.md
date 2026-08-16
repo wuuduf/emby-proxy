@@ -17,6 +17,57 @@ sudo /tmp/setup-emby-proxy.sh
 
 脚本会先检查系统、已有 Caddy/Nginx、DNS（仅域名模式）、端口及源站；确认配置并通过语法验证后才会重载服务。
 
+安装脚本同时会安装长期管理命令：
+
+```bash
+sudo emby-proxy
+```
+
+不带参数会打开交互菜单，可以查看服务与入口概况、列出反代、查看路径详情、新增入口、添加或修改路径、删除脚本托管路径/入口、导入旧版配置，以及验证完整 Caddy/Nginx 配置。
+
+如果 VPS 已经由旧版脚本配置完成，只想安装管理命令、不新增反代，可以执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wuuduf/emby-reverse-proxy-installer/main/setup-emby-proxy.sh \
+  -o /tmp/setup-emby-proxy.sh && \
+chmod +x /tmp/setup-emby-proxy.sh && \
+sudo /tmp/setup-emby-proxy.sh --manager-only
+```
+
+该模式会安装命令并尝试导入旧版脚本配置，然后直接进入长期管理流程。
+
+## `emby-proxy` 管理命令（第一阶段）
+
+常用命令：
+
+```bash
+sudo emby-proxy status
+sudo emby-proxy list
+sudo emby-proxy show domain-emby.example.com
+sudo emby-proxy add
+
+sudo emby-proxy route add domain-emby.example.com
+sudo emby-proxy route set domain-emby.example.com
+sudo emby-proxy route delete domain-emby.example.com
+
+sudo emby-proxy delete domain-emby.example.com
+sudo emby-proxy import
+sudo emby-proxy config test
+```
+
+管理数据保存在：
+
+```text
+/etc/emby-proxy/sites.d/*.json
+/etc/emby-proxy/backups/
+```
+
+这些 JSON 文件是管理索引，不会替代 Caddy/Nginx 的实际配置。每次安装后端成功并通过端到端健康检查后才会更新索引。旧版本已经生成的 Caddy/Nginx 配置可通过 `sudo emby-proxy import` 导入；导入只建立索引，不会 reload 或改写当前运行配置。
+
+新增或修改路径时，管理器把完整入口状态重新交给经过验证的安装后端：先检查环境和源站，再生成候选配置、备份、运行 `caddy validate`/`nginx -t`、reload 和端到端检查。删除操作只识别脚本的精确托管标记或独立 Nginx 文件；标记缺失、重复或不完整时会拒绝自动删除。
+
+管理器与安装后端共同使用 `/run/lock/emby-proxy.lock`，避免两个 SSH 窗口同时修改配置。第一阶段不包含流量统计、定时健康检查和自动更新，这些功能将在后续阶段加入。
+
 ## 交互式使用
 
 把脚本上传到 VPS，然后执行：
@@ -197,7 +248,7 @@ Nginx 日志只记录 `$uri`，不记录查询参数；Caddy 会隐藏常见 `ap
 ## 自动检查及保护
 
 - 检查 Debian/Ubuntu、systemd、CPU 架构和 root 权限；
-- 安装 `ca-certificates`、`curl`、`gnupg`、`dnsutils` 等依赖；
+- 安装 `ca-certificates`、`curl`、`gnupg`、`dnsutils`、`jq`、`util-linux` 等依赖；
 - 检查反代域名的公网 A/AAAA 是否指向当前 VPS；
 - IP 模式跳过 DNS/证书申请，自动检测或校验 IPv4，并检查独立高位端口是否被占用；
 - 检查源站 HTTP/HTTPS 连通性和 TLS 证书；
@@ -251,9 +302,10 @@ Nginx 日志只记录 `$uri`，不记录查询参数；Caddy 会隐藏常见 `ap
 
 ```bash
 bash tests/test-config-generation.sh
+bash tests/test-manager.sh
 ```
 
-测试会检查域名 HTTPS 与 IP HTTP 配置生成、独立端口、已有 Caddy 站点路径插入及更新、路径冲突拒绝、多域名互不覆盖、旧 Caddy 标记迁移、Nginx 每域名变量隔离、ACME 阶段没有明文 `proxy_pass`、`X-Forwarded-For` 防伪造，以及子路径响应头改写幂等性。如果本机已安装 Caddy，还会额外执行完整 Caddy 配置验证；正式部署仍会在 reload 前运行 VPS 上的 `caddy validate` 或 `nginx -t`。
+测试会检查域名 HTTPS 与 IP HTTP 配置生成、独立端口、已有 Caddy 站点路径插入及更新、路径冲突拒绝、多域名互不覆盖、旧 Caddy 标记迁移、Nginx 每域名变量隔离、管理索引持久化、旧配置导入、状态到安装参数的无损回放、ACME 阶段没有明文 `proxy_pass`、`X-Forwarded-For` 防伪造，以及子路径响应头改写幂等性。如果本机已安装 Caddy，还会额外执行完整 Caddy 配置验证；正式部署仍会在 reload 前运行 VPS 上的 `caddy validate` 或 `nginx -t`。
 
 ## 手动恢复
 

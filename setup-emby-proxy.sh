@@ -4,15 +4,21 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+readonly SCRIPT_NAME="$(basename "$SCRIPT_PATH")"
 readonly CADDYFILE="/etc/caddy/Caddyfile"
 readonly BEGIN_MARKER="# BEGIN MANAGED EMBY REVERSE PROXY"
 readonly END_MARKER="# END MANAGED EMBY REVERSE PROXY"
 readonly NGINX_LEGACY_CONFIG="/etc/nginx/conf.d/emby-proxy-managed.conf"
 readonly NGINX_ACME_ROOT="/var/www/emby-proxy-acme"
 readonly HEALTH_PATH="/_emby_proxy_health"
+readonly MANAGER_COMMAND_URL="https://raw.githubusercontent.com/wuuduf/emby-reverse-proxy-installer/main/emby-proxy"
+readonly MANAGER_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
+readonly MANAGER_LIBEXEC="${EMBY_PROXY_LIBEXEC:-/usr/local/lib/emby-proxy}"
+readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
 
 PROXY_ENGINE=""
+MANAGER_ONLY=0
 ACCESS_MODE=""
 ACCESS_SCHEME=""
 PROXY_IP=""
@@ -45,6 +51,7 @@ declare -a ROUTE_PATHS=()
 declare -a ROUTE_INPUTS=()
 declare -a ROUTE_URLS=()
 declare -a ROUTE_HOSTS=()
+LOCK_FD=""
 
 if [[ -t 1 ]]; then
   RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
@@ -62,11 +69,13 @@ usage() {
   cat <<EOF
 用法：
   sudo ./${SCRIPT_NAME}
+  sudo ./${SCRIPT_NAME} --manager-only
   sudo ./${SCRIPT_NAME} --engine nginx --domain emby.example.com --upstream origin.example.com
   sudo ./${SCRIPT_NAME} --engine caddy --mode ip --listen-port 8080 --upstream origin.example.com
 
 选项：
   -e, --engine ENGINE       反代程序：caddy 或 nginx；不填写时交互选择
+      --manager-only        只安装 emby-proxy 管理命令并导入旧配置，不新增反代
   -m, --mode MODE           访问模式：domain（域名 HTTPS）或 ip（公网 IPv4 + HTTP）
   -d, --domain DOMAIN       对外访问的反代域名（必须已解析到本 VPS）
   -i, --ip-address IPV4     IP 模式的对外访问 IPv4；不填写时自动检测公网 IPv4
@@ -86,6 +95,8 @@ while (($#)); do
     -e|--engine)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       PROXY_ENGINE="$2"; shift 2 ;;
+    --manager-only)
+      MANAGER_ONLY=1; shift ;;
     -m|--mode)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       ACCESS_MODE="$2"; shift 2 ;;
@@ -120,6 +131,7 @@ require_root() {
     command -v sudo >/dev/null 2>&1 || die "请切换到 root 后重新运行：su -c 'bash ${SCRIPT_NAME}'"
     info "需要管理员权限，正在通过 sudo 重新运行……"
     [[ -n "$PROXY_ENGINE" ]] && sudo_args+=(--engine "$PROXY_ENGINE")
+    (( MANAGER_ONLY )) && sudo_args+=(--manager-only)
     [[ -n "$ACCESS_MODE" ]] && sudo_args+=(--mode "$ACCESS_MODE")
     [[ -n "$PROXY_DOMAIN" ]] && sudo_args+=(--domain "$PROXY_DOMAIN")
     [[ -n "$PROXY_IP" ]] && sudo_args+=(--ip-address "$PROXY_IP")
@@ -130,8 +142,22 @@ require_root() {
     for route_spec in "${ROUTE_SPECS[@]}"; do
       sudo_args+=(--route "$route_spec")
     done
-    exec sudo -- "$0" "${sudo_args[@]}"
+    exec sudo -- "$SCRIPT_PATH" "${sudo_args[@]}"
   fi
+}
+
+acquire_operation_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  mkdir -p /run/lock
+  exec {LOCK_FD}>/run/lock/emby-proxy.lock
+  flock -n "$LOCK_FD" || die "另一个 emby-proxy 配置任务正在运行，请等待它完成后重试。"
+}
+
+release_operation_lock() {
+  [[ -n "$LOCK_FD" ]] || return 0
+  flock -u "$LOCK_FD" 2>/dev/null || true
+  eval "exec ${LOCK_FD}>&-"
+  LOCK_FD=""
 }
 
 check_platform() {
@@ -225,7 +251,7 @@ normalize_proxy_domain() {
   value="${value%.}"
   [[ "$value" != */* && "$value" != *:* && "$value" != *\?* && "$value" != *\#* && "$value" != *@* ]] || \
     die "反代访问地址只能填写域名，不能带端口、路径、参数或账号信息。"
-  valid_domain "$value" || die "反代域名格式无效：$value（示例：emby.example.com）"
+  valid_domain "$value" || die "反代域名格式无效：${value}（示例：emby.example.com）"
   PROXY_DOMAIN="$value"
   ACCESS_SCHEME="https"
   PUBLIC_AUTHORITY="$PROXY_DOMAIN"
@@ -259,7 +285,7 @@ parse_upstream() {
   [[ -n "$authority" && "$authority" != */* && "$authority" != *\?* && "$authority" != *\#* && "$authority" != *@* ]] || \
     die "源站只能包含协议、主机名和端口，不能带路径、查询参数或账号信息。"
   [[ "$authority" =~ ^[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || \
-    die "源站格式无效：$authority（示例：https://origin.example.com 或 http://1.2.3.4:8096）"
+    die "源站格式无效：${authority}（示例：https://origin.example.com 或 http://1.2.3.4:8096）"
 
   host="${authority%%:*}"
   port=""
@@ -273,7 +299,7 @@ parse_upstream() {
     if [[ "$ACCESS_MODE" == "domain" ]]; then
       die "源站域名不能与反代域名相同，否则会形成代理循环。"
     elif [[ -n "$port" && "$port" == "$LISTEN_PORT" ]]; then
-      die "源站不能指向当前 IP 入口的同一端口 $LISTEN_PORT，否则会形成代理循环。"
+      die "源站不能指向当前 IP 入口的同一端口 ${LISTEN_PORT}，否则会形成代理循环。"
     fi
   fi
   UPSTREAM_HOST="$host_lower"
@@ -325,7 +351,7 @@ confirm_existing_service() {
   local engine="$1" answer=""
   PROXY_ENGINE="$engine"
   if [[ ! -t 0 ]]; then
-    die "检测到现有 $engine 服务。非交互运行时请显式添加 --engine $engine，确认在原服务上新增独立站点。"
+    die "检测到现有 $engine 服务。非交互运行时请显式添加 --engine ${engine}，确认在原服务上新增独立站点。"
   fi
   printf '\n检测到现有 %s。是否在其原配置基础上新增 Emby 反代域名或路径？[Y/n]：' "$engine"
   read -r answer
@@ -333,7 +359,7 @@ confirm_existing_service() {
     die "已取消。为避免影响现有服务，脚本不会自动改用另一套 Web 服务。"
   fi
   USING_EXISTING_SERVICE=1
-  ok "将使用现有 $engine，并仅写入脚本托管的独立站点配置。"
+  ok "将使用现有 ${engine}，并仅写入脚本托管的独立站点配置。"
 }
 
 select_proxy_engine() {
@@ -378,7 +404,7 @@ select_proxy_engine() {
     local existing="caddy"
     (( HAS_NGINX )) && existing="nginx"
     if [[ -n "$requested" && "$requested" != "$existing" ]]; then
-      die "已检测到现有 $existing。为避免改动两套 Web 服务，请复用它，或先人工卸载/迁移后重试。"
+      die "已检测到现有 ${existing}。为避免改动两套 Web 服务，请复用它，或先人工卸载/迁移后重试。"
     fi
     if [[ -n "$requested" ]]; then
       PROXY_ENGINE="$existing"; USING_EXISTING_SERVICE=1
@@ -392,7 +418,7 @@ select_proxy_engine() {
   if (( HAS_CADDY && HAS_NGINX )); then
     if [[ -n "$requested" ]]; then
       PROXY_ENGINE="$requested"; USING_EXISTING_SERVICE=1
-      ok "两种服务均已安装但未运行，将按参数复用现有 $PROXY_ENGINE。"
+      ok "两种服务均已安装但未运行，将按参数复用现有 ${PROXY_ENGINE}。"
       return
     fi
     [[ -t 0 ]] || die "Caddy 与 Nginx 均已安装但未运行；请用 --engine 明确选择要复用的服务。"
@@ -402,7 +428,7 @@ select_proxy_engine() {
     PROXY_ENGINE="$choice"
     normalize_engine_choice
     USING_EXISTING_SERVICE=1
-    ok "将复用现有 $PROXY_ENGINE。"
+    ok "将复用现有 ${PROXY_ENGINE}。"
     return
   fi
 
@@ -551,7 +577,7 @@ check_existing_caddy_route_conflict() {
   )
   [[ -z "$temp" ]] || rm -f "$temp"
   [[ -z "$conflict" ]] || \
-    die "已有 Caddy 站点 $PROXY_DOMAIN 中检测到与 $route_path 重叠的路径 $conflict。为避免覆盖原路由，脚本已停止。"
+    die "已有 Caddy 站点 $PROXY_DOMAIN 中检测到与 $route_path 重叠的路径 ${conflict}。为避免覆盖原路由，脚本已停止。"
 }
 
 detect_existing_caddy_domain_mode() {
@@ -559,7 +585,7 @@ detect_existing_caddy_domain_mode() {
   caddy_domain_is_script_managed && return 0
   if locate_existing_caddy_site; then
     CADDY_ATTACH_EXISTING=1
-    info "域名 $PROXY_DOMAIN 已存在于 $CADDY_EXISTING_SITE_FILE。"
+    info "域名 $PROXY_DOMAIN 已存在于 ${CADDY_EXISTING_SITE_FILE}。"
     info "将只在该站点内新增独立非根路径，不会替换原站点或原有根路径。"
   fi
 }
@@ -668,7 +694,7 @@ normalize_route_path() {
     return
   fi
   [[ "$value" =~ ^/([A-Za-z0-9._~-]+/)*[A-Za-z0-9._~-]+$ ]] || \
-    die "路径格式无效：$value。只允许字母、数字、点、下划线、波浪线、连字符和斜杠。"
+    die "路径格式无效：${value}。只允许字母、数字、点、下划线、波浪线、连字符和斜杠。"
   lower="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
   case "$lower" in
     /emby|/emby/*|/web|/web/*|/.well-known|/.well-known/*|/_emby_proxy_health|/_emby_proxy_health/*)
@@ -680,7 +706,7 @@ normalize_route_path() {
 parse_route_specs() {
   local spec path input existing
   for spec in "${ROUTE_SPECS[@]}"; do
-    [[ "$spec" == *=* ]] || die "路径映射格式无效：$spec（正确示例：/a=https://origin.example.com）"
+    [[ "$spec" == *=* ]] || die "路径映射格式无效：${spec}（正确示例：/a=https://origin.example.com）"
     path="$(normalize_route_path "${spec%%=*}")"
     input="$(trim "${spec#*=}")"
     [[ -n "$input" ]] || die "路径 $path 的源站不能为空。"
@@ -714,8 +740,104 @@ apt_install_prerequisites() {
   apt-get update -qq
   apt-get install -y --no-install-recommends \
     debian-keyring debian-archive-keyring apt-transport-https \
-    ca-certificates curl gnupg dnsutils iproute2 >/dev/null
+    ca-certificates curl gnupg dnsutils iproute2 jq util-linux >/dev/null
   ok "基础依赖已就绪。"
+}
+
+install_manager_command() {
+  local source_candidate temp manager_source=""
+  temp="$(mktemp /tmp/emby-proxy-manager.XXXXXX)"
+  source_candidate="$(dirname -- "$SCRIPT_PATH")/emby-proxy"
+  if [[ -f "$source_candidate" ]]; then
+    cp -a "$source_candidate" "$temp"
+    manager_source="$source_candidate"
+  elif [[ -f "$MANAGER_BIN" ]]; then
+    cp -a "$MANAGER_BIN" "$temp"
+    manager_source="$MANAGER_BIN"
+  elif curl -fsSL --connect-timeout 8 --max-time 30 "$MANAGER_COMMAND_URL" -o "$temp"; then
+    manager_source="$MANAGER_COMMAND_URL"
+  else
+    rm -f "$temp"
+    warn "暂时无法下载 emby-proxy 管理命令；本次反代仍会继续配置，稍后可重新运行安装脚本补齐。"
+    return 0
+  fi
+  if ! bash -n "$temp"; then
+    rm -f "$temp"
+    warn "管理命令语法验证失败，来源：${manager_source}；为避免安装损坏文件，本次跳过。"
+    return 0
+  fi
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    install -d -o root -g root -m 0755 "$MANAGER_LIBEXEC"
+    if [[ "$SCRIPT_PATH" != "$(readlink -f "$MANAGER_LIBEXEC/setup-emby-proxy.sh" 2>/dev/null || true)" ]]; then
+      install -o root -g root -m 0755 "$SCRIPT_PATH" "$MANAGER_LIBEXEC/setup-emby-proxy.sh"
+    fi
+    install -o root -g root -m 0755 "$temp" "$MANAGER_BIN"
+  else
+    install -d -m 0755 "$MANAGER_LIBEXEC"
+    install -m 0755 "$SCRIPT_PATH" "$MANAGER_LIBEXEC/setup-emby-proxy.sh"
+    install -m 0755 "$temp" "$MANAGER_BIN"
+  fi
+  rm -f "$temp"
+  ok "管理命令已安装：sudo emby-proxy"
+}
+
+site_state_id() {
+  if [[ "$ACCESS_MODE" == "ip" ]]; then
+    printf 'ip-%s-%s' "$PROXY_IP" "$LISTEN_PORT"
+  else
+    printf 'domain-%s' "$PROXY_DOMAIN"
+  fi
+}
+
+persist_site_state() {
+  local site_id state_file temp created_at now managed_kind config_file routes_json i
+  command -v jq >/dev/null 2>&1 || { warn "缺少 jq，无法写入管理索引；反代配置本身已经生效。"; return 0; }
+  site_id="$(site_state_id)"
+  state_file="$MANAGER_HOME/sites.d/${site_id}.json"
+  temp="$(mktemp /tmp/emby-proxy-state.XXXXXX)"
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  created_at="$now"
+  [[ ! -f "$state_file" ]] || created_at="$(jq -r '.created_at // empty' "$state_file" 2>/dev/null || true)"
+  [[ -n "$created_at" ]] || created_at="$now"
+  managed_kind="standalone"
+  config_file="$([[ "$PROXY_ENGINE" == "caddy" ]] && printf '%s' "$CADDYFILE" || printf '%s' "$NGINX_CONFIG")"
+  if (( CADDY_ATTACH_EXISTING )); then
+    managed_kind="caddy_attached"
+    config_file="$CADDY_EXISTING_SITE_FILE"
+  fi
+  routes_json='[]'
+  for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
+    routes_json="$(jq -c --arg path "${ROUTE_PATHS[$i]}" --arg upstream "${ROUTE_URLS[$i]}" \
+      '. + [{path:$path,upstream:$upstream}]' <<<"$routes_json")"
+  done
+  if [[ "$managed_kind" == "caddy_attached" && -f "$state_file" ]]; then
+    routes_json="$(jq -c --argjson incoming "$routes_json" '
+      (.routes // []) as $old |
+      reduce $incoming[] as $item ($old; map(select(.path != $item.path)) + [$item])
+    ' "$state_file" 2>/dev/null || printf '%s' "$routes_json")"
+  fi
+  routes_json="$(jq -c 'sort_by([if .path=="/" then 0 else 1 end,.path])' <<<"$routes_json")"
+  jq -n \
+    --argjson schema_version 1 \
+    --arg id "$site_id" --arg engine "$PROXY_ENGINE" --arg mode "$ACCESS_MODE" \
+    --arg domain "$([[ "$ACCESS_MODE" == "domain" ]] && printf '%s' "$PROXY_DOMAIN" || true)" \
+    --arg ip "$PROXY_IP" --arg listen_port "$LISTEN_PORT" --arg public_url "$PUBLIC_BASE_URL" \
+    --arg managed_kind "$managed_kind" --arg config_file "$config_file" \
+    --arg created_at "$created_at" --arg updated_at "$now" --argjson routes "$routes_json" \
+    '{schema_version:$schema_version,id:$id,engine:$engine,mode:$mode,domain:$domain,ip:$ip,
+      listen_port:($listen_port|if .=="" then null else tonumber end),public_url:$public_url,
+      managed_kind:$managed_kind,config_file:$config_file,created_at:$created_at,updated_at:$updated_at,routes:$routes}' \
+    >"$temp"
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    install -d -o root -g root -m 0750 "$MANAGER_HOME/sites.d" "$MANAGER_HOME/backups"
+    install -o root -g root -m 0640 "$temp" "$state_file"
+  else
+    # 仅供本地配置生成测试；正式安装始终由 root 执行。
+    install -d -m 0750 "$MANAGER_HOME/sites.d" "$MANAGER_HOME/backups"
+    install -m 0640 "$temp" "$state_file"
+  fi
+  rm -f "$temp"
+  ok "已写入管理索引：${site_id}（以后可运行 sudo emby-proxy 管理）"
 }
 
 public_ip() {
@@ -816,7 +938,7 @@ probe_upstream() {
   if [[ "$UPSTREAM_URL" == http://* || "$UPSTREAM_URL" == https://* ]]; then
     info "检测源站连通性：$UPSTREAM_URL"
     if ! code="$(probe_url "$UPSTREAM_URL")"; then
-      error "VPS 无法访问源站 $UPSTREAM_URL。"
+      error "VPS 无法访问源站 ${UPSTREAM_URL}。"
       printf '修复方法：检查源站协议/端口、防火墙、IP 白名单和 HTTPS 证书；可在 VPS 上执行：\n  curl -v --connect-timeout 10 %q/\n' "$UPSTREAM_URL" >&2
       exit 1
     fi
@@ -829,13 +951,13 @@ probe_upstream() {
       if code="$(probe_url "http://$UPSTREAM_URL")"; then
         UPSTREAM_URL="http://$UPSTREAM_URL"
       else
-        error "HTTPS 和 HTTP 均无法连接源站 $UPSTREAM_URL。"
+        error "HTTPS 和 HTTP 均无法连接源站 ${UPSTREAM_URL}。"
         printf '修复方法：确认源站域名、端口、源站服务状态及防火墙；如使用非标准端口，请写成 host:port。\n' >&2
         exit 1
       fi
     fi
   fi
-  ok "源站可访问：$UPSTREAM_URL（HTTP $code）"
+  ok "源站可访问：${UPSTREAM_URL}（HTTP $code）"
   if [[ "$UPSTREAM_URL" == http://* ]]; then
     warn "源站链路使用明文 HTTP；仅在可信内网或本机回源时推荐。"
   fi
@@ -870,7 +992,7 @@ check_port_conflicts() {
   allowed_pattern="$PROXY_ENGINE"
   foreign="$(printf '%s\n' "$listeners" | grep -vi "$allowed_pattern" || true)"
   if [[ -n "$foreign" ]]; then
-    error "80/443 端口已被其他程序占用，无法启用 $PROXY_ENGINE："
+    error "80/443 端口已被其他程序占用，无法启用 ${PROXY_ENGINE}："
     printf '%s\n' "$foreign" >&2
     printf '修复方法：确认占用者没有承载其他站点后，再停止它或修改监听端口。不要直接删除全部 Docker 容器。\n' >&2
     [[ "$foreign" == *caddy* ]] && printf '如确定不再使用 Caddy：systemctl disable --now caddy\n' >&2
@@ -1206,7 +1328,7 @@ migrate_legacy_nginx_config() {
     die "无法从旧配置 $NGINX_LEGACY_CONFIG 识别唯一域名。为避免影响现有站点，请先人工确认。"
   destination="/etc/nginx/conf.d/emby-proxy-${legacy_domain}.conf"
   [[ ! -e "$destination" ]] || \
-    die "旧配置和每域名配置同时存在：$NGINX_LEGACY_CONFIG、$destination。请人工去重后重试。"
+    die "旧配置和每域名配置同时存在：$NGINX_LEGACY_CONFIG、${destination}。请人工去重后重试。"
   migration_backup="${NGINX_LEGACY_CONFIG}.bak-migration-$(date +%Y%m%d-%H%M%S)"
   cp -a "$NGINX_LEGACY_CONFIG" "$migration_backup"
   mv "$NGINX_LEGACY_CONFIG" "$destination"
@@ -1214,7 +1336,7 @@ migrate_legacy_nginx_config() {
     mv "$destination" "$NGINX_LEGACY_CONFIG"
     die "旧 Nginx 配置迁移后的完整配置验证失败，已恢复原文件；备份：$migration_backup"
   fi
-  ok "已把旧版单域名 Nginx 配置迁移为：$destination（内容未改变，备份：$migration_backup）"
+  ok "已把旧版单域名 Nginx 配置迁移为：${destination}（内容未改变，备份：$migration_backup）"
 }
 
 check_nginx_domain_conflict() {
@@ -1225,20 +1347,20 @@ check_nginx_domain_conflict() {
       "$domain_pattern" /etc/nginx 2>/dev/null | head -n 1 || true)"
   fi
   if [[ -n "$conflict" ]]; then
-    die "域名 $PROXY_DOMAIN 已出现在其他 Nginx 配置中：$conflict。请先合并或移除重复站点，避免 server_name 冲突。"
+    die "域名 $PROXY_DOMAIN 已出现在其他 Nginx 配置中：${conflict}。请先合并或移除重复站点，避免 server_name 冲突。"
   fi
 }
 
 check_nginx_ip_conflict() {
   local conflict="" marker="# MANAGED EMBY SITE: $PROXY_KEY"
   if [[ -f "$NGINX_CONFIG" ]] && ! grep -Fx "$marker" "$NGINX_CONFIG" >/dev/null 2>&1; then
-    die "目标配置文件已存在但不是本脚本管理：$NGINX_CONFIG。为避免覆盖，脚本已停止。"
+    die "目标配置文件已存在但不是本脚本管理：${NGINX_CONFIG}。为避免覆盖，脚本已停止。"
   fi
   if [[ -d /etc/nginx ]]; then
     conflict="$(grep -RIlE --include='*.conf' --exclude="$(basename "$NGINX_CONFIG")" \
       "listen[[:space:]]+([^[:space:];]*:)?${LISTEN_PORT}([[:space:];]|$)" /etc/nginx 2>/dev/null | head -n 1 || true)"
   fi
-  [[ -z "$conflict" ]] || die "Nginx 配置 $conflict 已声明端口 $LISTEN_PORT。为避免监听冲突，请选择其他独立端口。"
+  [[ -z "$conflict" ]] || die "Nginx 配置 $conflict 已声明端口 ${LISTEN_PORT}。为避免监听冲突，请选择其他独立端口。"
 }
 
 apply_nginx_ip_config() {
@@ -1267,7 +1389,7 @@ apply_nginx_ip_config() {
   if ! nginx -T 2>&1 | grep -F "configuration file $NGINX_CONFIG:" >/dev/null; then
     rollback_nginx
     rm -f "$candidate"
-    die "主 nginx.conf 没有加载 $NGINX_CONFIG。请确认 http 块中包含：include /etc/nginx/conf.d/*.conf;"
+    die "主 nginx.conf 没有加载 ${NGINX_CONFIG}。请确认 http 块中包含：include /etc/nginx/conf.d/*.conf;"
   fi
   if ! reload_or_start_nginx; then
     rollback_nginx
@@ -1310,7 +1432,7 @@ apply_nginx_config() {
     fi
     if ! nginx -T 2>&1 | grep -F "configuration file $NGINX_CONFIG:" >/dev/null; then
       rollback_nginx
-      die "主 nginx.conf 没有加载 $NGINX_CONFIG。请确认 http 块中包含：include /etc/nginx/conf.d/*.conf;"
+      die "主 nginx.conf 没有加载 ${NGINX_CONFIG}。请确认 http 块中包含：include /etc/nginx/conf.d/*.conf;"
     fi
     if ! reload_or_start_nginx; then
       rollback_nginx
@@ -1337,7 +1459,7 @@ apply_nginx_config() {
   fi
   if ! nginx -T 2>&1 | grep -F "configuration file $NGINX_CONFIG:" >/dev/null; then
     rollback_nginx
-    die "主 nginx.conf 没有加载 $NGINX_CONFIG。请确认 http 块中包含：include /etc/nginx/conf.d/*.conf;"
+    die "主 nginx.conf 没有加载 ${NGINX_CONFIG}。请确认 http 块中包含：include /etc/nginx/conf.d/*.conf;"
   fi
   if ! reload_or_start_nginx; then
     rollback_nginx
@@ -1424,9 +1546,9 @@ validate_caddy_managed_markers() {
   domain_begins="$(grep -cFx "$domain_begin" "$source_file" 2>/dev/null || true)"
   domain_ends="$(grep -cFx "$domain_end" "$source_file" 2>/dev/null || true)"
   [[ "$legacy_begins" == "$legacy_ends" && "$legacy_begins" -le 1 ]] || \
-    die "检测到不完整或重复的旧版脚本托管标记，请检查 $CADDYFILE。"
+    die "检测到不完整或重复的旧版脚本托管标记，请检查 ${CADDYFILE}。"
   [[ "$domain_begins" == "$domain_ends" && "$domain_begins" -le 1 ]] || \
-    die "域名 $PROXY_DOMAIN 的 Caddy 托管标记不完整或重复，请检查 $CADDYFILE。"
+    die "域名 $PROXY_DOMAIN 的 Caddy 托管标记不完整或重复，请检查 ${CADDYFILE}。"
   legacy_domain="$(legacy_caddy_managed_domain "$source_file")"
   if [[ "$legacy_domain" == "$PROXY_DOMAIN" && "$domain_begins" -eq 1 ]]; then
     die "域名 $PROXY_DOMAIN 同时存在旧版和新版托管块，请人工合并后重试。"
@@ -1486,7 +1608,7 @@ strip_existing_caddy_route_block() {
   begins="$(grep -cFx "$begin" "$source_file" 2>/dev/null || true)"
   ends="$(grep -cFx "$end" "$source_file" 2>/dev/null || true)"
   [[ "$begins" == "$ends" && "$begins" -le 1 ]] || \
-    die "路径 $route_path 的脚本托管标记不完整或重复，请检查 $CADDY_EXISTING_SITE_FILE。"
+    die "路径 $route_path 的脚本托管标记不完整或重复，请检查 ${CADDY_EXISTING_SITE_FILE}。"
   awk -v begin="$begin" -v end="$end" '
     $0 == begin { skipping=1; next }
     skipping && $0 == end { skipping=0; next }
@@ -1648,7 +1770,7 @@ check_caddy_domain_conflict() {
       "$domain_pattern" /etc/caddy 2>/dev/null | head -n 1 || true)"
   fi
   if [[ -n "$other_conflict" ]]; then
-    die "域名 $PROXY_DOMAIN 已存在于其他 Caddy 配置：$other_conflict。为避免影响原站点，请先人工确认。"
+    die "域名 $PROXY_DOMAIN 已存在于其他 Caddy 配置：${other_conflict}。为避免影响原站点，请先人工确认。"
   fi
 }
 
@@ -1751,7 +1873,7 @@ apply_config() {
     if ! systemctl reload caddy; then
       cp -a "$BACKUP_FILE" "$CADDYFILE"
       systemctl reload caddy >/dev/null 2>&1 || true
-      die "Caddy 重载失败，已自动恢复 $BACKUP_FILE。查看日志：journalctl -u caddy -n 100 --no-pager"
+      die "Caddy 重载失败，已自动恢复 ${BACKUP_FILE}。查看日志：journalctl -u caddy -n 100 --no-pager"
     fi
   else
     if ! systemctl start caddy; then
@@ -1818,7 +1940,7 @@ verify_result() {
       [[ "$code" =~ ^[1-4][0-9][0-9]$ && "$code" != "000" ]] || all_ok=0
     done
     if (( all_ok )); then
-      ok "代理存活检查通过：$PUBLIC_BASE_URL$health_request_path（HTTP 200）。"
+      ok "代理存活检查通过：$PUBLIC_BASE_URL${health_request_path}（HTTP 200）。"
       for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
         ok "路径 ${ROUTE_PATHS[$i]} 反代验证通过（HTTP ${route_codes[$i]}）。"
       done
@@ -1859,7 +1981,7 @@ verify_result() {
   if [[ "$ACCESS_MODE" == "ip" ]]; then
     cat >&2 <<EOF
 请按顺序检查：
-  1. 云厂商安全组是否放行入站 TCP $LISTEN_PORT；
+  1. 云厂商安全组是否放行入站 TCP ${LISTEN_PORT}；
   2. 查看代理日志：$log_command
   3. 查看端口监听：ss -lntp | grep -E ':${LISTEN_PORT}\\b'
   4. 本机入口测试：curl -v -H 'Host: $PROXY_IP' 'http://127.0.0.1:${LISTEN_PORT}/'
@@ -1884,10 +2006,21 @@ EOF
 
 main() {
   require_root
+  acquire_operation_lock
   printf '%sEmby 一键反向代理配置器（域名 HTTPS / IP HTTP，Caddy / Nginx）%s\n\n' "$BOLD" "$RESET"
   check_platform
+  if (( MANAGER_ONLY )); then
+    apt_install_prerequisites
+    install_manager_command
+    [[ -x "$MANAGER_BIN" ]] || die "管理命令安装失败，请检查 GitHub 网络连接后重试。"
+    release_operation_lock
+    "$MANAGER_BIN" import || warn "管理命令已安装，但旧配置自动导入未完成；稍后运行 sudo emby-proxy import 重试。"
+    ok "管理命令准备完成。运行：sudo emby-proxy"
+    return
+  fi
   prompt_inputs
   apt_install_prerequisites
+  install_manager_command
   prepare_access_target
   prepare_routes
   check_port_conflicts
@@ -1904,6 +2037,7 @@ main() {
     apply_nginx_config
   fi
   verify_result
+  persist_site_state
 }
 
 if [[ "${EMBY_PROXY_LIB_ONLY:-0}" != "1" ]]; then

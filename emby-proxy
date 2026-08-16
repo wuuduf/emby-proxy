@@ -1,0 +1,625 @@
+#!/usr/bin/env bash
+# Emby 反向代理管理命令：交互菜单、状态索引和安全配置变更。
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly VERSION="2.0.0-stage1"
+readonly STATE_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
+readonly SITES_DIR="$STATE_HOME/sites.d"
+readonly BACKUPS_DIR="$STATE_HOME/backups"
+readonly CADDYFILE="${EMBY_PROXY_CADDYFILE:-/etc/caddy/Caddyfile}"
+readonly NGINX_CONF_DIR="${EMBY_PROXY_NGINX_CONF_DIR:-/etc/nginx/conf.d}"
+readonly HEALTH_PATH="/_emby_proxy_health"
+readonly INSTALLED_BACKEND="/usr/local/lib/emby-proxy/setup-emby-proxy.sh"
+LOCK_FD=""
+
+if [[ -t 1 ]]; then
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+else
+  RED=""; GREEN=""; YELLOW=""; BLUE=""; BOLD=""; RESET=""
+fi
+
+info()  { printf '%s[信息]%s %s\n' "$BLUE" "$RESET" "$*"; }
+ok()    { printf '%s[正常]%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn()  { printf '%s[提醒]%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+error() { printf '%s[错误]%s %s\n' "$RED" "$RESET" "$*" >&2; }
+die()   { error "$*"; exit 1; }
+
+usage() {
+  cat <<EOF
+Emby Reverse Proxy Manager $VERSION
+
+用法：
+  sudo emby-proxy                         打开交互式管理菜单
+  sudo emby-proxy status                  查看运行概况
+  sudo emby-proxy list                    列出所有托管入口
+  sudo emby-proxy show <入口ID>           查看入口详情
+  sudo emby-proxy add [安装参数]           新增入口
+  sudo emby-proxy route add <入口ID>       新增路径
+  sudo emby-proxy route set <入口ID>       修改路径源站
+  sudo emby-proxy route delete <入口ID>    删除路径
+  sudo emby-proxy delete <入口ID>          删除整个托管入口
+  sudo emby-proxy import                  导入旧版脚本配置
+  sudo emby-proxy config test             验证完整 Caddy/Nginx 配置
+  emby-proxy version
+EOF
+}
+
+require_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] && return 0
+  command -v sudo >/dev/null 2>&1 || die "请切换到 root 后运行。"
+  exec sudo -- "$0" "$@"
+}
+
+require_jq() {
+  command -v jq >/dev/null 2>&1 || die "缺少 jq。请先运行安装脚本，或执行：apt-get install -y jq"
+}
+
+install_managed_dir() {
+  local mode="$1"; shift
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    install -d -o root -g root -m "$mode" "$@"
+  else
+    install -d -m "$mode" "$@"
+  fi
+}
+
+install_managed_file() {
+  local mode="$1" source="$2" target="$3"
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    install -o root -g root -m "$mode" "$source" "$target"
+  else
+    install -m "$mode" "$source" "$target"
+  fi
+}
+
+ensure_state_dirs() {
+  install_managed_dir 0750 "$SITES_DIR" "$BACKUPS_DIR"
+}
+
+acquire_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  mkdir -p /run/lock
+  exec {LOCK_FD}>/run/lock/emby-proxy.lock
+  flock -n "$LOCK_FD" || die "另一个 emby-proxy 配置任务正在运行，请稍后重试。"
+}
+
+release_lock() {
+  [[ -n "$LOCK_FD" ]] || return 0
+  flock -u "$LOCK_FD" 2>/dev/null || true
+  eval "exec ${LOCK_FD}>&-"
+  LOCK_FD=""
+}
+
+backend_path() {
+  local sibling
+  [[ -n "${EMBY_PROXY_BACKEND:-}" ]] && { printf '%s' "$EMBY_PROXY_BACKEND"; return; }
+  [[ -x "$INSTALLED_BACKEND" ]] && { printf '%s' "$INSTALLED_BACKEND"; return; }
+  sibling="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/setup-emby-proxy.sh"
+  [[ -x "$sibling" ]] && { printf '%s' "$sibling"; return; }
+  die "找不到配置后端 setup-emby-proxy.sh，请重新运行一键安装命令。"
+}
+
+state_file() {
+  local id="$1"
+  [[ "$id" =~ ^(domain|ip)-[A-Za-z0-9._:-]+$ ]] || die "入口 ID 格式无效：$id"
+  printf '%s/%s.json' "$SITES_DIR" "$id"
+}
+
+require_site() {
+  local file
+  file="$(state_file "$1")"
+  [[ -f "$file" ]] || die "找不到入口：$1。运行 emby-proxy list 查看可用 ID。"
+  printf '%s' "$file"
+}
+
+site_count() {
+  find "$SITES_DIR" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' '
+}
+
+service_line() {
+  local service="$1" binary="$2" version="未安装" state="未安装"
+  if command -v "$binary" >/dev/null 2>&1; then
+    version="$($binary version 2>/dev/null || $binary -v 2>&1 || printf '版本未知')"
+    state="未运行"
+    systemctl is-active --quiet "$service" 2>/dev/null && state="运行中"
+  fi
+  printf '%-8s %-8s %s' "$service" "$state" "$version"
+}
+
+print_status() {
+  local count caddy_count nginx_count domain_count ip_count
+  ensure_state_dirs
+  count="$(site_count)"
+  caddy_count="$(find "$SITES_DIR" -type f -name '*.json' -exec grep -l '"engine": "caddy"' {} + 2>/dev/null | wc -l | tr -d ' ')"
+  nginx_count="$(find "$SITES_DIR" -type f -name '*.json' -exec grep -l '"engine": "nginx"' {} + 2>/dev/null | wc -l | tr -d ' ')"
+  domain_count="$(find "$SITES_DIR" -type f -name '*.json' -exec grep -l '"mode": "domain"' {} + 2>/dev/null | wc -l | tr -d ' ')"
+  ip_count="$((count-domain_count))"
+  printf '%sEmby Reverse Proxy Manager%s  %s\n\n' "$BOLD" "$RESET" "$VERSION"
+  printf '  %s\n' "$(service_line caddy caddy)"
+  printf '  %s\n' "$(service_line nginx nginx)"
+  printf '\n  托管入口：%s（域名 HTTPS %s，IP HTTP %s）\n' "$count" "$domain_count" "$ip_count"
+  printf '  引擎分布：Caddy %s，Nginx %s\n' "$caddy_count" "$nginx_count"
+  if command -v ss >/dev/null 2>&1; then
+    printf '  监听端口：\n'
+    ss -H -lntp 2>/dev/null | awk '$4 ~ /:(80|443|8080)$/ {printf "    %s %s\n",$4,$NF}' || true
+  fi
+}
+
+health_url_for_file() {
+  local file="$1" url kind prefix
+  url="$(jq -r '.public_url' "$file")"
+  kind="$(jq -r '.managed_kind' "$file")"
+  if [[ "$kind" == "caddy_attached" ]]; then
+    prefix="$(jq -r '.routes[0].path // empty' "$file")"
+    printf '%s%s%s' "$url" "$prefix" "$HEALTH_PATH"
+  else
+    printf '%s%s' "$url" "$HEALTH_PATH"
+  fi
+}
+
+list_sites() {
+  local file id url engine routes kind index=0
+  ensure_state_dirs
+  printf '%-4s %-38s %-7s %-7s %s\n' "序号" "访问地址" "引擎" "路径" "入口ID"
+  printf '%-4s %-38s %-7s %-7s %s\n' "----" "--------------------------------------" "-------" "-------" "----------------"
+  while IFS= read -r file; do
+    ((index+=1))
+    id="$(jq -r '.id' "$file")"
+    url="$(jq -r '.public_url' "$file")"
+    engine="$(jq -r '.engine' "$file")"
+    routes="$(jq -r '.routes|length' "$file")"
+    kind="$(jq -r '.managed_kind' "$file")"
+    [[ "$kind" != "caddy_attached" ]] || url+="$(jq -r '.routes[0].path // ""' "$file")"
+    printf '%-4s %-38s %-7s %-7s %s\n' "$index" "$url" "$engine" "$routes" "$id"
+  done < <(find "$SITES_DIR" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null | sort)
+  (( index > 0 )) || warn "还没有管理索引。若已有旧配置，请运行：sudo emby-proxy import"
+}
+
+show_site() {
+  local file id="$1" health_url code path upstream mode domain ip port request_path
+  file="$(require_site "$id")"
+  printf '%s入口详情%s\n\n' "$BOLD" "$RESET"
+  jq -r '
+    "入口 ID：\(.id)",
+    "访问模式：\(if .mode=="domain" then "域名 HTTPS" else "公网 IPv4 + HTTP" end)",
+    "访问地址：\(.public_url)",
+    "反代程序：\(.engine)",
+    "管理方式：\(.managed_kind)",
+    "配置文件：\(.config_file)",
+    "更新时间：\(.updated_at)"
+  ' "$file"
+  printf '\n路径映射：\n'
+  while IFS=$'\t' read -r path upstream; do
+    printf '  %-16s -> %s\n' "$path" "$upstream"
+  done < <(jq -r '.routes[] | [.path,.upstream] | @tsv' "$file")
+  health_url="$(health_url_for_file "$file")"
+  mode="$(jq -r '.mode' "$file")"
+  request_path="${health_url#$(jq -r '.public_url' "$file")}"
+  if [[ "$mode" == "ip" ]]; then
+    ip="$(jq -r '.ip' "$file")"; port="$(jq -r '.listen_port' "$file")"
+    code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' -H "Host: $ip" \
+      --connect-timeout 3 --max-time 8 "http://127.0.0.1:${port}${request_path}" 2>/dev/null || true)"
+  else
+    domain="$(jq -r '.domain' "$file")"
+    code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --resolve "$domain:443:127.0.0.1" \
+      --connect-timeout 3 --max-time 8 "https://${domain}${request_path}" 2>/dev/null || true)"
+  fi
+  printf '\n健康地址：%s\n' "$health_url"
+  if [[ "$code" == "200" ]]; then
+    ok "入口健康检查 HTTP 200"
+  else
+    [[ "$code" == "000" ]] && code="无响应"
+    warn "入口健康检查 HTTP ${code:-无响应}"
+  fi
+}
+
+write_state_json() {
+  local id="$1" engine="$2" mode="$3" domain="$4" ip="$5" port="$6" url="$7" kind="$8" config="$9" routes="${10}"
+  local file temp now
+  file="$(state_file "$id")"
+  [[ ! -e "$file" ]] || return 0
+  temp="$(mktemp /tmp/emby-proxy-import.XXXXXX)"
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  jq -n --argjson schema_version 1 --arg id "$id" --arg engine "$engine" --arg mode "$mode" \
+    --arg domain "$domain" --arg ip "$ip" --arg port "$port" --arg public_url "$url" \
+    --arg kind "$kind" --arg config "$config" --arg now "$now" --argjson routes "$routes" \
+    '{schema_version:$schema_version,id:$id,engine:$engine,mode:$mode,domain:$domain,ip:$ip,
+      listen_port:($port|if .=="" then null else tonumber end),public_url:$public_url,
+      managed_kind:$kind,config_file:$config,created_at:$now,updated_at:$now,routes:$routes}' >"$temp"
+  install_managed_file 0640 "$temp" "$file"
+  rm -f "$temp"
+}
+
+parse_caddy_routes() {
+  awk '
+    /^[[:space:]]*handle_path[[:space:]]+\/[^[:space:]]+\/\*[[:space:]]*\{/ {
+      path=$2; sub(/\/\*$/, "", path); next
+    }
+    /^[[:space:]]*handle[[:space:]]*\{[[:space:]]*$/ { path="/"; next }
+    /^[[:space:]]*reverse_proxy[[:space:]]+/ && path != "" {
+      upstream=$2; print path "\t" upstream; path=""
+    }
+  ' "$1"
+}
+
+routes_tsv_to_json() {
+  jq -Rn '[inputs | split("\t") | select(length==2) | {path:.[0],upstream:(.[1]|sub("/$";""))}] | unique_by(.path)'
+}
+
+import_caddy_standalone() {
+  local source="$CADDYFILE" key block address mode domain="" ip="" port="" url id routes imported=0
+  [[ -f "$source" ]] || return 0
+  while IFS= read -r key; do
+    id="domain-$key"
+    mode="domain"; domain="$key"; ip=""; port=""; url="https://$key"
+    if [[ "$key" == ip-* ]]; then
+      ip="${key#ip-}"; port="${ip##*-}"; ip="${ip%-$port}"
+      id="$key"; mode="ip"; domain=""; url="http://${ip}:${port}"
+    fi
+    [[ ! -f "$(state_file "$id")" ]] || continue
+    block="$(mktemp /tmp/emby-caddy-import.XXXXXX)"
+    awk -v begin="# BEGIN MANAGED EMBY REVERSE PROXY: $key" -v end="# END MANAGED EMBY REVERSE PROXY: $key" '
+      $0==begin {inside=1; next} $0==end {exit} inside {print}
+    ' "$source" >"$block"
+    address="$(awk '/^[^#[:space:]].*\{[[:space:]]*$/ {line=$0; sub(/[[:space:]]*\{[[:space:]]*$/, "", line); print line; exit}' "$block")"
+    [[ -n "$address" ]] || { rm -f "$block"; continue; }
+    routes="$(parse_caddy_routes "$block" | routes_tsv_to_json)"
+    [[ "$(jq 'length' <<<"$routes")" -gt 0 ]] || { rm -f "$block"; continue; }
+    write_state_json "$id" caddy "$mode" "$domain" "$ip" "$port" "$url" standalone "$source" "$routes"
+    rm -f "$block"
+    ((imported+=1))
+  done < <(sed -n 's/^# BEGIN MANAGED EMBY REVERSE PROXY: //p' "$source")
+  printf '%s' "$imported"
+}
+
+import_caddy_attached() {
+  local file marker domain path id state routes upstream imported=0 now temp
+  [[ -d "$(dirname "$CADDYFILE")" ]] || { printf '0'; return; }
+  while IFS=$'\t' read -r file marker; do
+    domain="${marker#\# BEGIN MANAGED EMBY EXISTING ROUTE: }"
+    path="${domain#* }"; domain="${domain%% *}"
+    id="domain-$domain"
+    upstream="$(awk -v begin="$marker" -v end="# END MANAGED EMBY EXISTING ROUTE: $domain $path" '
+      $0==begin {inside=1; next} $0==end {exit} inside && $1=="reverse_proxy" {print $2; exit}
+    ' "$file")"
+    [[ -n "$upstream" ]] || continue
+    state="$(state_file "$id")"
+    if [[ -f "$state" ]]; then
+      [[ "$(jq -r '.managed_kind' "$state")" == "caddy_attached" ]] || continue
+      temp="$(mktemp /tmp/emby-attached-import.XXXXXX)"
+      now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      jq --arg path "$path" --arg upstream "${upstream%/}" --arg now "$now" '
+        .routes=((.routes | map(select(.path!=$path)))+[{path:$path,upstream:$upstream}]|sort_by(.path)) | .updated_at=$now
+      ' "$state" >"$temp"
+      install_managed_file 0640 "$temp" "$state"; rm -f "$temp"
+    else
+      routes="$(jq -n --arg path "$path" --arg upstream "${upstream%/}" '[{path:$path,upstream:$upstream}]')"
+      write_state_json "$id" caddy domain "$domain" "" "" "https://$domain" caddy_attached "$file" "$routes"
+    fi
+    ((imported+=1))
+  done < <(grep -RHn '^# BEGIN MANAGED EMBY EXISTING ROUTE: ' "$(dirname "$CADDYFILE")" \
+    --include='Caddyfile' --include='*.caddy' --include='*.conf' 2>/dev/null |
+    sed -E 's/^([^:]+):[0-9]+:(.*)$/\1\t\2/')
+  printf '%s' "$imported"
+}
+
+parse_nginx_routes() {
+  awk '
+    $1=="location" && $2=="=" {path=$3; next}
+    $1=="location" && $2=="^~" {path=$3; sub(/\/$/,"",path); next}
+    $1=="location" && $2=="/" {path="/"; next}
+    $1=="proxy_pass" && path!="" {up=$2; sub(/;$/,"",up); sub(/\/$/,"",up); print path "\t" up; path=""}
+  ' "$1"
+}
+
+import_nginx() {
+  local file marker id mode domain ip="" port="" url routes imported=0
+  [[ -d "$NGINX_CONF_DIR" ]] || { printf '0'; return; }
+  for file in "$NGINX_CONF_DIR"/emby-proxy-*.conf; do
+    [[ -f "$file" ]] || continue
+    marker="$(sed -n 's/^# MANAGED EMBY SITE: //p' "$file" | head -n1)"
+    if [[ "$marker" == ip-* ]]; then
+      id="$marker"; mode="ip"; ip="${marker#ip-}"; port="${ip##*-}"; ip="${ip%-$port}"
+      domain=""; url="http://${ip}:${port}"
+    else
+      domain="$(awk '$1=="server_name" {gsub(/;/,"",$2); print $2; exit}' "$file")"
+      [[ -n "$domain" ]] || continue
+      id="domain-$domain"; mode="domain"; ip=""; port=""; url="https://$domain"
+    fi
+    [[ ! -f "$(state_file "$id")" ]] || continue
+    routes="$(parse_nginx_routes "$file" | routes_tsv_to_json)"
+    [[ "$(jq 'length' <<<"$routes")" -gt 0 ]] || continue
+    write_state_json "$id" nginx "$mode" "$domain" "$ip" "$port" "$url" standalone "$file" "$routes"
+    ((imported+=1))
+  done
+  printf '%s' "$imported"
+}
+
+import_existing() {
+  local a b c
+  require_jq; ensure_state_dirs; acquire_lock
+  a="$(import_caddy_standalone)"; b="$(import_caddy_attached)"; c="$(import_nginx)"
+  release_lock
+  ok "导入完成：独立 Caddy ${a:-0}，附加路径 Caddy ${b:-0}，Nginx ${c:-0}。"
+}
+
+run_backend_for_state() {
+  local file="$1" backend engine mode domain ip port kind path upstream i
+  local -a args=()
+  backend="$(backend_path)"
+  engine="$(jq -r '.engine' "$file")"; mode="$(jq -r '.mode' "$file")"
+  kind="$(jq -r '.managed_kind' "$file")"
+  args+=(--engine "$engine")
+  if [[ "$mode" == "domain" ]]; then
+    domain="$(jq -r '.domain' "$file")"; args+=(--domain "$domain")
+  else
+    ip="$(jq -r '.ip' "$file")"; port="$(jq -r '.listen_port' "$file")"
+    args+=(--mode ip --ip-address "$ip" --listen-port "$port")
+  fi
+  path="$(jq -r '.routes[0].path' "$file")"; upstream="$(jq -r '.routes[0].upstream' "$file")"
+  [[ "$kind" != "caddy_attached" ]] || args+=(--path "$path")
+  args+=(--upstream "$upstream")
+  for ((i=1; i<$(jq '.routes|length' "$file"); i++)); do
+    path="$(jq -r ".routes[$i].path" "$file")"; upstream="$(jq -r ".routes[$i].upstream" "$file")"
+    args+=(--route "$path=$upstream")
+  done
+  "$backend" "${args[@]}"
+}
+
+validate_route_path() {
+  local path="$1"
+  [[ "$path" == /* ]] || path="/$path"
+  while [[ "$path" != "/" && "$path" == */ ]]; do path="${path%/}"; done
+  [[ "$path" == "/" || "$path" =~ ^/([A-Za-z0-9._~-]+/)*[A-Za-z0-9._~-]+$ ]] || die "路径格式无效：$path"
+  printf '%s' "$path"
+}
+
+check_route_overlap() {
+  local file="$1" wanted="$2" ignore="${3:-}" existing
+  while IFS= read -r existing; do
+    [[ "$existing" == "$ignore" || "$existing" == "/" ]] && continue
+    if [[ "$wanted" == "$existing" || "$wanted" == "$existing"/* || "$existing" == "$wanted"/* ]]; then
+      die "路径 $wanted 与现有路径 $existing 重叠。"
+    fi
+  done < <(jq -r '.routes[].path' "$file")
+}
+
+route_upsert() {
+  local action="$1" id="$2" file path upstream temp exists
+  file="$(require_site "$id")"
+  printf '请输入访问路径（例如 /a）：'; read -r path; path="$(validate_route_path "$path")"
+  exists="$(jq --arg path "$path" '[.routes[]|select(.path==$path)]|length' "$file")"
+  if [[ "$action" == "add" && "$exists" -gt 0 ]]; then die "路径 $path 已存在，请使用 route set。"; fi
+  if [[ "$action" == "set" && "$exists" -eq 0 ]]; then die "路径 $path 不存在，请使用 route add。"; fi
+  [[ "$(jq -r '.managed_kind' "$file")" != "caddy_attached" || "$path" != "/" ]] || die "附加到手工 Caddy 站点时不能接管根路径。"
+  check_route_overlap "$file" "$path" "$path"
+  printf '请输入 Emby 源站域名或 URL：'; read -r upstream
+  [[ -n "$upstream" ]] || die "源站不能为空。"
+  temp="$(mktemp /tmp/emby-proxy-route.XXXXXX.json)"
+  jq --arg path "$path" --arg upstream "$upstream" '
+    .routes=((.routes | map(select(.path!=$path)))+[{path:$path,upstream:$upstream}] |
+      sort_by([if .path=="/" then 0 else 1 end,.path]))
+  ' "$file" >"$temp"
+  run_backend_for_state "$temp"
+  rm -f "$temp"
+}
+
+backup_target() {
+  local id="$1" target="$2" timestamp dir
+  timestamp="$(date +%Y%m%d-%H%M%S)"; dir="$BACKUPS_DIR/${timestamp}-${id}"
+  install_managed_dir 0750 "$dir"
+  cp -a "$target" "$dir/$(basename "$target")"
+  printf '%s' "$dir"
+}
+
+apply_caddy_removal() {
+  local id="$1" target="$2" candidate="$3" backup staged
+  [[ -f "$target" ]] || die "Caddy 配置文件不存在：$target"
+  target="$(readlink -f "$target")"
+  backup="$(backup_target "$id" "$target")"
+  staged="$(mktemp "${target}.emby-candidate.XXXXXX")"
+  cat "$candidate" >"$staged"
+  chown --reference="$target" "$staged"
+  chmod --reference="$target" "$staged"
+  mv "$staged" "$target"
+  if ! caddy validate --config "$CADDYFILE" --adapter caddyfile || ! systemctl reload caddy; then
+    cp -a "$backup/$(basename "$target")" "$target"
+    caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1 && systemctl reload caddy >/dev/null 2>&1 || true
+    die "Caddy 删除操作失败，已恢复：$backup"
+  fi
+  ok "Caddy 配置已更新，备份：$backup"
+}
+
+remove_attached_route() {
+  local id="$1" file="$2" path="$3" target domain begin end candidate temp remaining begins ends
+  target="$(jq -r '.config_file' "$file")"; domain="$(jq -r '.domain' "$file")"
+  begin="# BEGIN MANAGED EMBY EXISTING ROUTE: $domain $path"; end="# END MANAGED EMBY EXISTING ROUTE: $domain $path"
+  begins="$(grep -cFx "$begin" "$target" 2>/dev/null || true)"; ends="$(grep -cFx "$end" "$target" 2>/dev/null || true)"
+  [[ "$begins" == 1 && "$ends" == 1 ]] || die "路径 $path 的托管标记缺失、重复或不完整，脚本不会自动删除。"
+  candidate="$(mktemp /tmp/emby-caddy-delete.XXXXXX)"
+  awk -v begin="$begin" -v end="$end" '$0==begin {skip=1;next} skip&&$0==end {skip=0;next} !skip{print}' "$target" >"$candidate"
+  apply_caddy_removal "$id" "$target" "$candidate"; rm -f "$candidate"
+  temp="$(mktemp /tmp/emby-state-delete.XXXXXX)"
+  jq --arg path "$path" '.routes=(.routes | map(select(.path!=$path)))' "$file" >"$temp"
+  remaining="$(jq '.routes|length' "$temp")"
+  if (( remaining == 0 )); then rm -f "$file"; else install_managed_file 0640 "$temp" "$file"; fi
+  rm -f "$temp"
+}
+
+route_delete() {
+  local id="$1" file path kind temp count answer
+  file="$(require_site "$id")"
+  printf '请输入要删除的路径：'; read -r path; path="$(validate_route_path "$path")"
+  count="$(jq --arg path "$path" '[.routes[]|select(.path==$path)]|length' "$file")"
+  (( count == 1 )) || die "路径不存在：$path"
+  kind="$(jq -r '.managed_kind' "$file")"
+  if [[ "$kind" == "standalone" && "$path" == "/" ]]; then
+    die "独立入口的根路径不能单独删除；请删除整个入口。"
+  fi
+  printf '确认删除路径 %s？[y/N]：' "$path"; read -r answer; [[ "$answer" =~ ^[Yy]$ ]] || die "已取消。"
+  if [[ "$kind" == "caddy_attached" ]]; then
+    acquire_lock; remove_attached_route "$id" "$file" "$path"; release_lock
+  else
+    temp="$(mktemp /tmp/emby-route-delete.XXXXXX.json)"
+    jq --arg path "$path" '.routes=(.routes | map(select(.path!=$path)))' "$file" >"$temp"
+    run_backend_for_state "$temp"; rm -f "$temp"
+  fi
+}
+
+delete_site() {
+  local id="$1" file engine kind target answer candidate key begin end backup path temp begins ends
+  file="$(require_site "$id")"; engine="$(jq -r '.engine' "$file")"; kind="$(jq -r '.managed_kind' "$file")"
+  printf '确认删除入口 %s 的全部脚本托管配置？[y/N]：' "$id"; read -r answer
+  [[ "$answer" =~ ^[Yy]$ ]] || die "已取消。"
+  acquire_lock
+  target="$(jq -r '.config_file' "$file")"
+  if [[ "$engine" == "caddy" ]]; then
+    candidate="$(mktemp /tmp/emby-site-delete.XXXXXX)"; cp -a "$target" "$candidate"
+    if [[ "$kind" == "caddy_attached" ]]; then
+      while IFS= read -r path; do
+        begin="# BEGIN MANAGED EMBY EXISTING ROUTE: $(jq -r '.domain' "$file") $path"
+        end="# END MANAGED EMBY EXISTING ROUTE: $(jq -r '.domain' "$file") $path"
+        begins="$(grep -cFx "$begin" "$candidate" 2>/dev/null || true)"; ends="$(grep -cFx "$end" "$candidate" 2>/dev/null || true)"
+        [[ "$begins" == 1 && "$ends" == 1 ]] || die "路径 $path 的托管标记不完整，删除已停止。"
+        temp="$(mktemp /tmp/emby-strip.XXXXXX)"
+        awk -v begin="$begin" -v end="$end" '$0==begin{skip=1;next} skip&&$0==end{skip=0;next} !skip{print}' "$candidate" >"$temp"
+        mv "$temp" "$candidate"
+      done < <(jq -r '.routes[].path' "$file")
+    else
+      if [[ "$(jq -r '.mode' "$file")" == "ip" ]]; then
+        key="ip-$(jq -r '.ip' "$file")-$(jq -r '.listen_port' "$file")"
+      else key="$(jq -r '.domain' "$file")"; fi
+      begin="# BEGIN MANAGED EMBY REVERSE PROXY: $key"; end="# END MANAGED EMBY REVERSE PROXY: $key"
+      begins="$(grep -cFx "$begin" "$candidate" 2>/dev/null || true)"; ends="$(grep -cFx "$end" "$candidate" 2>/dev/null || true)"
+      [[ "$begins" == 1 && "$ends" == 1 ]] || die "入口 $id 的托管标记不完整，删除已停止。"
+      temp="$(mktemp /tmp/emby-strip.XXXXXX)"
+      awk -v begin="$begin" -v end="$end" '$0==begin{skip=1;next} skip&&$0==end{skip=0;next} !skip{print}' "$candidate" >"$temp"
+      mv "$temp" "$candidate"
+    fi
+    apply_caddy_removal "$id" "$target" "$candidate"; rm -f "$candidate"
+  else
+    [[ -f "$target" ]] || die "Nginx 配置文件不存在：$target"
+    backup="$(backup_target "$id" "$target")"; rm -f "$target"
+    if ! nginx -t || ! systemctl reload nginx; then
+      cp -a "$backup/$(basename "$target")" "$target"
+      nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+      die "Nginx 删除操作失败，已恢复：$backup"
+    fi
+    ok "Nginx 配置已删除，备份：$backup"
+  fi
+  rm -f "$file"
+  release_lock
+  ok "入口 $id 已从管理索引删除。"
+}
+
+config_test() {
+  local failed=0
+  if command -v caddy >/dev/null 2>&1 && [[ -f "$CADDYFILE" ]]; then
+    caddy validate --config "$CADDYFILE" --adapter caddyfile && ok "Caddy 配置验证通过" || failed=1
+  fi
+  if command -v nginx >/dev/null 2>&1; then
+    nginx -t && ok "Nginx 配置验证通过" || failed=1
+  fi
+  (( failed == 0 )) || return 1
+}
+
+select_site_id() {
+  local -a ids=() file choice
+  while IFS= read -r file; do ids+=("$(jq -r '.id' "$file")"); done < <(find "$SITES_DIR" -type f -name '*.json' -print 2>/dev/null | sort)
+  ((${#ids[@]})) || die "没有可管理入口。"
+  list_sites
+  printf '请选择序号：'; read -r choice
+  [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#ids[@]})) || die "序号无效。"
+  printf '%s' "${ids[$((choice-1))]}"
+}
+
+manage_site_menu() {
+  local id="$1" choice
+  while true; do
+    printf '\n'; show_site "$id" || true
+    cat <<EOF
+
+  1. 新增路径
+  2. 修改路径源站
+  3. 删除路径
+  4. 删除整个入口
+  0. 返回
+EOF
+    printf '请选择：'; read -r choice
+    case "$choice" in
+      1) route_upsert add "$id" ;;
+      2) route_upsert set "$id" ;;
+      3) route_delete "$id" ;;
+      4) delete_site "$id"; return ;;
+      0) return ;;
+      *) warn "请输入有效序号。" ;;
+    esac
+  done
+}
+
+main_menu() {
+  local choice id backend
+  require_jq; ensure_state_dirs
+  if (( $(site_count) == 0 )) && { [[ -f "$CADDYFILE" ]] || compgen -G "$NGINX_CONF_DIR/emby-proxy-*.conf" >/dev/null; }; then
+    warn "检测到可能存在旧版脚本配置，可在菜单中选择“导入旧配置”。"
+  fi
+  while true; do
+    printf '\n'; print_status
+    cat <<EOF
+
+  1. 查看全部反代入口
+  2. 查看入口详情
+  3. 新增反代入口
+  4. 管理已有入口/路径
+  5. 导入旧版脚本配置
+  6. 验证 Caddy/Nginx 配置
+  0. 退出
+EOF
+    printf '请选择：'; read -r choice
+    case "$choice" in
+      1) list_sites ;;
+      2) id="$(select_site_id)"; show_site "$id" ;;
+      3) backend="$(backend_path)"; "$backend" ;;
+      4) id="$(select_site_id)"; manage_site_menu "$id" ;;
+      5) import_existing ;;
+      6) config_test ;;
+      0) return ;;
+      *) warn "请输入有效序号。" ;;
+    esac
+  done
+}
+
+main() {
+  local command="${1:-menu}" id action
+  case "$command" in
+    -h|--help|help) usage; return ;;
+    -V|--version|version) printf 'emby-proxy %s\n' "$VERSION"; return ;;
+  esac
+  require_root "$@"
+  require_jq; ensure_state_dirs
+  case "$command" in
+    menu) main_menu ;;
+    status) print_status ;;
+    list) list_sites ;;
+    show) [[ $# -ge 2 ]] || die "用法：emby-proxy show <入口ID>"; show_site "$2" ;;
+    add) shift; "$(backend_path)" "$@" ;;
+    import) import_existing ;;
+    delete) [[ $# -ge 2 ]] || die "用法：emby-proxy delete <入口ID>"; delete_site "$2" ;;
+    route)
+      [[ $# -ge 3 ]] || die "用法：emby-proxy route add|set|delete <入口ID>"
+      action="$2"; id="$3"
+      case "$action" in
+        add|set) route_upsert "$action" "$id" ;;
+        delete|remove|rm) route_delete "$id" ;;
+        *) die "路径操作只能是 add、set 或 delete。" ;;
+      esac ;;
+    config) [[ "${2:-}" == "test" ]] || die "用法：emby-proxy config test"; config_test ;;
+    *) die "未知命令：${command}。运行 emby-proxy --help 查看帮助。" ;;
+  esac
+}
+
+if [[ "${EMBY_PROXY_MANAGER_LIB_ONLY:-0}" != "1" ]]; then
+  main "$@"
+fi
