@@ -883,12 +883,20 @@ apt_install_prerequisites() {
 }
 
 install_manager_command() {
-  local source_candidate temp manager_source=""
+  local install_mode="${1:-fallback}" source_candidate temp manager_source=""
   temp="$(mktemp /tmp/emby-proxy-manager.XXXXXX)"
   source_candidate="$(dirname -- "$SCRIPT_PATH")/emby-proxy"
   if [[ -f "$source_candidate" ]]; then
     cp -a "$source_candidate" "$temp"
     manager_source="$source_candidate"
+  elif [[ "$install_mode" == "current" ]]; then
+    if curl -fsSL --connect-timeout 8 --max-time 30 "$MANAGER_COMMAND_URL" -o "$temp"; then
+      manager_source="$MANAGER_COMMAND_URL"
+    else
+      rm -f "$temp"
+      warn "无法下载与当前安装后端配套的 emby-proxy 管理命令。请检查 GitHub 网络后重试。"
+      return 1
+    fi
   elif [[ -f "$MANAGER_BIN" ]]; then
     cp -a "$MANAGER_BIN" "$temp"
     manager_source="$MANAGER_BIN"
@@ -902,6 +910,7 @@ install_manager_command() {
   if ! bash -n "$temp"; then
     rm -f "$temp"
     warn "管理命令语法验证失败，来源：${manager_source}；为避免安装损坏文件，本次跳过。"
+    [[ "$install_mode" != "current" ]] || return 1
     return 0
   fi
   if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
@@ -2245,7 +2254,7 @@ main() {
     # 用户从管理菜单选择“新增反代入口”后，才进入完整的服务检查和配置向导。
     detect_existing_services
     apt_install_prerequisites
-    install_manager_command
+    install_manager_command current || die "无法安装当前管理菜单；没有修改 Caddy/Nginx 或创建反代入口。"
     [[ -x "$MANAGER_BIN" ]] || die "管理命令安装失败，请检查 GitHub 网络连接后重试。"
     release_operation_lock
     ok "管理菜单安装完成；本次没有安装或修改 Caddy/Nginx，也没有新增任何反代入口。"
