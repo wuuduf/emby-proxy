@@ -1022,13 +1022,22 @@ atomic_install_executable() {
 }
 
 self_update() {
-  local option="${1:-}" temp latest_version answer backup_dir timestamp manager_backup="" backend_backup=""
+  local option="${1:-}" temp latest_version answer backup_dir timestamp manager_backup="" backend_backup="" nonce manager_url backend_url checksums_url
   [[ -z "$option" || "$option" == "--check" || "$option" == "--force" ]] || die "用法：emby-proxy update [--check|--force]"
   temp="$(mktemp -d /tmp/emby-proxy-update.XXXXXX)"
+  nonce="$(date +%s%N)"
+  manager_url="$UPDATE_BASE_URL/emby-proxy"
+  backend_url="$UPDATE_BASE_URL/setup-emby-proxy.sh"
+  checksums_url="$UPDATE_BASE_URL/checksums.txt"
+  if [[ "$UPDATE_BASE_URL" == http://* || "$UPDATE_BASE_URL" == https://* ]]; then
+    manager_url+="?cachebust=$nonce"
+    backend_url+="?cachebust=$nonce"
+    checksums_url+="?cachebust=$nonce"
+  fi
   info "正在从更新源获取管理器和安装后端……"
-  curl -fsSL --connect-timeout 8 --max-time 30 "$UPDATE_BASE_URL/emby-proxy" -o "$temp/emby-proxy" || die "下载 emby-proxy 失败。"
-  curl -fsSL --connect-timeout 8 --max-time 30 "$UPDATE_BASE_URL/setup-emby-proxy.sh" -o "$temp/setup-emby-proxy.sh" || die "下载安装后端失败。"
-  curl -fsSL --connect-timeout 8 --max-time 30 "$UPDATE_BASE_URL/checksums.txt" -o "$temp/checksums.txt" || die "下载校验文件失败。"
+  curl -fsSL -H 'Cache-Control: no-cache' --connect-timeout 8 --max-time 30 "$manager_url" -o "$temp/emby-proxy" || die "下载 emby-proxy 失败。"
+  curl -fsSL -H 'Cache-Control: no-cache' --connect-timeout 8 --max-time 30 "$backend_url" -o "$temp/setup-emby-proxy.sh" || die "下载安装后端失败。"
+  curl -fsSL -H 'Cache-Control: no-cache' --connect-timeout 8 --max-time 30 "$checksums_url" -o "$temp/checksums.txt" || die "下载校验文件失败。"
   verify_update_checksums "$temp"
   bash -n "$temp/emby-proxy" "$temp/setup-emby-proxy.sh" || die "更新文件语法验证失败。"
   latest_version="$(sed -n 's/^readonly VERSION="\([^"]*\)"/\1/p' "$temp/emby-proxy" | head -n1)"
