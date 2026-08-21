@@ -944,7 +944,7 @@ prepare_access_target() {
 probe_url() {
   local url="$1" code
   code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 20 "$url/" 2>/dev/null || true)"
-  [[ "$code" =~ ^[1-4][0-9][0-9]$ && "$code" != "000" ]] || return 1
+  [[ "$code" =~ ^[1-5][0-9][0-9]$ && "$code" != "000" ]] || return 1
   printf '%s' "$code"
 }
 
@@ -1974,7 +1974,7 @@ verify_result() {
       [[ "$request_path" == "/" ]] || request_path="${request_path}/"
       code="$(entry_status_code "$request_path")"
       route_codes+=("$code")
-      [[ "$code" =~ ^[1-4][0-9][0-9]$ && "$code" != "000" ]] || all_ok=0
+      [[ "$code" =~ ^[1-5][0-9][0-9]$ && "$code" != "000" ]] || all_ok=0
     done
     if (( all_ok )); then
       ok "代理存活检查通过：$PUBLIC_BASE_URL${health_request_path}（HTTP 200）。"

@@ -85,7 +85,7 @@ EMBY_PROXY_OS_RELEASE_FILE="$TMP_DIR/os-release" EMBY_PROXY_MANAGER_LIB_ONLY=1 M
 ' || fail "完整诊断读取 os-release 失败"
 grep -F '系统：Test Debian' "$TMP_DIR/state/full-doctor.out" >/dev/null || fail "完整诊断未读取系统名称"
 
-# 源站 4xx 仍代表固定代理链路可达，诊断应记录真实状态码并标记为正常。
+# 源站任何有效 HTTP 状态（包括 5xx）都代表固定代理链路可达。
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_CADDYFILE="$TMP_DIR/caddy/Caddyfile" \
 EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
   set --
@@ -94,11 +94,11 @@ EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
   caddy() { return 0; }
   ss() { printf "LISTEN 0 4096 0.0.0.0:18080 0.0.0.0:*\n"; }
   local_health_code() { printf 200; }
-  curl() { printf 403; }
+  curl() { printf 503; }
   doctor_site "$EMBY_PROXY_STATE_HOME/sites.d/ip-203.0.113.10-18080.json" "" >"$EMBY_PROXY_STATE_HOME/doctor-403.out"
   [[ "$DOCTOR_ERROR" == 0 && "$DOCTOR_OK" -ge 1 ]]
-' || fail "源站 4xx 被错误诊断为不可达"
-grep -F '源站可访问：http://127.0.0.1:8096（HTTP 403）' "$TMP_DIR/state/doctor-403.out" >/dev/null || fail "源站 4xx 成功文案缺失"
+' || fail "源站 5xx 被错误诊断为不可达"
+grep -F '源站可访问：http://127.0.0.1:8096（HTTP 503）' "$TMP_DIR/state/doctor-403.out" >/dev/null || fail "源站 5xx 成功文案缺失"
 
 # 备份必须带元数据和哈希，恢复前再次备份，并恢复配置内容。
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_CADDYFILE="$TMP_DIR/caddy/Caddyfile" \
