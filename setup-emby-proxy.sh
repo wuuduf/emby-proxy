@@ -12,6 +12,7 @@ readonly END_MARKER="# END MANAGED EMBY REVERSE PROXY"
 readonly NGINX_LEGACY_CONFIG="/etc/nginx/conf.d/emby-proxy-managed.conf"
 readonly NGINX_ACME_ROOT="/var/www/emby-proxy-acme"
 readonly NGINX_DEFAULT_SITE_LINK="${EMBY_PROXY_NGINX_DEFAULT_SITE_LINK:-/etc/nginx/sites-enabled/default}"
+readonly NGINX_HASH_CONFIG="${EMBY_PROXY_NGINX_HASH_CONFIG:-/etc/nginx/conf.d/00-emby-proxy-hash.conf}"
 readonly HEALTH_PATH="/_emby_proxy_health"
 readonly MANAGER_COMMAND_URL="https://raw.githubusercontent.com/wuuduf/emby-reverse-proxy-installer/main/emby-proxy"
 readonly MANAGER_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
@@ -48,6 +49,7 @@ NGINX_ID=""
 NGINX_CONFIG=""
 NGINX_ACME_CONFIG=""
 NGINX_ACME_CREATED=0
+NGINX_HASH_CONFIG_CREATED=0
 CADDY_ACCESS_LOG=""
 NGINX_ACCESS_LOG=""
 CADDY_ATTACH_EXISTING=0
@@ -1403,8 +1405,33 @@ rollback_nginx() {
     rm -f "$NGINX_CONFIG"
   fi
   (( NGINX_ACME_CREATED == 0 )) || rm -f "$NGINX_ACME_CONFIG"
+  (( NGINX_HASH_CONFIG_CREATED == 0 )) || rm -f "$NGINX_HASH_CONFIG"
   restore_new_nginx_default_site
   nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+}
+
+ensure_nginx_hash_capacity() {
+  local candidate
+  if [[ -f "$NGINX_HASH_CONFIG" ]]; then
+    grep -Fx '# MANAGED EMBY NGINX HASH CAPACITY' "$NGINX_HASH_CONFIG" >/dev/null 2>&1 || \
+      warn "Nginx 哈希容量文件已存在但不是脚本托管：$NGINX_HASH_CONFIG；脚本不会覆盖。"
+    return 0
+  fi
+  if nginx -T 2>/dev/null | grep -Eq '^[[:space:]]*variables_hash_(max_size|bucket_size)[[:space:]]+'; then
+    info "检测到现有 Nginx variables_hash 容量设置，保留原配置。"
+    return 0
+  fi
+  candidate="$(mktemp /tmp/emby-nginx-hash.XXXXXX.conf)"
+  cat >"$candidate" <<'EOF'
+# MANAGED EMBY NGINX HASH CAPACITY
+# 多入口/多路径会创建较多固定 map 变量；只提高哈希表容量，不改变请求路由。
+variables_hash_max_size 4096;
+variables_hash_bucket_size 128;
+EOF
+  install -o root -g root -m 0644 "$candidate" "$NGINX_HASH_CONFIG"
+  rm -f "$candidate"
+  NGINX_HASH_CONFIG_CREATED=1
+  info "已加入 Nginx 多入口变量哈希容量配置：$NGINX_HASH_CONFIG"
 }
 
 reload_or_start_nginx() {
@@ -1502,6 +1529,7 @@ apply_nginx_ip_config() {
     NGINX_HAD_CONFIG=0
     BACKUP_FILE="首次创建，无旧文件"
   fi
+  ensure_nginx_hash_capacity
 
   write_nginx_ip_config "$candidate"
   install -o root -g root -m 0644 "$candidate" "$NGINX_CONFIG"
@@ -1547,6 +1575,7 @@ apply_nginx_config() {
     NGINX_HAD_CONFIG=0
     BACKUP_FILE="首次创建，无旧文件"
   fi
+  ensure_nginx_hash_capacity
 
   if [[ ! -f "$NGINX_ACME_CONFIG" ]]; then
     write_nginx_http_config "$acme_candidate"

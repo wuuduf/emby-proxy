@@ -248,6 +248,7 @@ sudo ./setup-emby-proxy.sh \
 - 显式配置 Emby WebSocket、流式传输、长连接超时、客户端 IP 头；
 - HTTPS 回源会发送正确 SNI，并使用系统 CA 校验源站证书；
 - 每个“域名 + HTTPS 端口”使用独立配置，例如 `/etc/nginx/conf.d/emby-proxy-emby.example.com-https-18443.conf`；内部变量、日志格式和 TLS session cache 也按入口隔离；
+- 多入口/多路径时自动写入独立的 `00-emby-proxy-hash.conf` 提高 Nginx 变量哈希容量，避免入口增多后出现 `could not build optimal variables_hash`；若系统已有手工容量设置则保持不覆盖；
 - 同一域名的多个 HTTPS 端口共享一个仅用于 ACME/HTTPS 跳转的 TCP 80 配置和同一张证书；TCP 80 永远不会提供明文 Emby 反代；
 - 发送给源站的 `X-Forwarded-For` 固定来自 Nginx 的 `$remote_addr`，不继承客户端伪造的来源链。
 - IP 模式只安装 Nginx，不安装或调用 Certbot，并生成独立的纯 HTTP 配置文件。
