@@ -655,7 +655,8 @@ detect_existing_caddy_domain_mode() {
 }
 
 prompt_inputs() {
-  local interactive_upstream=0 primary_route="/" i mode_choice="" domain_choice=""
+  local interactive_upstream=0 primary_route="/" i mode_choice="" domain_choice="" listen_port_provided=0
+  [[ -z "$LISTEN_PORT" ]] || listen_port_provided=1
   select_proxy_engine
 
   if [[ -z "$ACCESS_MODE" ]]; then
@@ -721,7 +722,7 @@ prompt_inputs() {
       read -r PROXY_IP
     fi
     [[ -z "$PROXY_IP" ]] || valid_ipv4 "$(trim "$PROXY_IP")" || die "访问 IPv4 格式无效：$PROXY_IP"
-    if [[ -t 0 ]]; then
+    if [[ -t 0 && $listen_port_provided -eq 0 ]]; then
       printf '%s请输入独立 HTTP 监听端口%s（默认 %s）：' "$BOLD" "$RESET" "$LISTEN_PORT"
       read -r mode_choice
       [[ -z "$mode_choice" ]] || LISTEN_PORT="$mode_choice"
