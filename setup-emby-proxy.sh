@@ -11,6 +11,7 @@ readonly BEGIN_MARKER="# BEGIN MANAGED EMBY REVERSE PROXY"
 readonly END_MARKER="# END MANAGED EMBY REVERSE PROXY"
 readonly NGINX_LEGACY_CONFIG="/etc/nginx/conf.d/emby-proxy-managed.conf"
 readonly NGINX_ACME_ROOT="/var/www/emby-proxy-acme"
+readonly NGINX_DEFAULT_SITE_LINK="${EMBY_PROXY_NGINX_DEFAULT_SITE_LINK:-/etc/nginx/sites-enabled/default}"
 readonly HEALTH_PATH="/_emby_proxy_health"
 readonly MANAGER_COMMAND_URL="https://raw.githubusercontent.com/wuuduf/emby-reverse-proxy-installer/main/emby-proxy"
 readonly MANAGER_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
@@ -38,6 +39,9 @@ UPSTREAM_URL=""
 UPSTREAM_HOST=""
 BACKUP_FILE=""
 NGINX_HAD_CONFIG=0
+NGINX_NEWLY_INSTALLED=0
+NGINX_DEFAULT_DISABLED=0
+NGINX_DEFAULT_LINK_TARGET=""
 NGINX_ID=""
 NGINX_CONFIG=""
 CADDY_ACCESS_LOG=""
@@ -1048,6 +1052,7 @@ install_nginx() {
     ok "检测到 Nginx：$(nginx -v 2>&1)"
     [[ "$ACCESS_MODE" == "ip" ]] || apt-get install -y --no-install-recommends certbot >/dev/null
   else
+    NGINX_NEWLY_INSTALLED=1
     if [[ "$ACCESS_MODE" == "ip" ]]; then
       info "从 Debian/Ubuntu 软件源安装 Nginx……"
       apt-get install -y nginx >/dev/null
@@ -1063,6 +1068,23 @@ install_nginx() {
     command -v certbot >/dev/null 2>&1 || die "Certbot 安装后仍未找到可执行文件。"
     ok "Nginx/Certbot 已就绪：$(nginx -v 2>&1)"
   fi
+}
+
+disable_new_nginx_default_site() {
+  (( NGINX_NEWLY_INSTALLED == 1 )) || return 0
+  [[ "$ACCESS_MODE" == "ip" && -L "$NGINX_DEFAULT_SITE_LINK" ]] || return 0
+  NGINX_DEFAULT_LINK_TARGET="$(readlink "$NGINX_DEFAULT_SITE_LINK")"
+  rm -f "$NGINX_DEFAULT_SITE_LINK"
+  NGINX_DEFAULT_DISABLED=1
+  info "IP 模式已禁用本次新装 Nginx 的 Debian 默认站点，不额外占用 TCP 80。"
+}
+
+restore_new_nginx_default_site() {
+  (( NGINX_DEFAULT_DISABLED == 1 )) || return 0
+  [[ -n "$NGINX_DEFAULT_LINK_TARGET" && ! -e "$NGINX_DEFAULT_SITE_LINK" ]] || return 0
+  mkdir -p "$(dirname "$NGINX_DEFAULT_SITE_LINK")"
+  ln -s "$NGINX_DEFAULT_LINK_TARGET" "$NGINX_DEFAULT_SITE_LINK"
+  NGINX_DEFAULT_DISABLED=0
 }
 
 emit_nginx_header_maps() {
@@ -1314,6 +1336,7 @@ rollback_nginx() {
   else
     rm -f "$NGINX_CONFIG"
   fi
+  restore_new_nginx_default_site
   nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
 }
 
@@ -1396,6 +1419,7 @@ apply_nginx_ip_config() {
 
   write_nginx_ip_config "$candidate"
   install -o root -g root -m 0644 "$candidate" "$NGINX_CONFIG"
+  disable_new_nginx_default_site
   if ! nginx -t; then
     rollback_nginx
     rm -f "$candidate"

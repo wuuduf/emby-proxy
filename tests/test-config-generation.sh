@@ -18,6 +18,21 @@ assert_count() {
 
 EMBY_PROXY_LIB_ONLY=1 source "$SCRIPT"
 
+# 只有本次新装的 Nginx/IP 模式才能禁用 Debian 默认站点，并且回滚可恢复原符号链接。
+mkdir -p "$TMP_DIR/nginx-default/sites-enabled" "$TMP_DIR/nginx-default/sites-available"
+: >"$TMP_DIR/nginx-default/sites-available/default"
+ln -s ../sites-available/default "$TMP_DIR/nginx-default/sites-enabled/default"
+EMBY_PROXY_NGINX_DEFAULT_SITE_LINK="$TMP_DIR/nginx-default/sites-enabled/default" \
+SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY_LIB_ONLY=1 bash -c '
+  set --
+  source "$SCRIPT_UNDER_TEST"
+  ACCESS_MODE=ip; NGINX_NEWLY_INSTALLED=1
+  disable_new_nginx_default_site
+  [[ ! -e "$NGINX_DEFAULT_SITE_LINK" && "$NGINX_DEFAULT_DISABLED" == 1 ]]
+  restore_new_nginx_default_site
+  [[ -L "$NGINX_DEFAULT_SITE_LINK" && "$(readlink "$NGINX_DEFAULT_SITE_LINK")" == ../sites-available/default ]]
+' || fail "新装 Nginx 默认站点的禁用/回滚失败"
+
 SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY_LIB_ONLY=1 bash -c '
   set -- --mode ip --ip-address 203.0.113.10 --listen-port 18080 --path /media
   source "$SCRIPT_UNDER_TEST"
