@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.1.1-stage2"
+readonly VERSION="2.1.2-stage2"
 readonly STATE_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
@@ -160,9 +160,9 @@ print_status() {
   local count caddy_count nginx_count domain_count ip_count
   ensure_state_dirs
   count="$(site_count)"
-  caddy_count="$(find "$SITES_DIR" -type f -name '*.json' -exec grep -l '"engine": "caddy"' {} + 2>/dev/null | wc -l | tr -d ' ')"
-  nginx_count="$(find "$SITES_DIR" -type f -name '*.json' -exec grep -l '"engine": "nginx"' {} + 2>/dev/null | wc -l | tr -d ' ')"
-  domain_count="$(find "$SITES_DIR" -type f -name '*.json' -exec grep -l '"mode": "domain"' {} + 2>/dev/null | wc -l | tr -d ' ')"
+  caddy_count="$(find "$SITES_DIR" -type f -name '*.json' -exec jq -r 'select(.engine=="caddy") | 1' {} \; 2>/dev/null | wc -l | tr -d ' ')"
+  nginx_count="$(find "$SITES_DIR" -type f -name '*.json' -exec jq -r 'select(.engine=="nginx") | 1' {} \; 2>/dev/null | wc -l | tr -d ' ')"
+  domain_count="$(find "$SITES_DIR" -type f -name '*.json' -exec jq -r 'select(.mode=="domain") | 1' {} \; 2>/dev/null | wc -l | tr -d ' ')"
   ip_count="$((count-domain_count))"
   printf '%sEmby Reverse Proxy Manager%s  %s\n\n' "$BOLD" "$RESET" "$VERSION"
   printf '  %s\n' "$(service_line caddy caddy)"

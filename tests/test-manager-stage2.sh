@@ -58,6 +58,18 @@ EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
 ' || fail "入口诊断产生错误"
 grep -F '本机入口健康检查 HTTP 200' "$TMP_DIR/state/doctor.out" >/dev/null || fail "诊断缺少健康检查"
 
+# 只有 Caddy/IP 入口时，Nginx 和域名计数为 0 不能被 pipefail 当成错误。
+EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_CADDYFILE="$TMP_DIR/caddy/Caddyfile" \
+EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  set --
+  source "$MANAGER_UNDER_TEST"
+  systemctl() { return 1; }
+  caddy() { printf "test-caddy"; }
+  print_status >"$EMBY_PROXY_STATE_HOME/status.out"
+' || fail "零项引擎/模式统计导致状态页面退出"
+grep -F '托管入口：1（域名 HTTPS 0，IP HTTP 1）' "$TMP_DIR/state/status.out" >/dev/null || fail "状态页面入口计数错误"
+grep -F '引擎分布：Caddy 1，Nginx 0' "$TMP_DIR/state/status.out" >/dev/null || fail "状态页面引擎计数错误"
+
 # 完整诊断不能因为 /etc/os-release 中也存在 VERSION 变量而与管理器版本冲突。
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_CADDYFILE="$TMP_DIR/caddy/Caddyfile" \
 EMBY_PROXY_OS_RELEASE_FILE="$TMP_DIR/os-release" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
