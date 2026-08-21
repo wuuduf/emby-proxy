@@ -177,6 +177,6 @@ EMBY_PROXY_LIB_ONLY=1 INSTALLER_UNDER_TEST="$INSTALLER" bash -c '
 ' || fail "管理命令安装失败"
 [[ -x "$TMP_DIR/installed/lib/setup-emby-proxy.sh" ]] || fail "未安装配置后端"
 [[ -x "$TMP_DIR/installed/bin/emby-proxy" ]] || fail "未安装 emby-proxy 命令"
-"$TMP_DIR/installed/bin/emby-proxy" version | grep -F '2.1.3-stage2' >/dev/null || fail "已安装管理命令不可运行"
+"$TMP_DIR/installed/bin/emby-proxy" version | grep -F '2.1.4-stage2' >/dev/null || fail "已安装管理命令不可运行"
 
 printf 'PASS: manager install/import, state registry, route replay, exact-marker deletion\n'

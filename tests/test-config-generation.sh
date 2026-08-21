@@ -40,14 +40,15 @@ set_domain() {
 
 # Nginx：正式配置固定上游、拒绝伪造 XFF，并为每个域名使用唯一变量。
 set_domain one.example.com
+one_nginx_id="$NGINX_ID"
 write_nginx_https_config "$TMP_DIR/nginx-one.conf"
 write_nginx_http_config "$TMP_DIR/nginx-one-acme.conf"
 assert_contains "$TMP_DIR/nginx-one.conf" 'proxy_set_header X-Forwarded-For $remote_addr;'
 assert_contains "$TMP_DIR/nginx-one.conf" '"ts":$msec'
 assert_not_contains "$TMP_DIR/nginx-one.conf" '$proxy_add_x_forwarded_for'
-assert_contains "$TMP_DIR/nginx-one.conf" '$emby_connection_upgrade_one_dot_example_dot_com'
+assert_contains "$TMP_DIR/nginx-one.conf" "\$emby_connection_upgrade_${one_nginx_id}"
 assert_contains "$TMP_DIR/nginx-one.conf" '"~*^/a(?:/|$)" $upstream_http_location;'
-assert_contains "$TMP_DIR/nginx-one.conf" 'add_header Location $emby_proxy_location_one_dot_example_dot_com_1 always;'
+assert_contains "$TMP_DIR/nginx-one.conf" "add_header Location \$emby_proxy_location_${one_nginx_id}_1 always;"
 assert_not_contains "$TMP_DIR/nginx-one.conf" 'proxy_pass $'
 
 # 证书申请阶段只能处理 ACME；不能在 80 端口临时暴露 Emby。
@@ -57,9 +58,12 @@ assert_not_contains "$TMP_DIR/nginx-one-acme.conf" 'proxy_pass '
 assert_not_contains "$TMP_DIR/nginx-one-acme.conf" 'origin.example.net'
 
 set_domain two.example.com
+two_nginx_id="$NGINX_ID"
+[[ "$one_nginx_id" != "$two_nginx_id" ]] || fail "不同入口生成了相同 Nginx 短标识"
+[[ "$one_nginx_id" =~ ^s[0-9a-f]{12}$ && "$two_nginx_id" =~ ^s[0-9a-f]{12}$ ]] || fail "Nginx 短标识格式错误"
 write_nginx_https_config "$TMP_DIR/nginx-two.conf"
-assert_contains "$TMP_DIR/nginx-two.conf" 'log_format emby_proxy_two_dot_example_dot_com_v1'
-assert_not_contains "$TMP_DIR/nginx-two.conf" 'emby_proxy_one_dot_example_dot_com'
+assert_contains "$TMP_DIR/nginx-two.conf" "log_format emby_proxy_${two_nginx_id}_v1"
+assert_not_contains "$TMP_DIR/nginx-two.conf" "emby_proxy_${one_nginx_id}"
 
 # Caddy：同一 Caddyfile 可保留多个域名；重跑一个域名只替换自己的托管块。
 : >"$TMP_DIR/Caddyfile.empty"
@@ -90,6 +94,7 @@ ACCESS_MODE="ip"
 PROXY_IP="203.0.113.10"
 LISTEN_PORT="18080"
 set_ip_access_target >/dev/null
+[[ "$NGINX_ID" =~ ^s[0-9a-f]{12}$ ]] || fail "IP 模式 Nginx 短标识格式错误"
 parse_upstream http://203.0.113.10:8096
 [[ "$UPSTREAM_URL" == http://203.0.113.10:8096 ]] || fail "IP 模式错误拒绝了同机不同端口源站"
 if (parse_upstream http://203.0.113.10:18080) >/dev/null 2>&1; then fail "IP 模式未拒绝入口端口代理循环"; fi

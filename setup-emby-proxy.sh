@@ -214,6 +214,18 @@ normalize_listen_port() {
   LISTEN_PORT="$((10#$LISTEN_PORT))"
 }
 
+set_nginx_id() {
+  local value="$1" hash
+  if command -v sha256sum >/dev/null 2>&1; then
+    hash="$(printf '%s' "$value" | sha256sum | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    hash="$(printf '%s' "$value" | shasum -a 256 | awk '{print $1}')"
+  else
+    die "缺少 sha256sum/shasum，无法生成安全的 Nginx 入口标识。"
+  fi
+  NGINX_ID="s${hash:0:12}"
+}
+
 set_ip_access_target() {
   PROXY_IP="$(trim "$PROXY_IP")"
   if [[ -z "$PROXY_IP" ]]; then
@@ -228,7 +240,7 @@ set_ip_access_target() {
   PUBLIC_AUTHORITY="${PROXY_IP}:${LISTEN_PORT}"
   PUBLIC_BASE_URL="http://${PUBLIC_AUTHORITY}"
   PROXY_KEY="ip-${PROXY_IP}-${LISTEN_PORT}"
-  NGINX_ID="ip_${PROXY_IP//./_}_${LISTEN_PORT}"
+  set_nginx_id "$PROXY_KEY"
   NGINX_CONFIG="/etc/nginx/conf.d/emby-proxy-${PROXY_KEY}.conf"
   CADDY_ACCESS_LOG="/var/log/caddy/emby-proxy-${PROXY_KEY}-access.log"
   NGINX_ACCESS_LOG="/var/log/nginx/emby-proxy-${PROXY_KEY}-access.log"
@@ -257,9 +269,8 @@ normalize_proxy_domain() {
   PUBLIC_AUTHORITY="$PROXY_DOMAIN"
   PUBLIC_BASE_URL="https://$PROXY_DOMAIN"
   PROXY_KEY="$PROXY_DOMAIN"
-  # 点和连字符使用不同编码，避免 a-b.example.com 与 a.b.example.com 生成同名 Nginx 变量。
-  NGINX_ID="${PROXY_DOMAIN//-/_dash_}"
-  NGINX_ID="${NGINX_ID//./_dot_}"
+  # 稳定短哈希既隔离不同入口，也避免长域名/IP+端口使 Nginx variables_hash 超出默认桶大小。
+  set_nginx_id "$PROXY_KEY"
   NGINX_CONFIG="/etc/nginx/conf.d/emby-proxy-${PROXY_DOMAIN}.conf"
   CADDY_ACCESS_LOG="/var/log/caddy/emby-proxy-${PROXY_DOMAIN}-access.log"
   NGINX_ACCESS_LOG="/var/log/nginx/emby-proxy-${PROXY_DOMAIN}-access.log"
