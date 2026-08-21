@@ -655,8 +655,9 @@ detect_existing_caddy_domain_mode() {
 }
 
 prompt_inputs() {
-  local interactive_upstream=0 primary_route="/" i mode_choice="" domain_choice="" listen_port_provided=0
+  local interactive_upstream=0 primary_route="/" i mode_choice="" domain_choice="" listen_port_provided=0 domain_type_provided=0
   [[ -z "$LISTEN_PORT" ]] || listen_port_provided=1
+  [[ -z "$DOMAIN_ENTRY_TYPE" ]] || domain_type_provided=1
   select_proxy_engine
 
   if [[ -z "$ACCESS_MODE" ]]; then
@@ -679,7 +680,7 @@ prompt_inputs() {
   if [[ "$ACCESS_MODE" == "domain" ]]; then
     [[ -z "$PROXY_IP" && -z "$LISTEN_PORT" ]] || die "域名模式不能同时使用 --ip-address 或 --listen-port。"
     normalize_domain_entry_type
-    if [[ -t 0 && -z "${HTTPS_PORT:-}" && -z "${PRIMARY_ROUTE_INPUT:-}" && ${#ROUTE_SPECS[@]} -eq 0 ]]; then
+    if [[ -t 0 && $domain_type_provided -eq 0 && -z "${HTTPS_PORT:-}" && -z "${PRIMARY_ROUTE_INPUT:-}" && ${#ROUTE_SPECS[@]} -eq 0 ]]; then
       printf '\n请选择域名入口结构：\n'
       printf '  1) 独立子域名 + HTTPS 443（首选，兼容性最好）\n'
       printf '  2) 同一域名 + 独立 HTTPS 端口（每个 Emby 一个端口）\n'
