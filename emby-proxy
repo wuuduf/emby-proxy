@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.1.0-stage2"
+readonly VERSION="2.1.1-stage2"
 readonly STATE_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
@@ -12,6 +12,7 @@ readonly CADDYFILE="${EMBY_PROXY_CADDYFILE:-/etc/caddy/Caddyfile}"
 readonly NGINX_CONF_DIR="${EMBY_PROXY_NGINX_CONF_DIR:-/etc/nginx/conf.d}"
 readonly CADDY_LOG_DIR="${EMBY_PROXY_CADDY_LOG_DIR:-/var/log/caddy}"
 readonly NGINX_LOG_DIR="${EMBY_PROXY_NGINX_LOG_DIR:-/var/log/nginx}"
+readonly OS_RELEASE_FILE="${EMBY_PROXY_OS_RELEASE_FILE:-/etc/os-release}"
 readonly HEALTH_PATH="/_emby_proxy_health"
 readonly INSTALLED_BACKEND="${EMBY_PROXY_INSTALLED_BACKEND:-/usr/local/lib/emby-proxy/setup-emby-proxy.sh}"
 readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
@@ -350,11 +351,13 @@ run_doctor() {
   local id="${1:-}" file public_ipv4="" os_name
   DOCTOR_OK=0; DOCTOR_WARN=0; DOCTOR_ERROR=0
   printf '%sEmby Proxy 运行诊断%s\n' "$BOLD" "$RESET"
-  if [[ -r /etc/os-release ]]; then
-    os_name="$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-unknown}")"
+  if [[ -r "$OS_RELEASE_FILE" ]]; then
+    os_name="$(sed -n 's/^PRETTY_NAME=//p' "$OS_RELEASE_FILE" | head -n1)"
+    os_name="${os_name#\"}"; os_name="${os_name%\"}"
+    [[ -n "$os_name" ]] || os_name="unknown"
     doctor_ok "系统：$os_name / $(uname -m)"
   else
-    doctor_error "缺少 /etc/os-release。"
+    doctor_error "缺少 $OS_RELEASE_FILE。"
   fi
   public_ipv4="$(curl -4 --noproxy '*' -fsS --connect-timeout 3 --max-time 6 https://api.ipify.org 2>/dev/null || true)"
   [[ -n "$public_ipv4" ]] && doctor_ok "本机公网 IPv4：$public_ipv4" || doctor_warn "无法自动检测本机公网 IPv4。"

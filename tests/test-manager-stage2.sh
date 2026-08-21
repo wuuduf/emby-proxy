@@ -20,6 +20,10 @@ EOF
 cat >"$TMP_DIR/state/sites.d/ip-203.0.113.10-18080.json" <<EOF
 {"schema_version":1,"id":"ip-203.0.113.10-18080","engine":"caddy","mode":"ip","domain":"","ip":"203.0.113.10","listen_port":18080,"public_url":"http://203.0.113.10:18080","managed_kind":"standalone","config_file":"$TMP_DIR/caddy/Caddyfile","created_at":"2026-08-17T00:00:00Z","updated_at":"2026-08-17T00:00:00Z","routes":[{"path":"/","upstream":"http://127.0.0.1:8096"}]}
 EOF
+cat >"$TMP_DIR/os-release" <<'EOF'
+PRETTY_NAME="Test Debian"
+VERSION="12 (bookworm)"
+EOF
 cat >"$TMP_DIR/log/emby-proxy-ip-203.0.113.10-18080-access.log" <<EOF
 {"ts":$NOW,"request":{"remote_ip":"1.2.3.4","method":"GET","uri":"/Videos/1/stream"},"status":200,"size":1048576,"duration":2.5}
 {"ts":$NOW,"request":{"remote_ip":"5.6.7.8","method":"GET","uri":"/web/index.html"},"status":500,"size":100,"duration":0.2}
@@ -53,6 +57,19 @@ EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
   [[ "$DOCTOR_ERROR" == 0 ]]
 ' || fail "入口诊断产生错误"
 grep -F '本机入口健康检查 HTTP 200' "$TMP_DIR/state/doctor.out" >/dev/null || fail "诊断缺少健康检查"
+
+# 完整诊断不能因为 /etc/os-release 中也存在 VERSION 变量而与管理器版本冲突。
+EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_CADDYFILE="$TMP_DIR/caddy/Caddyfile" \
+EMBY_PROXY_OS_RELEASE_FILE="$TMP_DIR/os-release" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  set --
+  source "$MANAGER_UNDER_TEST"
+  systemctl() { [[ "$1" == is-active ]] && return 0; return 0; }
+  caddy() { return 0; }
+  ss() { printf "LISTEN 0 4096 0.0.0.0:18080 0.0.0.0:*\n"; }
+  curl() { printf 200; }
+  run_doctor ip-203.0.113.10-18080 >"$EMBY_PROXY_STATE_HOME/full-doctor.out"
+' || fail "完整诊断读取 os-release 失败"
+grep -F '系统：Test Debian' "$TMP_DIR/state/full-doctor.out" >/dev/null || fail "完整诊断未读取系统名称"
 
 # 备份必须带元数据和哈希，恢复前再次备份，并恢复配置内容。
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_CADDYFILE="$TMP_DIR/caddy/Caddyfile" \
