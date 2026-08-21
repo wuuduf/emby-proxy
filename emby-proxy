@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.1.2-stage2"
+readonly VERSION="2.1.3-stage2"
 readonly STATE_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
@@ -171,7 +171,7 @@ print_status() {
   printf '  引擎分布：Caddy %s，Nginx %s\n' "$caddy_count" "$nginx_count"
   if command -v ss >/dev/null 2>&1; then
     printf '  监听端口：\n'
-    ss -H -lntp 2>/dev/null | awk '$4 ~ /:(80|443|8080)$/ {printf "    %s %s\n",$4,$NF}' || true
+    ss -H -lntp 2>/dev/null | awk '$0 ~ /users:\(\("(caddy|nginx)"/ {printf "    %s %s\n",$4,$NF}' || true
   fi
 }
 
