@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.2.3-modes"
+readonly VERSION="2.2.4-menu"
 readonly STATE_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
@@ -687,6 +687,12 @@ run_backend_for_state() {
   "$backend" "${args[@]}"
 }
 
+run_add_wizard() {
+  local backend
+  backend="$(backend_path)"
+  "$backend" --entry-wizard "$@"
+}
+
 validate_route_path() {
   local path="$1"
   [[ "$path" == /* ]] || path="/$path"
@@ -1183,7 +1189,7 @@ EOF
 }
 
 main_menu() {
-  local choice id backend
+  local choice id
   require_jq; ensure_state_dirs
   if (( $(site_count) == 0 )) && { [[ -f "$CADDYFILE" ]] || compgen -G "$NGINX_CONF_DIR/emby-proxy-*.conf" >/dev/null; }; then
     warn "检测到可能存在旧版脚本配置，可在菜单中选择“导入旧配置”。"
@@ -1208,7 +1214,7 @@ EOF
     case "$choice" in
       1) list_sites ;;
       2) id="$(select_site_id)"; show_site "$id" ;;
-      3) backend="$(backend_path)"; "$backend" ;;
+      3) run_add_wizard ;;
       4) id="$(select_site_id)"; manage_site_menu "$id" ;;
       5) run_doctor || true ;;
       6) logs_stats_menu ;;
@@ -1235,7 +1241,7 @@ main() {
     status) print_status ;;
     list) list_sites ;;
     show) [[ $# -ge 2 ]] || die "用法：emby-proxy show <入口ID>"; show_site "$2" ;;
-    add) shift; "$(backend_path)" "$@" ;;
+    add) shift; run_add_wizard "$@" ;;
     import) import_existing ;;
     doctor) run_doctor "${2:-}" ;;
     logs) [[ $# -ge 2 ]] || die "用法：emby-proxy logs <入口ID> [--follow|--media|--errors|--slow 秒]"

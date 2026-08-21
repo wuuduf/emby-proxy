@@ -21,6 +21,8 @@ readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
 
 PROXY_ENGINE=""
 MANAGER_ONLY=0
+BOOTSTRAP_MENU=0
+ENTRY_WIZARD=0
 SHOW_UNSAFE_IP_MODE="${EMBY_PROXY_SHOW_UNSAFE_IP_MODE:-0}"
 ACCESS_MODE=""
 ACCESS_SCHEME=""
@@ -63,6 +65,10 @@ declare -a ROUTE_INPUTS=()
 declare -a ROUTE_URLS=()
 declare -a ROUTE_HOSTS=()
 LOCK_FD=""
+
+# 无参数运行下载的一键脚本时，只初始化长期管理命令并进入菜单。
+# 真正新增入口由菜单显式传入内部参数 --entry-wizard，避免首次安装直接掉进配置向导。
+(($# == 0)) && BOOTSTRAP_MENU=1
 
 if [[ -t 1 ]]; then
   RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
@@ -112,6 +118,8 @@ while (($#)); do
       PROXY_ENGINE="$2"; shift 2 ;;
     --manager-only)
       MANAGER_ONLY=1; shift ;;
+    --entry-wizard)
+      ENTRY_WIZARD=1; BOOTSTRAP_MENU=0; shift ;;
     --show-unsafe-ip-mode|--allow-insecure-ip)
       SHOW_UNSAFE_IP_MODE=1; shift ;;
     -m|--mode)
@@ -155,6 +163,7 @@ require_root() {
     info "需要管理员权限，正在通过 sudo 重新运行……"
     [[ -n "$PROXY_ENGINE" ]] && sudo_args+=(--engine "$PROXY_ENGINE")
     (( MANAGER_ONLY )) && sudo_args+=(--manager-only)
+    (( ENTRY_WIZARD )) && sudo_args+=(--entry-wizard)
     case "$SHOW_UNSAFE_IP_MODE" in 1|true|TRUE|yes|YES|on|ON) sudo_args+=(--show-unsafe-ip-mode) ;; esac
     [[ -n "$ACCESS_MODE" ]] && sudo_args+=(--mode "$ACCESS_MODE")
     [[ -n "$PROXY_DOMAIN" ]] && sudo_args+=(--domain "$PROXY_DOMAIN")
@@ -2231,6 +2240,18 @@ main() {
   acquire_operation_lock
   printf '%sEmby 一键反向代理配置器（域名 HTTPS / IP HTTP，Caddy / Nginx）%s\n\n' "$BOLD" "$RESET"
   check_platform
+  if (( BOOTSTRAP_MENU )); then
+    # 首次执行只部署管理层，不安装 Web 服务、不创建入口，也不碰现有配置。
+    # 用户从管理菜单选择“新增反代入口”后，才进入完整的服务检查和配置向导。
+    detect_existing_services
+    apt_install_prerequisites
+    install_manager_command
+    [[ -x "$MANAGER_BIN" ]] || die "管理命令安装失败，请检查 GitHub 网络连接后重试。"
+    release_operation_lock
+    ok "管理菜单安装完成；本次没有安装或修改 Caddy/Nginx，也没有新增任何反代入口。"
+    info "正在打开管理菜单，请选择“3. 新增反代入口”开始配置。"
+    exec "$MANAGER_BIN"
+  fi
   if (( MANAGER_ONLY )); then
     apt_install_prerequisites
     install_manager_command

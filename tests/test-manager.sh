@@ -18,6 +18,18 @@ EMBY_PROXY_LIB_ONLY=1 INSTALLER_UNDER_TEST="$INSTALLER" bash -c '
   [[ "$MANAGER_ONLY" == 1 ]]
 ' || fail "--manager-only 参数解析失败"
 
+EMBY_PROXY_LIB_ONLY=1 INSTALLER_UNDER_TEST="$INSTALLER" bash -c '
+  set --
+  source "$INSTALLER_UNDER_TEST"
+  [[ "$BOOTSTRAP_MENU" == 1 && "$ENTRY_WIZARD" == 0 ]]
+' || fail "无参数首次运行没有进入管理菜单初始化模式"
+
+EMBY_PROXY_LIB_ONLY=1 INSTALLER_UNDER_TEST="$INSTALLER" bash -c '
+  set -- --entry-wizard
+  source "$INSTALLER_UNDER_TEST"
+  [[ "$BOOTSTRAP_MENU" == 0 && "$ENTRY_WIZARD" == 1 ]]
+' || fail "管理菜单新增入口没有进入配置向导模式"
+
 mkdir -p "$TMP_DIR/caddy" "$TMP_DIR/nginx" "$TMP_DIR/state"
 cat >"$TMP_DIR/caddy/Caddyfile" <<'EOF'
 # BEGIN MANAGED EMBY REVERSE PROXY: one.example.com
@@ -126,6 +138,16 @@ cat >"$TMP_DIR/fake-backend" <<'EOF'
 printf '%s\n' "$@" >"$FAKE_ARGS_OUT"
 EOF
 chmod +x "$TMP_DIR/fake-backend"
+FAKE_ARGS_OUT="$TMP_DIR/add-wizard.args" EMBY_PROXY_BACKEND="$TMP_DIR/fake-backend" \
+EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  set --
+  source "$MANAGER_UNDER_TEST"
+  run_add_wizard --engine caddy
+' || fail "管理器未能启动新增入口向导"
+assert_arg "$TMP_DIR/add-wizard.args" '--entry-wizard'
+assert_arg "$TMP_DIR/add-wizard.args" '--engine'
+assert_arg "$TMP_DIR/add-wizard.args" 'caddy'
+
 FAKE_ARGS_OUT="$TMP_DIR/backend.args" EMBY_PROXY_BACKEND="$TMP_DIR/fake-backend" \
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
   set --
@@ -221,6 +243,6 @@ EMBY_PROXY_LIB_ONLY=1 INSTALLER_UNDER_TEST="$INSTALLER" bash -c '
 ' || fail "管理命令安装失败"
 [[ -x "$TMP_DIR/installed/lib/setup-emby-proxy.sh" ]] || fail "未安装配置后端"
 [[ -x "$TMP_DIR/installed/bin/emby-proxy" ]] || fail "未安装 emby-proxy 命令"
-"$TMP_DIR/installed/bin/emby-proxy" version | grep -F '2.2.3-modes' >/dev/null || fail "已安装管理命令不可运行"
+"$TMP_DIR/installed/bin/emby-proxy" version | grep -F '2.2.4-menu' >/dev/null || fail "已安装管理命令不可运行"
 
 printf 'PASS: manager install/import, state registry, route replay, exact-marker deletion\n'
