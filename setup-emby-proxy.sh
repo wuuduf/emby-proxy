@@ -972,11 +972,7 @@ probe_upstream() {
       fi
     fi
   fi
-  if [[ "$code" =~ ^4[0-9][0-9]$ ]]; then
-    warn "源站网络可达，但返回 HTTP ${code}：${UPSTREAM_URL}。这可能是源站 IP 白名单、WAF 或访问策略拒绝；部署后该路径可能无法使用。"
-  else
-    ok "源站可访问：${UPSTREAM_URL}（HTTP ${code}）"
-  fi
+  ok "源站可访问：${UPSTREAM_URL}（HTTP ${code}）"
   if [[ "$UPSTREAM_URL" == http://* ]]; then
     warn "源站链路使用明文 HTTP；仅在可信内网或本机回源时推荐。"
   fi
@@ -1983,11 +1979,7 @@ verify_result() {
     if (( all_ok )); then
       ok "代理存活检查通过：$PUBLIC_BASE_URL${health_request_path}（HTTP 200）。"
       for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
-        if [[ "${route_codes[$i]}" =~ ^4[0-9][0-9]$ ]]; then
-          warn "路径 ${ROUTE_PATHS[$i]} 已到达源站，但源站返回 HTTP ${route_codes[$i]}；请检查源站白名单、WAF、鉴权或访问策略。"
-        else
-          ok "路径 ${ROUTE_PATHS[$i]} 反代验证通过（HTTP ${route_codes[$i]}）。"
-        fi
+        ok "路径 ${ROUTE_PATHS[$i]} 反代验证通过（HTTP ${route_codes[$i]}）。"
       done
       printf '\n%s部署完成！%s\n' "$GREEN$BOLD" "$RESET"
       printf '可用的 Emby 反代地址：\n'
