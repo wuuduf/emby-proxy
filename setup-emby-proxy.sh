@@ -21,6 +21,7 @@ readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
 
 PROXY_ENGINE=""
 MANAGER_ONLY=0
+SHOW_UNSAFE_IP_MODE="${EMBY_PROXY_SHOW_UNSAFE_IP_MODE:-0}"
 ACCESS_MODE=""
 ACCESS_SCHEME=""
 PROXY_IP=""
@@ -82,11 +83,12 @@ usage() {
   sudo ./${SCRIPT_NAME} --manager-only
   sudo ./${SCRIPT_NAME} --engine nginx --domain emby.example.com --upstream origin.example.com
   sudo ./${SCRIPT_NAME} --engine nginx --domain emby.example.com --https-port 18443 --upstream origin.example.com
-  sudo ./${SCRIPT_NAME} --engine caddy --mode ip --listen-port 8080 --upstream origin.example.com
+  sudo ./${SCRIPT_NAME} --show-unsafe-ip-mode --engine caddy --mode ip --listen-port 8080 --upstream origin.example.com
 
 选项：
   -e, --engine ENGINE       反代程序：caddy 或 nginx；不填写时交互选择
       --manager-only        只安装 emby-proxy 管理命令并导入旧配置，不新增反代
+      --show-unsafe-ip-mode 显示/允许“公网 IP + 明文 HTTP”模式；默认隐藏
   -m, --mode MODE           访问模式：domain（域名 HTTPS）或 ip（公网 IPv4 + HTTP）
   -d, --domain DOMAIN       对外访问的反代域名（必须已解析到本 VPS）
   -i, --ip-address IPV4     IP 模式的对外访问 IPv4；不填写时自动检测公网 IPv4
@@ -110,6 +112,8 @@ while (($#)); do
       PROXY_ENGINE="$2"; shift 2 ;;
     --manager-only)
       MANAGER_ONLY=1; shift ;;
+    --show-unsafe-ip-mode|--allow-insecure-ip)
+      SHOW_UNSAFE_IP_MODE=1; shift ;;
     -m|--mode)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       ACCESS_MODE="$2"; shift 2 ;;
@@ -151,6 +155,7 @@ require_root() {
     info "需要管理员权限，正在通过 sudo 重新运行……"
     [[ -n "$PROXY_ENGINE" ]] && sudo_args+=(--engine "$PROXY_ENGINE")
     (( MANAGER_ONLY )) && sudo_args+=(--manager-only)
+    case "$SHOW_UNSAFE_IP_MODE" in 1|true|TRUE|yes|YES|on|ON) sudo_args+=(--show-unsafe-ip-mode) ;; esac
     [[ -n "$ACCESS_MODE" ]] && sudo_args+=(--mode "$ACCESS_MODE")
     [[ -n "$PROXY_DOMAIN" ]] && sudo_args+=(--domain "$PROXY_DOMAIN")
     [[ -n "$PROXY_IP" ]] && sudo_args+=(--ip-address "$PROXY_IP")
@@ -225,6 +230,21 @@ normalize_access_mode() {
     2|ip|http) ACCESS_MODE="ip" ;;
     *) die "访问模式只能选择 1/domain 或 2/ip。" ;;
   esac
+}
+
+normalize_unsafe_ip_visibility() {
+  SHOW_UNSAFE_IP_MODE="$(printf '%s' "$(trim "$SHOW_UNSAFE_IP_MODE")" | tr '[:upper:]' '[:lower:]')"
+  case "$SHOW_UNSAFE_IP_MODE" in
+    1|true|yes|on) SHOW_UNSAFE_IP_MODE=1 ;;
+    0|false|no|off|"") SHOW_UNSAFE_IP_MODE=0 ;;
+    *) die "EMBY_PROXY_SHOW_UNSAFE_IP_MODE 只能是 0/1 或 true/false。" ;;
+  esac
+}
+
+require_unsafe_ip_opt_in() {
+  if [[ "$ACCESS_MODE" == "ip" && "$SHOW_UNSAFE_IP_MODE" != "1" ]]; then
+    die "IP 模式是明文 HTTP，默认已禁用。若确认接受凭据和媒体流未加密的风险，请显式添加 --show-unsafe-ip-mode。"
+  fi
 }
 
 normalize_listen_port() {
@@ -660,6 +680,7 @@ prompt_inputs() {
   local interactive_upstream=0 primary_route="/" i mode_choice="" domain_choice="" listen_port_provided=0 domain_type_provided=0
   [[ -z "$LISTEN_PORT" ]] || listen_port_provided=1
   [[ -z "$DOMAIN_ENTRY_TYPE" ]] || domain_type_provided=1
+  normalize_unsafe_ip_visibility
   select_proxy_engine
 
   if [[ -z "$ACCESS_MODE" ]]; then
@@ -668,16 +689,23 @@ prompt_inputs() {
     elif [[ -n "$PROXY_IP" || -n "$LISTEN_PORT" ]]; then
       ACCESS_MODE="ip"
     else
-      [[ -t 0 ]] || die "非交互环境请使用 --mode ip，或提供 --domain。"
-      printf '\n请选择对外访问方式：\n'
-      printf '  1) 域名 + HTTPS（需要域名解析）\n'
-      printf '  2) 公网 IPv4 + HTTP 独立端口（不需要域名）\n'
-      printf '请输入 1 或 2（默认 1）：'
-      read -r mode_choice
-      ACCESS_MODE="${mode_choice:-1}"
+      [[ -t 0 ]] || die "非交互环境请提供 --domain；如确需不安全的 IP HTTP 模式，必须同时使用 --show-unsafe-ip-mode --mode ip。"
+      if [[ "$SHOW_UNSAFE_IP_MODE" == "1" ]]; then
+        printf '\n请选择对外访问方式：\n'
+        printf '  1) 域名 + HTTPS（安全，推荐）\n'
+        printf '  2) 公网 IPv4 + HTTP 独立端口（不安全：明文传输）\n'
+        printf '请输入 1 或 2（默认 1）：'
+        read -r mode_choice
+        ACCESS_MODE="${mode_choice:-1}"
+      else
+        ACCESS_MODE="domain"
+        info "默认仅提供域名 HTTPS 模式；不安全的 IP 明文 HTTP 模式已隐藏。"
+        info "确需临时使用时，重新运行并显式添加：--show-unsafe-ip-mode"
+      fi
     fi
   fi
   normalize_access_mode
+  require_unsafe_ip_opt_in
 
   if [[ "$ACCESS_MODE" == "domain" ]]; then
     [[ -z "$PROXY_IP" && -z "$LISTEN_PORT" ]] || die "域名模式不能同时使用 --ip-address 或 --listen-port。"

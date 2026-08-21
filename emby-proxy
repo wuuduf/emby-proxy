@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.2.2-modes"
+readonly VERSION="2.2.3-modes"
 readonly STATE_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
@@ -674,7 +674,8 @@ run_backend_for_state() {
     fi
   else
     ip="$(jq -r '.ip' "$file")"; port="$(jq -r '.listen_port' "$file")"
-    args+=(--mode ip --ip-address "$ip" --listen-port "$port")
+    # 现有 IP 入口已由管理员明确创建；回放时显式解锁隐藏的明文 HTTP 兼容模式。
+    args+=(--show-unsafe-ip-mode --mode ip --ip-address "$ip" --listen-port "$port")
   fi
   path="$(jq -r '.routes[0].path' "$file")"; upstream="$(jq -r '.routes[0].upstream' "$file")"
   [[ "$kind" != "caddy_attached" ]] || args+=(--path "$path")

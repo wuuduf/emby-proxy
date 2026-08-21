@@ -2,12 +2,13 @@
 
 `setup-emby-proxy.sh` 用于在 Debian/Ubuntu VPS 上选择 Caddy 或 Nginx，为一个或多个 Emby 源站配置反向代理。入口可以使用域名 HTTPS，也可以在没有域名时使用公网 IPv4 + 独立 HTTP 端口。
 
-当前只在菜单中提供以下入口结构：
+默认交互菜单只提供以下安全的域名 HTTPS 入口结构：
 
 1. **独立子域名 + HTTPS 443**（首选，客户端兼容性最好）；
 2. **同一域名 + 独立 HTTPS 端口**（每个 Emby 一个端口）；
 3. **同一域名 + 不同路径**（高级兼容模式，会显示明显警告）；
-4. **IP + 独立 HTTP 端口**（每个 Emby 一个端口，不使用域名）。
+
+**IP + 独立 HTTP 端口默认隐藏并禁用**，因为登录凭据、Token 和媒体流都是明文。只有明确接受风险并使用 `--show-unsafe-ip-mode` 时才会显示或允许该兼容模式。
 
 > **端口必须放行：** 脚本会尝试修改已启用的 UFW/firewalld，但无法修改 VPS 厂商的云防火墙/安全组。域名 443 模式需放行入站 TCP `80/443`；自定义 HTTPS 端口模式需放行 `80/自定义端口`；IP 模式需放行所选 HTTP 端口。未放行时，本机检查可能正常，但公网仍无法访问。
 
@@ -54,6 +55,8 @@ sudo emby-proxy status
 sudo emby-proxy list
 sudo emby-proxy show domain-emby.example.com
 sudo emby-proxy add
+# 仅在明确接受明文 HTTP 风险时显示 IP 模式
+sudo emby-proxy add --show-unsafe-ip-mode
 
 sudo emby-proxy route add domain-emby.example.com
 sudo emby-proxy route set domain-emby.example.com
@@ -121,12 +124,11 @@ sudo ./setup-emby-proxy.sh
 根据菜单先输入：
 
 1. 选择 `Caddy` 或 `Nginx`；
-2. 选择“域名 + HTTPS”或“公网 IPv4 + HTTP 独立端口”；
-3. 域名模式再选择“独立子域名 443”“同一域名独立 HTTPS 端口”或“同一域名不同路径”；
-4. 输入域名/端口；IP 模式可直接回车自动检测公网 IPv4，并选择默认 `8080` 或其他高位端口；
-5. 输入 Emby 源站，例如 `origin.example.com`、`https://origin.example.com` 或 `http://1.2.3.4:8096`。
+2. 默认直接选择“独立子域名 443”“同一域名独立 HTTPS 端口”或“同一域名不同路径”；
+3. 输入域名/端口；
+4. 输入 Emby 源站，例如 `origin.example.com`、`https://origin.example.com` 或 `http://1.2.3.4:8096`。
 
-IP 模式不需要域名、DNS 或证书，示例入口为 `http://203.0.113.10:8080/`。它使用 1024-65535 范围内的独立端口；端口被占用时会停止并要求更换，不会抢占已有服务。脚本可配置 VPS 本机防火墙，但云厂商安全组仍需用户放行对应 TCP 端口。
+如确需临时显示 IP 模式，使用 `sudo ./setup-emby-proxy.sh --show-unsafe-ip-mode`。该模式不需要域名、DNS 或证书，示例入口为 `http://203.0.113.10:8080/`。它使用 1024-65535 范围内的独立端口；端口被占用时会停止并要求更换，不会抢占已有服务。
 
 > **安全提醒：** IP 模式是明文 HTTP，客户端登录凭据和媒体流在客户端到本 VPS 之间没有 TLS 加密，不建议在不可信网络中传输管理员账号。IP 直连也不代表当然免除中国大陆服务器的备案或接入商要求，请以服务器接入商和主管部门的实际要求为准。
 
@@ -164,6 +166,7 @@ Caddy：
 
 ```bash
 sudo ./setup-emby-proxy.sh \
+  --show-unsafe-ip-mode \
   --engine caddy \
   --domain emby.example.com \
   --upstream origin.example.com

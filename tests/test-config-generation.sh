@@ -34,10 +34,21 @@ SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY_LIB_ONLY=1 bash -c '
 ' || fail "新装 Nginx 默认站点的禁用/回滚失败"
 
 SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY_LIB_ONLY=1 bash -c '
-  set -- --mode ip --ip-address 203.0.113.10 --listen-port 18080 --path /media
+  set -- --show-unsafe-ip-mode --mode ip --ip-address 203.0.113.10 --listen-port 18080 --path /media
   source "$SCRIPT_UNDER_TEST"
-  [[ "$ACCESS_MODE" == ip && "$PROXY_IP" == 203.0.113.10 && "$LISTEN_PORT" == 18080 && "$PRIMARY_ROUTE_INPUT" == /media ]]
+  normalize_unsafe_ip_visibility
+  [[ "$SHOW_UNSAFE_IP_MODE" == 1 && "$ACCESS_MODE" == ip && "$PROXY_IP" == 203.0.113.10 && "$LISTEN_PORT" == 18080 && "$PRIMARY_ROUTE_INPUT" == /media ]]
 ' || fail "IP 模式命令行参数解析失败"
+
+if SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY_LIB_ONLY=1 bash -c '
+  set -- --mode ip --ip-address 203.0.113.10 --listen-port 18080
+  source "$SCRIPT_UNDER_TEST"
+  normalize_unsafe_ip_visibility
+  normalize_access_mode
+  require_unsafe_ip_opt_in
+' >/dev/null 2>&1; then
+  fail "未显式解锁时仍允许了不安全 IP HTTP 模式"
+fi
 
 # 域名冲突检测按完整 token 匹配，不能把 a.example.com 错认成 ba.example.com。
 domain_pattern="$(domain_token_regex 'a.example.com')"
