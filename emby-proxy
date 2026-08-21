@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.1.4-stage2"
+readonly VERSION="2.1.5-stage2"
 readonly STATE_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
@@ -337,9 +337,9 @@ doctor_site() {
   [[ "$code" == "200" ]] && doctor_ok "本机入口健康检查 HTTP 200。" || doctor_error "本机入口健康检查 HTTP ${code:-无响应}。"
   while IFS=$'\t' read -r path upstream; do
     upstream_code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 "${upstream%/}/" 2>/dev/null || true)"
-    if [[ "$upstream_code" =~ ^[1-4][0-9][0-9]$ && "$upstream_code" != "000" ]]; then
+    if [[ "$upstream_code" =~ ^[23][0-9][0-9]$ ]]; then
       doctor_ok "路径 $path 源站可访问：${upstream}（HTTP ${upstream_code}）。"
-    elif [[ "$upstream_code" =~ ^5[0-9][0-9]$ ]]; then
+    elif [[ "$upstream_code" =~ ^[45][0-9][0-9]$ ]]; then
       doctor_warn "路径 $path 源站返回 HTTP ${upstream_code}：$upstream"
     else
       doctor_error "路径 $path 无法连接源站：$upstream"
