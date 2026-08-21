@@ -2,6 +2,15 @@
 
 `setup-emby-proxy.sh` 用于在 Debian/Ubuntu VPS 上选择 Caddy 或 Nginx，为一个或多个 Emby 源站配置反向代理。入口可以使用域名 HTTPS，也可以在没有域名时使用公网 IPv4 + 独立 HTTP 端口。
 
+当前只在菜单中提供以下入口结构：
+
+1. **独立子域名 + HTTPS 443**（首选，客户端兼容性最好）；
+2. **同一域名 + 独立 HTTPS 端口**（每个 Emby 一个端口）；
+3. **同一域名 + 不同路径**（高级兼容模式，会显示明显警告）；
+4. **IP + 独立 HTTP 端口**（每个 Emby 一个端口，不使用域名）。
+
+> **端口必须放行：** 脚本会尝试修改已启用的 UFW/firewalld，但无法修改 VPS 厂商的云防火墙/安全组。域名 443 模式需放行入站 TCP `80/443`；自定义 HTTPS 端口模式需放行 `80/自定义端口`；IP 模式需放行所选 HTTP 端口。未放行时，本机检查可能正常，但公网仍无法访问。
+
 除基础反代外，脚本还会配置固定的健康检查、可轮转的请求/流媒体日志，并安全改写源站返回的 `Location` 与 `Content-Location`。
 
 ## 一键启动命令
@@ -113,16 +122,17 @@ sudo ./setup-emby-proxy.sh
 
 1. 选择 `Caddy` 或 `Nginx`；
 2. 选择“域名 + HTTPS”或“公网 IPv4 + HTTP 独立端口”；
-3. 域名模式输入 `emby.example.com`；IP 模式可直接回车自动检测公网 IPv4，并选择默认 `8080` 或其他高位端口；
-4. Emby 源站，例如 `origin.example.com`、`https://origin.example.com` 或 `http://1.2.3.4:8096`。
+3. 域名模式再选择“独立子域名 443”“同一域名独立 HTTPS 端口”或“同一域名不同路径”；
+4. 输入域名/端口；IP 模式可直接回车自动检测公网 IPv4，并选择默认 `8080` 或其他高位端口；
+5. 输入 Emby 源站，例如 `origin.example.com`、`https://origin.example.com` 或 `http://1.2.3.4:8096`。
 
 IP 模式不需要域名、DNS 或证书，示例入口为 `http://203.0.113.10:8080/`。它使用 1024-65535 范围内的独立端口；端口被占用时会停止并要求更换，不会抢占已有服务。脚本可配置 VPS 本机防火墙，但云厂商安全组仍需用户放行对应 TCP 端口。
 
 > **安全提醒：** IP 模式是明文 HTTP，客户端登录凭据和媒体流在客户端到本 VPS 之间没有 TLS 加密，不建议在不可信网络中传输管理员账号。IP 直连也不代表当然免除中国大陆服务器的备案或接入商要求，请以服务器接入商和主管部门的实际要求为准。
 
-如果输入的域名已经是一个手工配置的 Caddy 站点，脚本会先要求输入 `/a`、`/emby2` 等非根路径，检查与现有路径没有重叠后，再询问 Emby 源站。原站点的 `/`、证书、其他指令和日志设置保持不变。
+只有明确选择“同一域名 + 不同路径”时，脚本才会询问 `/a`、`/emby2` 等路径。若该域名已经是手工配置的 Caddy 站点，脚本会检查路径不重叠后，只插入精确托管片段；原站点的 `/`、证书、其他指令和日志设置保持不变。
 
-输入根路径源站后，可以继续添加任意数量的路径源站，例如：
+高级路径模式可以继续添加多个路径源站，例如：
 
 ```text
 /    -> https://emby-one.example.com
@@ -159,6 +169,26 @@ sudo ./setup-emby-proxy.sh \
   --upstream origin.example.com
 ```
 
+同一域名的独立 HTTPS 端口（Caddy/Nginx 均支持；每个 Emby 重复执行一次并换端口）：
+
+```bash
+sudo ./setup-emby-proxy.sh \
+  --engine nginx \
+  --domain emby.example.com \
+  --domain-mode port \
+  --https-port 18443 \
+  --upstream https://origin-one.example.com
+
+sudo ./setup-emby-proxy.sh \
+  --engine nginx \
+  --domain emby.example.com \
+  --domain-mode port \
+  --https-port 19443 \
+  --upstream https://origin-two.example.com
+```
+
+对应地址是 `https://emby.example.com:18443/` 和 `https://emby.example.com:19443/`。必须在云安全组放行 TCP `80`、`18443`、`19443`；TCP 80 用于证书申请和续期。
+
 向一个已经存在的 Caddy 域名追加 `/emby2`，不会接管原来的根路径：
 
 ```bash
@@ -177,6 +207,7 @@ Nginx：
 sudo ./setup-emby-proxy.sh \
   --engine nginx \
   --domain emby.example.com \
+  --domain-mode path \
   --upstream https://origin.example.com \
   --route /a=https://emby-two.example.com \
   --route /b=http://10.0.0.3:8096
@@ -190,11 +221,10 @@ sudo ./setup-emby-proxy.sh \
   --mode ip \
   --ip-address 203.0.113.10 \
   --listen-port 8080 \
-  --upstream http://127.0.0.1:8096 \
-  --route /a=https://emby-two.example.com
+  --upstream http://127.0.0.1:8096
 ```
 
-`--ip-address` 可以省略，脚本会通过公网服务自动检测 IPv4。非交互运行建议显式填写，以避免多出口或 NAT 环境识别到错误地址。部署后访问 `http://203.0.113.10:8080/` 和 `http://203.0.113.10:8080/a/`。
+`--ip-address` 可以省略，脚本会通过公网服务自动检测 IPv4。非交互运行建议显式填写，以避免多出口或 NAT 环境识别到错误地址。部署后访问 `http://203.0.113.10:8080/`。新增另一个 Emby 时重新运行脚本并选择另一个端口（例如 `18081`），不要在 IP 模式继续堆叠 `/a`、`/b`。
 
 如果源站只填写域名，脚本会先尝试 HTTPS，再尝试 HTTP。源站地址不能带 `/emby/`、`/web/index.html`、查询参数或账号密码。
 
@@ -217,8 +247,8 @@ sudo ./setup-emby-proxy.sh \
 - 自动安装证书续期后的 Nginx reload hook；
 - 显式配置 Emby WebSocket、流式传输、长连接超时、客户端 IP 头；
 - HTTPS 回源会发送正确 SNI，并使用系统 CA 校验源站证书；
-- 每个域名使用独立配置，例如 `/etc/nginx/conf.d/emby-proxy-emby.example.com.conf`；内部变量、日志格式和 TLS session cache 也按域名隔离；
-- 首次申请证书期间只开放 ACME challenge，其他 HTTP 请求返回 503，不会临时提供明文 Emby 反代；
+- 每个“域名 + HTTPS 端口”使用独立配置，例如 `/etc/nginx/conf.d/emby-proxy-emby.example.com-https-18443.conf`；内部变量、日志格式和 TLS session cache 也按入口隔离；
+- 同一域名的多个 HTTPS 端口共享一个仅用于 ACME/HTTPS 跳转的 TCP 80 配置和同一张证书；TCP 80 永远不会提供明文 Emby 反代；
 - 发送给源站的 `X-Forwarded-For` 固定来自 Nginx 的 `$remote_addr`，不继承客户端伪造的来源链。
 - IP 模式只安装 Nginx，不安装或调用 Certbot，并生成独立的纯 HTTP 配置文件。
 
@@ -228,6 +258,8 @@ sudo ./setup-emby-proxy.sh \
 
 ```bash
 curl -fsS https://emby.example.com/_emby_proxy_health
+# 自定义 HTTPS 端口：
+curl -fsS https://emby.example.com:18443/_emby_proxy_health
 # IP 模式：
 curl -fsS http://203.0.113.10:8080/_emby_proxy_health
 ```
@@ -294,12 +326,12 @@ Nginx 日志只记录 `$uri`，不记录查询参数；Caddy 会隐藏常见 `ap
 - 检查反代域名的公网 A/AAAA 是否指向当前 VPS；
 - IP 模式跳过 DNS/证书申请，自动检测或校验 IPv4，并检查独立高位端口是否被占用；
 - 检查源站 HTTP/HTTPS 连通性和 TLS 证书；
-- 检查 80/443 端口冲突，避免覆盖另一种 Web 服务；
+- 检查 TCP 80 和所选 HTTPS/HTTP 端口冲突，避免覆盖另一种 Web 服务；
 - 运行前识别已有 Caddy/Nginx，并优先安全复用已有服务；
 - 支持连续管理多个反代域名，更新一个域名时保留其他脚本托管站点，并兼容迁移旧版单域名配置；
 - 已有手工 Caddy 域名可追加独立非根路径；自动定位唯一站点块、检查路径重叠，并按“域名 + 路径”幂等更新；
 - 无法安全定位、根路径接管、路径重叠或重复站点会被拒绝；
-- 自动为启用中的 UFW/firewalld 放行域名模式的 TCP 80/443，或 IP 模式选定的独立 TCP 端口；
+- 自动为启用中的 UFW/firewalld 放行域名模式的 TCP 80 + 所选 HTTPS 端口，或 IP 模式选定的独立 TCP 端口，并始终提醒用户另行放行云安全组；
 - 修改前备份配置；
 - 使用 `caddy validate` 或 `nginx -t` 验证后才 reload；
 - 启动或重载失败时自动恢复原配置；
@@ -307,7 +339,7 @@ Nginx 日志只记录 `$uri`，不记录查询参数；Caddy 会隐藏常见 `ap
 - 提供 `/_emby_proxy_health` 存活检查，并在部署后验证 HTTP 200；
 - 记录每条请求的响应字节数、总耗时与回源耗时，日志自动轮转或交给系统 logrotate；
 - 安全改写固定源站的 `Location` / `Content-Location`，为子路径补回外部前缀；
-- 支持同一域名按 `/`、`/a`、`/b` 等路径映射多个 Emby，并逐路径验证；
+- 首选独立子域名或独立端口；仍支持同一域名按 `/`、`/a`、`/b` 映射多个 Emby，但会标记为高级兼容模式并逐路径验证；
 - 失败时给出 DNS、安全组、端口、证书和源站排查命令。
 
 ## 防止被当作通用 SNI/Host 代理

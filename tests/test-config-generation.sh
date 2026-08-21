@@ -46,6 +46,8 @@ printf '%s\n' 'a.example.com {' | grep -E "$domain_pattern" >/dev/null || fail "
 
 set_domain() {
   ACCESS_MODE="domain"
+  HTTPS_PORT="443"
+  DOMAIN_ENTRY_TYPE="path"
   PROXY_DOMAIN="$1"
   normalize_proxy_domain "$PROXY_DOMAIN"
   ROUTE_PATHS=("/" "/a")
@@ -66,8 +68,9 @@ assert_contains "$TMP_DIR/nginx-one.conf" '"~*^/a(?:/|$)" $upstream_http_locatio
 assert_contains "$TMP_DIR/nginx-one.conf" "add_header Location \$emby_proxy_location_${one_nginx_id}_1 always;"
 assert_not_contains "$TMP_DIR/nginx-one.conf" 'proxy_pass $'
 
-# 证书申请阶段只能处理 ACME；不能在 80 端口临时暴露 Emby。
-assert_contains "$TMP_DIR/nginx-one-acme.conf" 'return 503 "HTTPS certificate is being provisioned";'
+# TCP 80 只处理共享 ACME 与 HTTPS 跳转；不能暴露明文 Emby。
+assert_contains "$TMP_DIR/nginx-one-acme.conf" '# MANAGED EMBY ACME: one.example.com'
+assert_contains "$TMP_DIR/nginx-one-acme.conf" 'return 308 https://one.example.com$request_uri;'
 assert_contains "$TMP_DIR/nginx-one-acme.conf" 'location ^~ /.well-known/acme-challenge/'
 assert_not_contains "$TMP_DIR/nginx-one-acme.conf" 'proxy_pass '
 assert_not_contains "$TMP_DIR/nginx-one-acme.conf" 'origin.example.net'
@@ -79,6 +82,34 @@ two_nginx_id="$NGINX_ID"
 write_nginx_https_config "$TMP_DIR/nginx-two.conf"
 assert_contains "$TMP_DIR/nginx-two.conf" "log_format emby_proxy_${two_nginx_id}_v1"
 assert_not_contains "$TMP_DIR/nginx-two.conf" "emby_proxy_${one_nginx_id}"
+
+# 同一域名的独立 HTTPS 端口必须生成独立标识、URL、日志和监听，不重复声明 TCP 80。
+ACCESS_MODE="domain"; DOMAIN_ENTRY_TYPE="port"; HTTPS_PORT="18443"; PROXY_DOMAIN="ports.example.com"
+normalize_proxy_domain "$PROXY_DOMAIN"
+ROUTE_PATHS=("/"); ROUTE_URLS=("https://origin.example.net"); ROUTE_HOSTS=("origin.example.net")
+write_nginx_https_config "$TMP_DIR/nginx-port.conf"
+assert_contains "$TMP_DIR/nginx-port.conf" '# MANAGED EMBY SITE: ports.example.com-https-18443'
+assert_contains "$TMP_DIR/nginx-port.conf" 'listen 18443 ssl http2;'
+assert_not_contains "$TMP_DIR/nginx-port.conf" 'listen 80;'
+assert_contains "$TMP_DIR/nginx-port.conf" '"https://ports.example.com:18443/$1";'
+[[ "$PUBLIC_BASE_URL" == "https://ports.example.com:18443" ]] || fail "自定义 HTTPS 端口公共 URL 错误"
+[[ "$NGINX_CONFIG" == */emby-proxy-ports.example.com-https-18443.conf ]] || fail "自定义 HTTPS 端口配置文件未隔离"
+
+: >"$TMP_DIR/Caddyfile.ports"
+build_candidate_config "$TMP_DIR/Caddyfile.ports" "$TMP_DIR/Caddyfile.port-one"
+HTTPS_PORT="19443"; normalize_proxy_domain "$PROXY_DOMAIN"
+ROUTE_PATHS=("/"); ROUTE_URLS=("https://origin-two.example.net"); ROUTE_HOSTS=("origin-two.example.net")
+build_candidate_config "$TMP_DIR/Caddyfile.port-one" "$TMP_DIR/Caddyfile.port-two"
+assert_contains "$TMP_DIR/Caddyfile.port-two" 'https://ports.example.com:18443 {'
+assert_contains "$TMP_DIR/Caddyfile.port-two" 'https://ports.example.com:19443 {'
+assert_count "$TMP_DIR/Caddyfile.port-two" '# BEGIN MANAGED EMBY REVERSE PROXY: ports.example.com-https-' 2
+
+# 同一 Caddy 域名的 443 与自定义端口也能并存，冲突检查不能把 :PORT 错判成 443。
+HTTPS_PORT="443"; DOMAIN_ENTRY_TYPE="subdomain"; normalize_proxy_domain "$PROXY_DOMAIN"
+ROUTE_URLS=("https://origin-root.example.net"); ROUTE_HOSTS=("origin-root.example.net")
+build_candidate_config "$TMP_DIR/Caddyfile.port-two" "$TMP_DIR/Caddyfile.port-and-443"
+assert_contains "$TMP_DIR/Caddyfile.port-and-443" 'ports.example.com {'
+assert_contains "$TMP_DIR/Caddyfile.port-and-443" 'https://ports.example.com:18443 {'
 
 # Caddy：同一 Caddyfile 可保留多个域名；重跑一个域名只替换自己的托管块。
 : >"$TMP_DIR/Caddyfile.empty"

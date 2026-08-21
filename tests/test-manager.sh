@@ -47,6 +47,15 @@ http://203.0.113.10:18080 {
     }
 }
 # END MANAGED EMBY REVERSE PROXY: ip-203.0.113.10-18080
+
+# BEGIN MANAGED EMBY REVERSE PROXY: one.example.com-https-18443
+https://one.example.com:18443 {
+    handle {
+        reverse_proxy https://origin-port.example.net {
+        }
+    }
+}
+# END MANAGED EMBY REVERSE PROXY: one.example.com-https-18443
 EOF
 
 cat >"$TMP_DIR/caddy/existing.caddy" <<'EOF'
@@ -78,6 +87,17 @@ server {
 }
 EOF
 
+cat >"$TMP_DIR/nginx/emby-proxy-nginx.example.com-https-19443.conf" <<'EOF'
+# MANAGED EMBY SITE: nginx.example.com-https-19443
+server {
+    listen 19443 ssl;
+    server_name nginx.example.com;
+    location / {
+        proxy_pass https://origin-port-nginx.example.net;
+    }
+}
+EOF
+
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" \
 EMBY_PROXY_CADDYFILE="$TMP_DIR/caddy/Caddyfile" \
 EMBY_PROXY_NGINX_CONF_DIR="$TMP_DIR/nginx" \
@@ -87,9 +107,9 @@ MANAGER_UNDER_TEST="$MANAGER" bash -c '
   source "$MANAGER_UNDER_TEST"
   require_jq
   ensure_state_dirs
-  [[ "$(import_caddy_standalone)" == 2 ]]
+  [[ "$(import_caddy_standalone)" == 3 ]]
   [[ "$(import_caddy_attached)" == 1 ]]
-  [[ "$(import_nginx)" == 1 ]]
+  [[ "$(import_nginx)" == 2 ]]
 ' || fail "旧配置导入失败"
 
 assert_jq "$TMP_DIR/state/sites.d/domain-one.example.com.json" '.engine=="caddy" and .mode=="domain" and (.routes|length)==2'
@@ -97,6 +117,8 @@ assert_jq "$TMP_DIR/state/sites.d/domain-one.example.com.json" 'any(.routes[]; .
 assert_jq "$TMP_DIR/state/sites.d/ip-203.0.113.10-18080.json" '.mode=="ip" and .listen_port==18080 and .public_url=="http://203.0.113.10:18080"'
 assert_jq "$TMP_DIR/state/sites.d/domain-existing.example.com.json" '.managed_kind=="caddy_attached" and .routes[0].path=="/media"'
 assert_jq "$TMP_DIR/state/sites.d/domain-nginx.example.com.json" '.engine=="nginx" and (.routes|length)==2'
+assert_jq "$TMP_DIR/state/sites.d/domain-one.example.com-https-18443.json" '.engine=="caddy" and .listen_port==18443 and .entry_type=="port" and .public_url=="https://one.example.com:18443"'
+assert_jq "$TMP_DIR/state/sites.d/domain-nginx.example.com-https-19443.json" '.engine=="nginx" and .listen_port==19443 and .public_url=="https://nginx.example.com:19443"'
 
 # 管理器应把状态文件无损转换回安装后端参数。
 cat >"$TMP_DIR/fake-backend" <<'EOF'
@@ -117,6 +139,17 @@ assert_arg "$TMP_DIR/backend.args" 'one.example.com'
 assert_arg "$TMP_DIR/backend.args" '--upstream'
 assert_arg "$TMP_DIR/backend.args" 'https://origin-one.example.net'
 assert_arg "$TMP_DIR/backend.args" '/a=https://origin-a.example.net'
+
+FAKE_ARGS_OUT="$TMP_DIR/backend-port.args" EMBY_PROXY_BACKEND="$TMP_DIR/fake-backend" \
+EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  set --
+  source "$MANAGER_UNDER_TEST"
+  run_backend_for_state "$EMBY_PROXY_STATE_HOME/sites.d/domain-one.example.com-https-18443.json"
+' || fail "自定义 HTTPS 端口状态转后端参数失败"
+assert_arg "$TMP_DIR/backend-port.args" '--domain-mode'
+assert_arg "$TMP_DIR/backend-port.args" 'port'
+assert_arg "$TMP_DIR/backend-port.args" '--https-port'
+assert_arg "$TMP_DIR/backend-port.args" '18443'
 
 FAKE_ARGS_OUT="$TMP_DIR/route-add.args" EMBY_PROXY_BACKEND="$TMP_DIR/fake-backend" \
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
@@ -164,7 +197,8 @@ MANAGER_UNDER_TEST="$MANAGER" bash -c '
 grep -F 'respond "original" 200' "$TMP_DIR/caddy/existing.caddy" >/dev/null || fail "删除附加路径破坏了手工站点"
 ! grep -F 'MANAGED EMBY EXISTING ROUTE' "$TMP_DIR/caddy/existing.caddy" >/dev/null || fail "附加路径标记未删除"
 grep -F '# BEGIN MANAGED EMBY REVERSE PROXY: ip-203.0.113.10-18080' "$TMP_DIR/caddy/Caddyfile" >/dev/null || fail "删除一个入口误删了其他入口"
-! grep -F '# BEGIN MANAGED EMBY REVERSE PROXY: one.example.com' "$TMP_DIR/caddy/Caddyfile" >/dev/null || fail "独立入口未删除"
+! grep -Fx '# BEGIN MANAGED EMBY REVERSE PROXY: one.example.com' "$TMP_DIR/caddy/Caddyfile" >/dev/null || fail "独立入口未删除"
+grep -Fx '# BEGIN MANAGED EMBY REVERSE PROXY: one.example.com-https-18443' "$TMP_DIR/caddy/Caddyfile" >/dev/null || fail "删除 443 入口误删同域名自定义端口"
 [[ ! -e "$TMP_DIR/nginx/emby-proxy-nginx.example.com.conf" ]] || fail "Nginx 独立入口未删除"
 
 # 一键安装后端应把自身和管理命令安装到长期路径。
@@ -177,6 +211,6 @@ EMBY_PROXY_LIB_ONLY=1 INSTALLER_UNDER_TEST="$INSTALLER" bash -c '
 ' || fail "管理命令安装失败"
 [[ -x "$TMP_DIR/installed/lib/setup-emby-proxy.sh" ]] || fail "未安装配置后端"
 [[ -x "$TMP_DIR/installed/bin/emby-proxy" ]] || fail "未安装 emby-proxy 命令"
-"$TMP_DIR/installed/bin/emby-proxy" version | grep -F '2.1.8-stage2' >/dev/null || fail "已安装管理命令不可运行"
+"$TMP_DIR/installed/bin/emby-proxy" version | grep -F '2.2.0-modes' >/dev/null || fail "已安装管理命令不可运行"
 
 printf 'PASS: manager install/import, state registry, route replay, exact-marker deletion\n'
