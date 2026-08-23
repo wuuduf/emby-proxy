@@ -34,10 +34,10 @@ SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY_LIB_ONLY=1 bash -c '
 ' || fail "新装 Nginx 默认站点的禁用/回滚失败"
 
 SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY_LIB_ONLY=1 bash -c '
-  set -- --show-unsafe-ip-mode --mode ip --ip-address 203.0.113.10 --listen-port 18080 --path /media
+  set -- --show-unsafe-ip-mode --mode ip --ip-version ipv6 --ip-address 2001:db8::10 --listen-port 18080 --path /media
   source "$SCRIPT_UNDER_TEST"
   normalize_unsafe_ip_visibility
-  [[ "$SHOW_UNSAFE_IP_MODE" == 1 && "$ACCESS_MODE" == ip && "$PROXY_IP" == 203.0.113.10 && "$LISTEN_PORT" == 18080 && "$PRIMARY_ROUTE_INPUT" == /media ]]
+  [[ "$SHOW_UNSAFE_IP_MODE" == 1 && "$ACCESS_MODE" == ip && "$IP_VERSION" == ipv6 && "$PROXY_IP" == 2001:db8::10 && "$LISTEN_PORT" == 18080 && "$PRIMARY_ROUTE_INPUT" == /media ]]
 ' || fail "IP 模式命令行参数解析失败"
 
 if SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY_LIB_ONLY=1 bash -c '
@@ -177,6 +177,31 @@ assert_not_contains "$TMP_DIR/Caddyfile.ip" 'https://203.0.113.10:18080'
 valid_ipv4 203.0.113.10 || fail "合法 IPv4 被拒绝"
 valid_ipv4 999.0.0.1 && fail "非法 IPv4 未被拒绝"
 if (LISTEN_PORT=443; normalize_listen_port) >/dev/null 2>&1; then fail "IP 模式允许了受保护端口 443"; fi
+
+# IPv6 独立端口：URL 使用方括号，Nginx 只监听 IPv6，Caddy 站点地址保持 RFC 3986 格式。
+for valid in 2001:db8::10 ::1 2001:db8:0:1:2:3:4:5; do
+  valid_ipv6 "$valid" || fail "合法 IPv6 被拒绝：$valid"
+done
+for invalid in 2001:db8:::10 2001:db8::1::2 2001:db8:0:1:2:3:4 2001:db8::zz; do
+  valid_ipv6 "$invalid" && fail "非法 IPv6 未被拒绝：$invalid"
+done
+ACCESS_MODE="ip"; IP_VERSION="ipv6"; PROXY_IP="2001:db8::10"; LISTEN_PORT="18082"
+set_ip_access_target >/dev/null
+parse_upstream 'https://[2001:db8::20]:8443'
+[[ "$UPSTREAM_URL" == 'https://[2001:db8::20]:8443' && "$UPSTREAM_HOST" == '2001:db8::20' ]] || fail "IPv6 源站解析失败"
+ROUTE_PATHS=(/); ROUTE_URLS=('https://[2001:db8::20]:8443'); ROUTE_HOSTS=('2001:db8::20')
+write_nginx_ip_config "$TMP_DIR/nginx-ipv6.conf"
+assert_contains "$TMP_DIR/nginx-ipv6.conf" 'listen [2001:db8::10]:18082 ipv6only=on;'
+assert_not_contains "$TMP_DIR/nginx-ipv6.conf" 'listen 18082;'
+assert_contains "$TMP_DIR/nginx-ipv6.conf" 'if ($host !~ ^\[?2001:db8::10\]?$) { return 444; }'
+assert_contains "$TMP_DIR/nginx-ipv6.conf" 'proxy_pass https://[2001:db8::20]:8443;'
+assert_contains "$TMP_DIR/nginx-ipv6.conf" 'https?://\[2001:db8::20\]'
+: >"$TMP_DIR/Caddyfile.ipv6-empty"
+build_candidate_config "$TMP_DIR/Caddyfile.ipv6-empty" "$TMP_DIR/Caddyfile.ipv6"
+assert_contains "$TMP_DIR/Caddyfile.ipv6" '# BEGIN MANAGED EMBY REVERSE PROXY: ip-2001:db8::10-18082'
+assert_contains "$TMP_DIR/Caddyfile.ipv6" 'http://[2001:db8::10]:18082 {'
+assert_contains "$TMP_DIR/Caddyfile.ipv6" 'reverse_proxy https://[2001:db8::20]:8443 {'
+[[ "$PUBLIC_BASE_URL" == 'http://[2001:db8::10]:18082' ]] || fail "IPv6 公共 URL 未使用方括号"
 
 # 旧版无域名托管标记在更新旧域名时应迁移，新域名不能把它删除。
 cat >"$TMP_DIR/Caddyfile.legacy" <<'EOF'

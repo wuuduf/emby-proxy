@@ -58,6 +58,24 @@ EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
 ' || fail "入口诊断产生错误"
 grep -F '本机入口健康检查 HTTP 200' "$TMP_DIR/state/doctor.out" >/dev/null || fail "诊断缺少健康检查"
 
+# IPv6 IP 入口的管理器健康检查必须访问本机 [::1]，并发送带方括号的 Host。
+cat >"$TMP_DIR/state/sites.d/ip-2001:db8::10-18082.json" <<EOF
+{"schema_version":1,"id":"ip-2001:db8::10-18082","engine":"caddy","mode":"ip","domain":"","ip":"2001:db8::10","listen_port":18082,"public_url":"http://[2001:db8::10]:18082","managed_kind":"standalone","config_file":"$TMP_DIR/caddy/Caddyfile","created_at":"2026-08-17T00:00:00Z","updated_at":"2026-08-17T00:00:00Z","routes":[{"path":"/","upstream":"https://[2001:db8::20]:8443"}]}
+EOF
+EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_CADDYFILE="$TMP_DIR/caddy/Caddyfile" \
+EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  set --
+  source "$MANAGER_UNDER_TEST"
+  curl() {
+    printf "%s\n" "$*" >"$EMBY_PROXY_STATE_HOME/ipv6-curl.args"
+    printf 200
+  }
+  code="$(local_health_code "$EMBY_PROXY_STATE_HOME/sites.d/ip-2001:db8::10-18082.json")"
+  [[ "$code" == 200 ]]
+' || fail "IPv6 入口健康检查失败"
+grep -F -- 'Host: [2001:db8::10]' "$TMP_DIR/state/ipv6-curl.args" >/dev/null || fail "IPv6 健康检查未发送方括号 Host"
+grep -F -- 'http://[::1]:18082' "$TMP_DIR/state/ipv6-curl.args" >/dev/null || fail "IPv6 健康检查未访问 [::1]"
+
 # 只有 Caddy/IP 入口时，Nginx 和域名计数为 0 不能被 pipefail 当成错误。
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_CADDYFILE="$TMP_DIR/caddy/Caddyfile" \
 EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
@@ -68,8 +86,8 @@ EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
   ss() { printf "LISTEN 0 4096 *:18080 *:* users:((\"caddy\",pid=123,fd=7))\n"; }
   print_status >"$EMBY_PROXY_STATE_HOME/status.out"
 ' || fail "零项引擎/模式统计导致状态页面退出"
-grep -F '托管入口：1（域名 HTTPS 0，IP HTTP 1）' "$TMP_DIR/state/status.out" >/dev/null || fail "状态页面入口计数错误"
-grep -F '引擎分布：Caddy 1，Nginx 0' "$TMP_DIR/state/status.out" >/dev/null || fail "状态页面引擎计数错误"
+grep -F '托管入口：2（域名 HTTPS 0，IP HTTP 2）' "$TMP_DIR/state/status.out" >/dev/null || fail "状态页面入口计数错误"
+grep -F '引擎分布：Caddy 2，Nginx 0' "$TMP_DIR/state/status.out" >/dev/null || fail "状态页面引擎计数错误"
 grep -F '*:18080' "$TMP_DIR/state/status.out" >/dev/null || fail "状态页面未显示实际托管监听端口"
 
 # 完整诊断不能因为 /etc/os-release 中也存在 VERSION 变量而与管理器版本冲突。

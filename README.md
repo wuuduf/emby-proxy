@@ -1,6 +1,6 @@
 # Emby 一键反向代理脚本（域名 HTTPS / IP HTTP，Caddy / Nginx）
 
-`setup-emby-proxy.sh` 用于在 Debian/Ubuntu VPS 上选择 Caddy 或 Nginx，为一个或多个 Emby 源站配置反向代理。入口可以使用域名 HTTPS，也可以在没有域名时使用公网 IPv4 + 独立 HTTP 端口。
+`setup-emby-proxy.sh` 用于在 Debian/Ubuntu VPS 上选择 Caddy 或 Nginx，为一个或多个 Emby 源站配置反向代理。入口可以使用域名 HTTPS，也可以在没有域名时使用公网 IPv4/IPv6 + 独立 HTTP 端口。
 
 默认交互菜单只提供以下安全的域名 HTTPS 入口结构：
 
@@ -8,7 +8,7 @@
 2. **同一域名 + 独立 HTTPS 端口**（每个 Emby 一个端口）；
 3. **同一域名 + 不同路径**（高级兼容模式，会显示明显警告）；
 
-**IP + 独立 HTTP 端口默认隐藏并禁用**，因为登录凭据、Token 和媒体流都是明文。只有明确接受风险并使用 `--show-unsafe-ip-mode` 时才会显示或允许该兼容模式。
+**IP + 独立 HTTP 端口默认隐藏并禁用**，因为登录凭据、Token 和媒体流都是明文。只有明确接受风险并使用 `--show-unsafe-ip-mode` 时才会显示或允许该兼容模式。IP 地址可以是 IPv4 或 IPv6；IPv6 URL 必须带方括号，例如 `http://[2001:db8::10]:18080`。
 
 > **端口必须放行：** 脚本会尝试修改已启用的 UFW/firewalld，但无法修改 VPS 厂商的云防火墙/安全组。域名 443 模式需放行入站 TCP `80/443`；自定义 HTTPS 端口模式需放行 `80/自定义端口`；IP 模式需放行所选 HTTP 端口。未放行时，本机检查可能正常，但公网仍无法访问。
 
@@ -218,20 +218,34 @@ sudo ./setup-emby-proxy.sh \
   --route /b=http://10.0.0.3:8096
 ```
 
-无域名 IP HTTP 模式（Caddy）：
+无域名 IP HTTP 模式（Caddy，IPv4/IPv6）：
 
 ```bash
 sudo ./setup-emby-proxy.sh \
   --engine caddy \
+  --show-unsafe-ip-mode \
   --mode ip \
   --ip-address 203.0.113.10 \
   --listen-port 8080 \
   --upstream http://127.0.0.1:8096
 ```
 
-`--ip-address` 可以省略，脚本会通过公网服务自动检测 IPv4。非交互运行建议显式填写，以避免多出口或 NAT 环境识别到错误地址。部署后访问 `http://203.0.113.10:8080/`。新增另一个 Emby 时重新运行脚本并选择另一个端口（例如 `18081`），不要在 IP 模式继续堆叠 `/a`、`/b`。
+`--ip-address` 可以省略，脚本会按 `--ip-version` 自动检测公网地址；默认是 `auto`，根据手工填写的地址自动判断。IPv6 示例：
 
-如果源站只填写域名，脚本会先尝试 HTTPS，再尝试 HTTP。源站地址不能带 `/emby/`、`/web/index.html`、查询参数或账号密码。
+```bash
+sudo ./setup-emby-proxy.sh \
+  --engine caddy \
+  --show-unsafe-ip-mode \
+  --mode ip \
+  --ip-version ipv6 \
+  --ip-address 2001:db8::10 \
+  --listen-port 18080 \
+  --upstream https://origin.example.com
+```
+
+IPv6 部署后的访问地址必须使用方括号：`http://[2001:db8::10]:18080/`。非交互运行建议显式填写地址，以避免多出口环境识别到错误地址。新增另一个 Emby 时重新运行脚本并选择另一个端口（例如 `18081`），不要在 IP 模式继续堆叠 `/a`、`/b`。
+
+如果源站只填写域名，脚本会先尝试 HTTPS，再尝试 HTTP。源站地址不能带 `/emby/`、`/web/index.html`、查询参数或账号密码；IPv6 源站必须写成 `[IPv6]` 或 `[IPv6]:端口`，例如 `https://[2001:db8::20]:8443`。
 
 > **子路径兼容性提醒：** Caddy 官方将此类配置称为可能存在“subfolder problem”的模式。脚本会正确完成前缀剥离、WebSocket 和路径级回源，但 Emby 的部分原生客户端、Emby Connect 或源站返回的绝对路径可能不识别 `/a` 这类额外前缀。请逐个使用完整地址进行实际登录和播放测试；兼容性要求最高时，仍建议每个 Emby 使用独立子域名。
 
@@ -243,7 +257,7 @@ sudo ./setup-emby-proxy.sh \
 - Caddy 自动申请、安装及续期 HTTPS 证书；
 - Caddy 原生处理 WebSocket；
 - 配置写入 `/etc/caddy/Caddyfile` 中带域名的独立脚本托管块；可连续管理多个反代域名。
-- IP 模式使用显式 `http://IPv4:端口` 站点地址，不触发自动 HTTPS，也不会占用已有 80/443。
+- IP 模式使用显式 `http://IPv4:端口` 或 `http://[IPv6]:端口` 站点地址，不触发自动 HTTPS，也不会占用已有 80/443；IPv6 模式只监听指定 IPv6 地址，IPv4 模式同时监听 IPv4 和 IPv6。
 
 ### Nginx
 
@@ -256,7 +270,7 @@ sudo ./setup-emby-proxy.sh \
 - 多入口/多路径时自动写入独立的 `00-emby-proxy-hash.conf` 提高 Nginx 变量哈希容量，避免入口增多后出现 `could not build optimal variables_hash`；若系统已有手工容量设置则保持不覆盖；
 - 同一域名的多个 HTTPS 端口共享一个仅用于 ACME/HTTPS 跳转的 TCP 80 配置和同一张证书；TCP 80 永远不会提供明文 Emby 反代；
 - 发送给源站的 `X-Forwarded-For` 固定来自 Nginx 的 `$remote_addr`，不继承客户端伪造的来源链。
-- IP 模式只安装 Nginx，不安装或调用 Certbot，并生成独立的纯 HTTP 配置文件。
+- IP 模式只安装 Nginx，不安装或调用 Certbot，并生成独立的纯 HTTP 配置文件；支持 IPv4 和 IPv6 独立端口。
 
 ## 健康检查与流量日志
 
@@ -311,7 +325,7 @@ Nginx 日志只记录 `$uri`，不记录查询参数；Caddy 会隐藏常见 `ap
 
 脚本会按每条固定路由改写响应头：
 
-- 源站 `Location` / `Content-Location` 中指向**当前固定源站**的绝对 URL，会改成当前对外入口；域名模式使用 HTTPS，IP 模式使用 `http://IPv4:端口`；
+- 源站 `Location` / `Content-Location` 中指向**当前固定源站**的绝对 URL，会改成当前对外入口；域名模式使用 HTTPS，IP 模式使用 `http://IPv4:端口` 或 `http://[IPv6]:端口`；
 - `/a` 等子路径路由会自动补回 `/a` 前缀；
 - 根相对 URL（如 `/web/index.html`）也会补上对应前缀；
 - 已经带有当前路径前缀的 URL 会保持不变，例如 `/a/web` 不会被重复改成 `/a/a/web`；
@@ -330,7 +344,7 @@ Nginx 日志只记录 `$uri`，不记录查询参数；Caddy 会隐藏常见 `ap
 - 检查 Debian/Ubuntu、systemd、CPU 架构和 root 权限；
 - 安装 `ca-certificates`、`curl`、`gnupg`、`dnsutils`、`jq`、`util-linux` 等依赖；
 - 检查反代域名的公网 A/AAAA 是否指向当前 VPS；
-- IP 模式跳过 DNS/证书申请，自动检测或校验 IPv4，并检查独立高位端口是否被占用；
+- IP 模式跳过 DNS/证书申请，自动检测或校验 IPv4/IPv6，并检查独立高位端口是否被占用；
 - 检查源站 HTTP/HTTPS 连通性和 TLS 证书；
 - 检查 TCP 80 和所选 HTTPS/HTTP 端口冲突，避免覆盖另一种 Web 服务；
 - 运行前识别已有 Caddy/Nginx，并优先安全复用已有服务；
@@ -372,7 +386,7 @@ Nginx 日志只记录 `$uri`，不记录查询参数；Caddy 会隐藏常见 `ap
 - 如果使用 Cloudflare，安装和排障阶段使用“仅 DNS（灰云）”；
 - 源站允许这台 VPS 访问。
 
-若使用 IP 模式，不需要前三项域名/DNS准备；只需确认公网 IPv4 可从客户端访问，并在云安全组放行所选独立 TCP 端口（默认 `8080`）。
+若使用 IP 模式，不需要前三项域名/DNS准备；只需确认公网 IPv4/IPv6 可从客户端访问，并在云安全组放行所选独立 TCP 端口（默认 `8080`）。
 
 脚本能配置 VPS 本机防火墙，但无法修改云厂商控制台中的安全组。
 
@@ -386,7 +400,7 @@ bash tests/test-manager.sh
 bash tests/test-manager-stage2.sh
 ```
 
-测试会检查域名 HTTPS 与 IP HTTP 配置生成、独立端口、已有 Caddy 站点路径插入及更新、路径冲突拒绝、多域名互不覆盖、旧 Caddy 标记迁移、Nginx 每域名变量隔离、管理索引持久化、旧配置导入、状态到安装参数的无损回放、ACME 阶段没有明文 `proxy_pass`、`X-Forwarded-For` 防伪造、子路径响应头改写幂等性，以及第二阶段的诊断、日志过滤、流量统计、备份校验/恢复和校验式自更新。如果本机已安装 Caddy，还会额外执行完整 Caddy 配置验证；正式部署仍会在 reload 前运行 VPS 上的 `caddy validate` 或 `nginx -t`。
+测试会检查域名 HTTPS 与 IPv4/IPv6 IP HTTP 配置生成、独立端口、已有 Caddy 站点路径插入及更新、路径冲突拒绝、多域名互不覆盖、旧 Caddy 标记迁移、Nginx 每域名变量隔离、管理索引持久化、旧配置导入、状态到安装参数的无损回放、ACME 阶段没有明文 `proxy_pass`、`X-Forwarded-For` 防伪造、子路径响应头改写幂等性，以及第二阶段的诊断、日志过滤、流量统计、备份校验/恢复和校验式自更新。如果本机已安装 Caddy，还会额外执行完整 Caddy 配置验证；正式部署仍会在 reload 前运行 VPS 上的 `caddy validate` 或 `nginx -t`。
 
 ## 手动恢复
 

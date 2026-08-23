@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.2.4-menu"
+readonly VERSION="2.3.0-ipv6"
 readonly STATE_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
@@ -209,6 +209,15 @@ site_proxy_key() {
   fi
 }
 
+format_ip_public_url() {
+  local ip="$1" port="$2"
+  if [[ "$ip" == *:* ]]; then
+    printf 'http://[%s]:%s' "$ip" "$port"
+  else
+    printf 'http://%s:%s' "$ip" "$port"
+  fi
+}
+
 local_health_code() {
   local file="$1" health_url mode domain ip port request_path public_url
   health_url="$(health_url_for_file "$file")"
@@ -217,8 +226,13 @@ local_health_code() {
   mode="$(jq -r '.mode' "$file")"
   if [[ "$mode" == "ip" ]]; then
     ip="$(jq -r '.ip' "$file")"; port="$(jq -r '.listen_port' "$file")"
-    curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' -H "Host: $ip" \
-      --connect-timeout 3 --max-time 8 "http://127.0.0.1:${port}${request_path}" 2>/dev/null || true
+    if [[ "$ip" == *:* ]]; then
+      curl --noproxy '*' -g -sS -o /dev/null -w '%{http_code}' -H "Host: [$ip]" \
+        --connect-timeout 3 --max-time 8 "http://[::1]:${port}${request_path}" 2>/dev/null || true
+    else
+      curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' -H "Host: $ip" \
+        --connect-timeout 3 --max-time 8 "http://127.0.0.1:${port}${request_path}" 2>/dev/null || true
+    fi
   else
     domain="$(jq -r '.domain' "$file")"; port="$(site_listen_port "$file")"
     curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --resolve "$domain:$port:127.0.0.1" \
@@ -250,7 +264,7 @@ show_site() {
   printf '%s入口详情%s\n\n' "$BOLD" "$RESET"
   jq -r '
     "入口 ID：\(.id)",
-    "访问模式：\(if .mode=="domain" then "域名 HTTPS" else "公网 IPv4 + HTTP" end)",
+    "访问模式：\(if .mode=="domain" then "域名 HTTPS" elif (.ip|contains(":")) then "公网 IPv6 + HTTP" else "公网 IPv4 + HTTP" end)",
     "访问地址：\(.public_url)",
     "反代程序：\(.engine)",
     "管理方式：\(.managed_kind)",
@@ -558,7 +572,7 @@ import_caddy_standalone() {
     mode="domain"; domain="$key"; ip=""; port="443"; url="https://$key"
     if [[ "$key" == ip-* ]]; then
       ip="${key#ip-}"; port="${ip##*-}"; ip="${ip%-$port}"
-      id="$key"; mode="ip"; domain=""; url="http://${ip}:${port}"
+      id="$key"; mode="ip"; domain=""; url="$(format_ip_public_url "$ip" "$port")"
     elif [[ "$key" =~ ^(.+)-https-([0-9]+)$ ]]; then
       domain="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
       id="domain-${domain}-https-${port}"; url="https://${domain}:${port}"
@@ -628,7 +642,7 @@ import_nginx() {
     marker="$(sed -n 's/^# MANAGED EMBY SITE: //p' "$file" | head -n1)"
     if [[ "$marker" == ip-* ]]; then
       id="$marker"; mode="ip"; ip="${marker#ip-}"; port="${ip##*-}"; ip="${ip%-$port}"
-      domain=""; url="http://${ip}:${port}"
+      domain=""; url="$(format_ip_public_url "$ip" "$port")"
     else
       domain="$(awk '$1=="server_name" {gsub(/;/,"",$2); print $2; exit}' "$file")"
       [[ -n "$domain" ]] || continue

@@ -27,6 +27,7 @@ SHOW_UNSAFE_IP_MODE="${EMBY_PROXY_SHOW_UNSAFE_IP_MODE:-0}"
 ACCESS_MODE=""
 ACCESS_SCHEME=""
 PROXY_IP=""
+IP_VERSION=""
 LISTEN_PORT=""
 HTTPS_PORT=""
 DOMAIN_ENTRY_TYPE=""
@@ -95,9 +96,10 @@ usage() {
   -e, --engine ENGINE       反代程序：caddy 或 nginx；不填写时交互选择
       --manager-only        只安装 emby-proxy 管理命令并导入旧配置，不新增反代
       --show-unsafe-ip-mode 显示/允许“公网 IP + 明文 HTTP”模式；默认隐藏
-  -m, --mode MODE           访问模式：domain（域名 HTTPS）或 ip（公网 IPv4 + HTTP）
+  -m, --mode MODE           访问模式：domain（域名 HTTPS）或 ip（公网 IPv4/IPv6 + HTTP）
   -d, --domain DOMAIN       对外访问的反代域名（必须已解析到本 VPS）
-  -i, --ip-address IPV4     IP 模式的对外访问 IPv4；不填写时自动检测公网 IPv4
+  -i, --ip-address ADDRESS  IP 模式的对外访问 IPv4/IPv6；不填写时按 --ip-version 自动检测
+      --ip-version VERSION  IP 模式地址族：auto、ipv4 或 ipv6；默认 auto（根据地址判断）
   -l, --listen-port PORT    IP 模式的独立 HTTP 端口，默认 8080（范围 1024-65535）
       --https-port PORT     域名模式的 HTTPS 端口，默认 443；自定义范围 1024-65535
       --domain-mode MODE    域名入口：subdomain、port 或 path
@@ -131,6 +133,9 @@ while (($#)); do
     -i|--ip-address)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       PROXY_IP="$2"; shift 2 ;;
+    --ip-version)
+      [[ $# -ge 2 ]] || die "$1 缺少参数。"
+      IP_VERSION="$2"; shift 2 ;;
     -l|--listen-port)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       LISTEN_PORT="$2"; shift 2 ;;
@@ -168,16 +173,23 @@ require_root() {
     [[ -n "$ACCESS_MODE" ]] && sudo_args+=(--mode "$ACCESS_MODE")
     [[ -n "$PROXY_DOMAIN" ]] && sudo_args+=(--domain "$PROXY_DOMAIN")
     [[ -n "$PROXY_IP" ]] && sudo_args+=(--ip-address "$PROXY_IP")
+    [[ -n "$IP_VERSION" ]] && sudo_args+=(--ip-version "$IP_VERSION")
     [[ -n "$LISTEN_PORT" ]] && sudo_args+=(--listen-port "$LISTEN_PORT")
     [[ -n "$HTTPS_PORT" ]] && sudo_args+=(--https-port "$HTTPS_PORT")
     [[ -n "$DOMAIN_ENTRY_TYPE" ]] && sudo_args+=(--domain-mode "$DOMAIN_ENTRY_TYPE")
     [[ -n "$PRIMARY_ROUTE_INPUT" ]] && sudo_args+=(--path "$PRIMARY_ROUTE_INPUT")
     [[ -n "$UPSTREAM_INPUT" ]] && sudo_args+=(--upstream "$UPSTREAM_INPUT")
     local route_spec
-    for route_spec in "${ROUTE_SPECS[@]}"; do
-      sudo_args+=(--route "$route_spec")
-    done
-    exec sudo -- "$SCRIPT_PATH" "${sudo_args[@]}"
+    if ((${#ROUTE_SPECS[@]} > 0)); then
+      for route_spec in "${ROUTE_SPECS[@]}"; do
+        sudo_args+=(--route "$route_spec")
+      done
+    fi
+    if ((${#sudo_args[@]} > 0)); then
+      exec sudo -- "$SCRIPT_PATH" "${sudo_args[@]}"
+    else
+      exec sudo -- "$SCRIPT_PATH"
+    fi
   fi
 }
 
@@ -230,6 +242,51 @@ valid_ipv4() {
   for octet in "${octets[@]}"; do
     ((10#$octet >= 0 && 10#$octet <= 255)) || return 1
   done
+}
+
+valid_ipv6() {
+  local value="$1" left right part part_count=0
+  local -a parts=()
+  [[ "$value" != \[*\] ]] || value="${value:1:${#value}-2}"
+  [[ "$value" == *:* && "$value" != *%* && "$value" != "::" ]] || return 1
+
+  # IPv6 最多一个压缩段 ::；不依赖外部 DNS/网络命令，安装前也能可靠校验。
+  if [[ "$value" == *::* ]]; then
+    left="${value%%::*}"
+    right="${value#*::}"
+    [[ "$right" != *::* ]] || return 1
+    if [[ -n "$left" ]]; then
+      IFS=':' read -r -a parts <<<"$left"
+      for part in "${parts[@]}"; do
+        [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        ((part_count+=1))
+      done
+    fi
+    if [[ -n "$right" ]]; then
+      IFS=':' read -r -a parts <<<"$right"
+      for part in "${parts[@]}"; do
+        [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        ((part_count+=1))
+      done
+    fi
+    ((part_count <= 7)) || return 1
+  else
+    IFS=':' read -r -a parts <<<"$value"
+    [[ ${#parts[@]} -eq 8 ]] || return 1
+    for part in "${parts[@]}"; do
+      [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+  fi
+}
+
+normalize_ip_version() {
+  IP_VERSION="$(printf '%s' "$(trim "${IP_VERSION:-auto}")" | tr '[:upper:]' '[:lower:]')"
+  case "$IP_VERSION" in
+    ""|auto) IP_VERSION="auto" ;;
+    4|ipv4) IP_VERSION="ipv4" ;;
+    6|ipv6) IP_VERSION="ipv6" ;;
+    *) die "IP 地址族只能选择 auto、ipv4 或 ipv6。" ;;
+  esac
 }
 
 normalize_access_mode() {
@@ -301,16 +358,38 @@ set_nginx_id() {
 
 set_ip_access_target() {
   PROXY_IP="$(trim "$PROXY_IP")"
-  if [[ -z "$PROXY_IP" ]]; then
-    info "正在检测本机公网 IPv4……"
-    PROXY_IP="$(public_ip 4 -4 https://api.ipify.org)"
-    [[ -n "$PROXY_IP" ]] || die "无法自动检测公网 IPv4，请重新运行并使用 --ip-address 1.2.3.4 指定。"
+  if [[ "$PROXY_IP" == \[*\] ]]; then
+    PROXY_IP="${PROXY_IP:1:${#PROXY_IP}-2}"
   fi
-  valid_ipv4 "$PROXY_IP" || die "访问 IPv4 格式无效：$PROXY_IP"
+  PROXY_IP="$(printf '%s' "$PROXY_IP" | tr '[:upper:]' '[:lower:]')"
+  normalize_ip_version
+  if [[ -z "$PROXY_IP" ]]; then
+    if [[ "$IP_VERSION" == "ipv6" ]]; then
+      info "正在检测本机公网 IPv6……"
+      PROXY_IP="$(public_ip 6 -6 https://api64.ipify.org)"
+      [[ -n "$PROXY_IP" ]] || die "无法自动检测公网 IPv6，请重新运行并使用 --ip-address 2001:db8::1 指定。"
+    else
+      info "正在检测本机公网 IPv4……"
+      PROXY_IP="$(public_ip 4 -4 https://api.ipify.org)"
+      [[ -n "$PROXY_IP" ]] || die "无法自动检测公网 IPv4，请重新运行并使用 --ip-address 1.2.3.4 指定。"
+    fi
+  fi
+  if [[ "$IP_VERSION" == "auto" ]]; then
+    if [[ "$PROXY_IP" == *:* ]]; then IP_VERSION="ipv6"; else IP_VERSION="ipv4"; fi
+  fi
+  if [[ "$IP_VERSION" == "ipv6" ]]; then
+    valid_ipv6 "$PROXY_IP" || die "访问 IPv6 格式无效：$PROXY_IP"
+  else
+    valid_ipv4 "$PROXY_IP" || die "访问 IPv4 格式无效：$PROXY_IP"
+  fi
   normalize_listen_port
   PROXY_DOMAIN="$PROXY_IP"
   ACCESS_SCHEME="http"
-  PUBLIC_AUTHORITY="${PROXY_IP}:${LISTEN_PORT}"
+  if [[ "$IP_VERSION" == "ipv6" ]]; then
+    PUBLIC_AUTHORITY="[${PROXY_IP}]:${LISTEN_PORT}"
+  else
+    PUBLIC_AUTHORITY="${PROXY_IP}:${LISTEN_PORT}"
+  fi
   PUBLIC_BASE_URL="http://${PUBLIC_AUTHORITY}"
   PROXY_KEY="ip-${PROXY_IP}-${LISTEN_PORT}"
   set_nginx_id "$PROXY_KEY"
@@ -360,7 +439,7 @@ normalize_proxy_domain() {
 }
 
 parse_upstream() {
-  local raw scheme authority host host_lower port
+  local raw scheme authority host host_lower port suffix close_bracket
   raw="$(trim "$1")"
   raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
   [[ -n "$raw" ]] || die "源站地址不能为空。"
@@ -378,16 +457,39 @@ parse_upstream() {
 
   [[ -n "$authority" && "$authority" != */* && "$authority" != *\?* && "$authority" != *\#* && "$authority" != *@* ]] || \
     die "源站只能包含协议、主机名和端口，不能带路径、查询参数或账号信息。"
-  [[ "$authority" =~ ^[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || \
-    die "源站格式无效：${authority}（示例：https://origin.example.com 或 http://1.2.3.4:8096）"
+  if [[ "$authority" == \[* ]]; then
+    [[ "$authority" =~ ^\[[0-9A-Fa-f:]+\](:[0-9]{1,5})?$ ]] || \
+      die "源站 IPv6 格式无效：${authority}（示例：https://[2001:db8::10]:8443）"
+  else
+    [[ "$authority" =~ ^[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || \
+      die "源站格式无效：${authority}（示例：https://origin.example.com 或 http://1.2.3.4:8096）"
+  fi
 
-  host="${authority%%:*}"
+  host=""
   port=""
-  [[ "$authority" == *:* ]] && port="${authority##*:}"
+  if [[ "$authority" == \[*\] || "$authority" == \[*\]:* ]]; then
+    close_bracket="${authority%%]*}"
+    [[ "$close_bracket" == \[* ]] || die "源站 IPv6 地址必须使用 [IPv6] 格式。"
+    host="${close_bracket:1}"
+    suffix="${authority#*]}"
+    if [[ -n "$suffix" ]]; then
+      [[ "$suffix" == :[0-9]* ]] || die "源站 IPv6 端口格式无效：$authority"
+      port="${suffix#:}"
+    fi
+    valid_ipv6 "$host" || die "源站 IPv6 格式无效：$host"
+  else
+    host="${authority%%:*}"
+    [[ "$authority" != *:*:* ]] || die "源站 IPv6 地址必须使用 [IPv6]:端口 格式。"
+    [[ "$authority" == *:* ]] && port="${authority##*:}"
+  fi
   if [[ -n "$port" ]] && ((10#$port < 1 || 10#$port > 65535)); then
     die "源站端口超出 1-65535 范围：$port"
   fi
-  [[ "$host" =~ ^[A-Za-z0-9.-]+$ && "$host" != .* && "$host" != *. && "$host" != *..* ]] || die "源站主机名无效：$host"
+  if [[ "$host" == *:* ]]; then
+    valid_ipv6 "$host" || die "源站 IPv6 格式无效：$host"
+  else
+    [[ "$host" =~ ^[A-Za-z0-9.-]+$ && "$host" != .* && "$host" != *. && "$host" != *..* ]] || die "源站主机名无效：$host"
+  fi
   host_lower="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
   if [[ "$host_lower" == "$PROXY_DOMAIN" ]]; then
     if [[ "$ACCESS_MODE" == "domain" ]]; then
@@ -686,23 +788,25 @@ detect_existing_caddy_domain_mode() {
 }
 
 prompt_inputs() {
-  local interactive_upstream=0 primary_route="/" i mode_choice="" domain_choice="" listen_port_provided=0 domain_type_provided=0
+  local interactive_upstream=0 primary_route="/" i mode_choice="" domain_choice="" listen_port_provided=0 domain_type_provided=0 ip_version_provided=0
   [[ -z "$LISTEN_PORT" ]] || listen_port_provided=1
   [[ -z "$DOMAIN_ENTRY_TYPE" ]] || domain_type_provided=1
+  [[ -z "$IP_VERSION" ]] || ip_version_provided=1
   normalize_unsafe_ip_visibility
+  normalize_ip_version
   select_proxy_engine
 
   if [[ -z "$ACCESS_MODE" ]]; then
     if [[ -n "$PROXY_DOMAIN" ]]; then
       ACCESS_MODE="domain"
-    elif [[ -n "$PROXY_IP" || -n "$LISTEN_PORT" ]]; then
+    elif [[ -n "$PROXY_IP" || -n "$LISTEN_PORT" || $ip_version_provided -eq 1 ]]; then
       ACCESS_MODE="ip"
     else
       [[ -t 0 ]] || die "非交互环境请提供 --domain；如确需不安全的 IP HTTP 模式，必须同时使用 --show-unsafe-ip-mode --mode ip。"
       if [[ "$SHOW_UNSAFE_IP_MODE" == "1" ]]; then
         printf '\n请选择对外访问方式：\n'
         printf '  1) 域名 + HTTPS（安全，推荐）\n'
-        printf '  2) 公网 IPv4 + HTTP 独立端口（不安全：明文传输）\n'
+        printf '  2) 公网 IPv4/IPv6 + HTTP 独立端口（不安全：明文传输）\n'
         printf '请输入 1 或 2（默认 1）：'
         read -r mode_choice
         ACCESS_MODE="${mode_choice:-1}"
@@ -717,7 +821,7 @@ prompt_inputs() {
   require_unsafe_ip_opt_in
 
   if [[ "$ACCESS_MODE" == "domain" ]]; then
-    [[ -z "$PROXY_IP" && -z "$LISTEN_PORT" ]] || die "域名模式不能同时使用 --ip-address 或 --listen-port。"
+    [[ -z "$PROXY_IP" && -z "$LISTEN_PORT" && ( -z "$IP_VERSION" || "$IP_VERSION" == "auto" ) ]] || die "域名模式不能同时使用 --ip-address、--ip-version 或 --listen-port。"
     normalize_domain_entry_type
     if [[ -t 0 && $domain_type_provided -eq 0 && -z "${HTTPS_PORT:-}" && -z "${PRIMARY_ROUTE_INPUT:-}" && ${#ROUTE_SPECS[@]} -eq 0 ]]; then
       printf '\n请选择域名入口结构：\n'
@@ -758,10 +862,26 @@ prompt_inputs() {
     LISTEN_PORT="${LISTEN_PORT:-8080}"
     normalize_listen_port
     if [[ -t 0 && -z "$PROXY_IP" ]]; then
-      printf '%s请输入对外访问的公网 IPv4%s（直接回车自动检测）：' "$BOLD" "$RESET"
+      printf '%s请输入对外访问的公网 IPv4/IPv6%s（直接回车按地址族自动检测）：' "$BOLD" "$RESET"
       read -r PROXY_IP
     fi
-    [[ -z "$PROXY_IP" ]] || valid_ipv4 "$(trim "$PROXY_IP")" || die "访问 IPv4 格式无效：$PROXY_IP"
+    if [[ -n "$PROXY_IP" ]]; then
+      local entered_ip="$(trim "$PROXY_IP")"
+      if [[ "$entered_ip" == \[*\] ]]; then entered_ip="${entered_ip:1:${#entered_ip}-2}"; fi
+      if [[ "$entered_ip" == *:* ]]; then
+        if (( ip_version_provided == 1 )) && [[ "$IP_VERSION" != "auto" && "$IP_VERSION" != "ipv6" ]]; then
+          die "--ip-version ipv4 与 IPv6 地址不匹配。"
+        fi
+        IP_VERSION="ipv6"
+        valid_ipv6 "$entered_ip" || die "访问 IPv6 格式无效：$PROXY_IP"
+      else
+        if (( ip_version_provided == 1 )) && [[ "$IP_VERSION" != "auto" && "$IP_VERSION" != "ipv4" ]]; then
+          die "--ip-version ipv6 与 IPv4 地址不匹配。"
+        fi
+        IP_VERSION="ipv4"
+        valid_ipv4 "$entered_ip" || die "访问 IPv4 格式无效：$PROXY_IP"
+      fi
+    fi
     if [[ -t 0 && $listen_port_provided -eq 0 ]]; then
       printf '%s请输入独立 HTTP 监听端口%s（默认 %s）：' "$BOLD" "$RESET" "$LISTEN_PORT"
       read -r mode_choice
@@ -843,6 +963,7 @@ normalize_route_path() {
 
 parse_route_specs() {
   local spec path input existing
+  if ((${#ROUTE_SPECS[@]} == 0)); then return 0; fi
   for spec in "${ROUTE_SPECS[@]}"; do
     [[ "$spec" == *=* ]] || die "路径映射格式无效：${spec}（正确示例：/a=https://origin.example.com）"
     path="$(normalize_route_path "${spec%%=*}")"
@@ -1029,8 +1150,8 @@ check_dns() {
   ipv4="$(public_ip 4 -4 https://api.ipify.org)"
   ipv6="$(public_ip 6 -6 https://api64.ipify.org)"
 
-  info "DNS A 记录：$([[ ${#records_a[@]} -gt 0 ]] && join_by ', ' "${records_a[@]}" || printf '未找到')"
-  info "DNS AAAA 记录：$([[ ${#records_aaaa[@]} -gt 0 ]] && join_by ', ' "${records_aaaa[@]}" || printf '未找到')"
+  info "DNS A 记录：$([[ ${#records_a[@]} -gt 0 ]] && join_by ', ' "${records_a[@]-}" || printf '未找到')"
+  info "DNS AAAA 记录：$([[ ${#records_aaaa[@]} -gt 0 ]] && join_by ', ' "${records_aaaa[@]-}" || printf '未找到')"
   [[ -n "$ipv4" ]] && info "本机公网 IPv4：$ipv4" || warn "无法从公网查询本机 IPv4，将在部署后通过证书申请结果继续验证。"
   [[ -n "$ipv6" ]] && info "本机公网 IPv6：$ipv6"
 
@@ -1042,14 +1163,14 @@ check_dns() {
 
   if [[ -n "$ipv4" && ${#records_a[@]} -gt 0 ]]; then
     local record
-    contains_exact "$ipv4" "${records_a[@]}" && dns_ok=1 || bad_record=1
-    for record in "${records_a[@]}"; do
+    contains_exact "$ipv4" "${records_a[@]-}" && dns_ok=1 || bad_record=1
+    for record in "${records_a[@]-}"; do
       [[ "$record" == "$ipv4" ]] || bad_record=1
     done
   fi
   if [[ -n "$ipv6" && ${#records_aaaa[@]} -gt 0 ]]; then
-    contains_exact "$ipv6" "${records_aaaa[@]}" && dns_ok=1 || bad_record=1
-    for record in "${records_aaaa[@]}"; do
+    contains_exact "$ipv6" "${records_aaaa[@]-}" && dns_ok=1 || bad_record=1
+    for record in "${records_aaaa[@]-}"; do
       [[ "$record" == "$ipv6" ]] || bad_record=1
     done
   elif [[ -z "$ipv6" && ${#records_aaaa[@]} -gt 0 ]]; then
@@ -1227,8 +1348,8 @@ emit_nginx_header_maps() {
   for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
     route_path="${ROUTE_PATHS[$i]}"
     upstream_host="${ROUTE_HOSTS[$i]}"
-    # 源站主机已限制为字母、数字、点和连字符；这里只需转义正则中的点。
-    escaped_host="${upstream_host//./\\.}"
+    # 源站主机已限制为域名或十六进制 IPv6；按 URL/正则语法转义点和 IPv6 方括号。
+    escaped_host="$(escape_upstream_host_for_url "$upstream_host")"
     public_prefix=""
     [[ "$route_path" == "/" ]] || public_prefix="$route_path"
     location_var="emby_proxy_location_${NGINX_ID}_$i"
@@ -1409,23 +1530,28 @@ EOF
 }
 
 write_nginx_ip_config() {
-  local target="$1" i
+  local target="$1" i ip_label
+  ip_label="$(printf '%s' "$IP_VERSION" | tr '[:lower:]' '[:upper:]')"
   {
     cat <<EOF
 # MANAGED EMBY SITE: $PROXY_KEY
-# 由 $SCRIPT_NAME 自动管理；这是固定公网 IPv4 + 独立端口的明文 HTTP 入口。
+# 由 $SCRIPT_NAME 自动管理；这是固定公网 $ip_label + 独立端口的明文 HTTP 入口。
 EOF
     emit_nginx_http_prelude
+    if [[ "$IP_VERSION" == "ipv6" ]]; then
+      printf 'server {\n    listen [%s]:%s ipv6only=on;\n    server_name %s;\n\n' "$PROXY_IP" "$LISTEN_PORT" "$PROXY_IP"
+    else
+      printf 'server {\n    listen %s;\n    listen [::]:%s ipv6only=on;\n    server_name %s;\n\n' "$LISTEN_PORT" "$LISTEN_PORT" "$PROXY_IP"
+    fi
+    if [[ "$IP_VERSION" == "ipv6" ]]; then
+      printf '    # IPv6 Host 可能由客户端带方括号，接受带/不带方括号的规范形式。\n'
+      printf '    if ($host !~ ^\\[?%s\\]?$) { return 444; }\n\n' "$PROXY_IP"
+    else
+      printf '    # 只接受当前 IP 作为 Host；客户端不能借 Host 选择其他回源。\n'
+      printf '    if ($host != %s) { return 444; }\n\n' "$PROXY_IP"
+    fi
     cat <<EOF
-server {
-    listen $LISTEN_PORT;
-    listen [::]:$LISTEN_PORT;
-    server_name $PROXY_IP;
-
     access_log $NGINX_ACCESS_LOG emby_proxy_${NGINX_ID}_v1;
-
-    # 只接受当前 IP 作为 Host；客户端不能借 Host 选择其他回源。
-    if (\$host != $PROXY_IP) { return 444; }
 
     client_max_body_size 0;
 
@@ -1700,7 +1826,7 @@ show_plan() {
   printf '\n%s即将应用以下配置：%s\n' "$BOLD" "$RESET"
   printf '  反代程序： %s\n' "$PROXY_ENGINE"
   if [[ "$ACCESS_MODE" == "ip" ]]; then
-    printf '  访问模式： 公网 IPv4 + HTTP 独立端口（每个 Emby 一个端口）\n'
+    printf '  访问模式： 公网 %s + HTTP 独立端口（每个 Emby 一个端口）\n' "$(printf '%s' "$IP_VERSION" | tr '[:lower:]' '[:upper:]')"
   else
     case "$DOMAIN_ENTRY_TYPE" in
       subdomain) printf '  访问模式： 独立子域名 + HTTPS 443（首选）\n' ;;
@@ -1789,7 +1915,7 @@ strip_current_caddy_managed() {
 
 emit_caddy_header_rewrites() {
   local route_path="$1" upstream_host="$2" escaped_host escaped_route public_prefix
-  escaped_host="${upstream_host//./\\.}"
+  escaped_host="$(escape_upstream_host_for_url "$upstream_host")"
   public_prefix=""
   [[ "$route_path" == "/" ]] || public_prefix="$route_path"
 
@@ -1814,6 +1940,16 @@ emit_caddy_header_rewrites() {
     printf '            header_down Content-Location "^%s(?:/(.*))?$" "emby-proxy-prefix-preserved://$1"\n' "$escaped_route"
     printf '            header_down Content-Location "^/(.*)$" "%s/$1"\n' "$public_prefix"
     printf '            header_down Content-Location "^emby-proxy-prefix-preserved://(.*)$" "%s/$1"\n' "$public_prefix"
+  fi
+}
+
+escape_upstream_host_for_url() {
+  local host="$1" escaped
+  escaped="${host//./\\.}"
+  if [[ "$host" == *:* ]]; then
+    printf '\\[%s\\]' "$escaped"
+  else
+    printf '%s' "$escaped"
   fi
 }
 
@@ -1896,7 +2032,13 @@ build_candidate_config() {
 
   site_address="$PROXY_DOMAIN"
   [[ "$ACCESS_MODE" != "domain" || "$HTTPS_PORT" == "443" ]] || site_address="https://${PROXY_DOMAIN}:${HTTPS_PORT}"
-  [[ "$ACCESS_MODE" == "ip" ]] && site_address="http://${PROXY_IP}:${LISTEN_PORT}"
+  if [[ "$ACCESS_MODE" == "ip" ]]; then
+    if [[ "$IP_VERSION" == "ipv6" ]]; then
+      site_address="http://[${PROXY_IP}]:${LISTEN_PORT}"
+    else
+      site_address="http://${PROXY_IP}:${LISTEN_PORT}"
+    fi
+  fi
 
   # 上游地址经过严格白名单校验，可安全写入 Caddyfile。
   {
@@ -1967,7 +2109,11 @@ check_caddy_domain_conflict() {
   (( CADDY_ATTACH_EXISTING )) && return 0
   if [[ "$ACCESS_MODE" == "ip" ]]; then
     # 同一端口上的其他显式主机可以由 Caddy 安全分流；但精确 IP 或 :PORT 通配站点会与本入口重叠。
-    domain_pattern="(http://${PROXY_IP//./\\.}:${LISTEN_PORT}([[:space:]]|\\{|,|$)|^[[:space:]]*(http://)?(:|\\*:)${LISTEN_PORT}([[:space:]]|\\{|,|$))"
+    if [[ "$IP_VERSION" == "ipv6" ]]; then
+      domain_pattern="(http://\\[${PROXY_IP//./\\.}\\]:${LISTEN_PORT}([[:space:]]|\\{|,|$)|^[[:space:]]*(http://)?(:|\\*:)${LISTEN_PORT}([[:space:]]|\\{|,|$))"
+    else
+      domain_pattern="(http://${PROXY_IP//./\\.}:${LISTEN_PORT}([[:space:]]|\\{|,|$)|^[[:space:]]*(http://)?(:|\\*:)${LISTEN_PORT}([[:space:]]|\\{|,|$))"
+    fi
   else
     if [[ "$HTTPS_PORT" == "443" ]]; then
       domain_pattern="(^|[[:space:],])((https://)?${PROXY_DOMAIN//./\\.})([[:space:],{]|$)"
@@ -2121,9 +2267,15 @@ apply_config() {
 entry_status_code() {
   local request_path="$1"
   if [[ "$ACCESS_MODE" == "ip" ]]; then
-    curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
-      -H "Host: $PROXY_IP" --connect-timeout 5 --max-time 15 \
-      "http://127.0.0.1:${LISTEN_PORT}${request_path}" 2>/dev/null || true
+    if [[ "$IP_VERSION" == "ipv6" ]]; then
+      curl --noproxy '*' -g -sS -o /dev/null -w '%{http_code}' \
+        -H "Host: [$PROXY_IP]" --connect-timeout 5 --max-time 15 \
+        "http://[::1]:${LISTEN_PORT}${request_path}" 2>/dev/null || true
+    else
+      curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+        -H "Host: $PROXY_IP" --connect-timeout 5 --max-time 15 \
+        "http://127.0.0.1:${LISTEN_PORT}${request_path}" 2>/dev/null || true
+    fi
   else
     curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
       --resolve "$PROXY_DOMAIN:$HTTPS_PORT:127.0.0.1" \

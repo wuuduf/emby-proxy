@@ -60,6 +60,18 @@ http://203.0.113.10:18080 {
 }
 # END MANAGED EMBY REVERSE PROXY: ip-203.0.113.10-18080
 
+# BEGIN MANAGED EMBY REVERSE PROXY: ip-2001:db8::10-18082
+http://[2001:db8::10]:18082 {
+    handle /_emby_proxy_health {
+        respond "ok" 200
+    }
+    handle {
+        reverse_proxy https://[2001:db8::20]:8443 {
+        }
+    }
+}
+# END MANAGED EMBY REVERSE PROXY: ip-2001:db8::10-18082
+
 # BEGIN MANAGED EMBY REVERSE PROXY: one.example.com-https-18443
 https://one.example.com:18443 {
     handle {
@@ -119,7 +131,7 @@ MANAGER_UNDER_TEST="$MANAGER" bash -c '
   source "$MANAGER_UNDER_TEST"
   require_jq
   ensure_state_dirs
-  [[ "$(import_caddy_standalone)" == 3 ]]
+  [[ "$(import_caddy_standalone)" == 4 ]]
   [[ "$(import_caddy_attached)" == 1 ]]
   [[ "$(import_nginx)" == 2 ]]
 ' || fail "旧配置导入失败"
@@ -127,6 +139,7 @@ MANAGER_UNDER_TEST="$MANAGER" bash -c '
 assert_jq "$TMP_DIR/state/sites.d/domain-one.example.com.json" '.engine=="caddy" and .mode=="domain" and (.routes|length)==2'
 assert_jq "$TMP_DIR/state/sites.d/domain-one.example.com.json" 'any(.routes[]; .path=="/" and .upstream=="https://origin-one.example.net")'
 assert_jq "$TMP_DIR/state/sites.d/ip-203.0.113.10-18080.json" '.mode=="ip" and .listen_port==18080 and .public_url=="http://203.0.113.10:18080"'
+assert_jq "$TMP_DIR/state/sites.d/ip-2001:db8::10-18082.json" '.mode=="ip" and .listen_port==18082 and .public_url=="http://[2001:db8::10]:18082"'
 assert_jq "$TMP_DIR/state/sites.d/domain-existing.example.com.json" '.managed_kind=="caddy_attached" and .routes[0].path=="/media"'
 assert_jq "$TMP_DIR/state/sites.d/domain-nginx.example.com.json" '.engine=="nginx" and (.routes|length)==2'
 assert_jq "$TMP_DIR/state/sites.d/domain-one.example.com-https-18443.json" '.engine=="caddy" and .listen_port==18443 and .entry_type=="port" and .public_url=="https://one.example.com:18443"'
@@ -243,6 +256,6 @@ EMBY_PROXY_LIB_ONLY=1 INSTALLER_UNDER_TEST="$INSTALLER" bash -c '
 ' || fail "管理命令安装失败"
 [[ -x "$TMP_DIR/installed/lib/setup-emby-proxy.sh" ]] || fail "未安装配置后端"
 [[ -x "$TMP_DIR/installed/bin/emby-proxy" ]] || fail "未安装 emby-proxy 命令"
-"$TMP_DIR/installed/bin/emby-proxy" version | grep -F '2.2.4-menu' >/dev/null || fail "已安装管理命令不可运行"
+"$TMP_DIR/installed/bin/emby-proxy" version | grep -F '2.3.0-ipv6' >/dev/null || fail "已安装管理命令不可运行"
 
 printf 'PASS: manager install/import, state registry, route replay, exact-marker deletion\n'
