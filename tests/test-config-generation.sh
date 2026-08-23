@@ -18,37 +18,12 @@ assert_count() {
 
 EMBY_PROXY_LIB_ONLY=1 source "$SCRIPT"
 
-# 只有本次新装的 Nginx/IP 模式才能禁用 Debian 默认站点，并且回滚可恢复原符号链接。
-mkdir -p "$TMP_DIR/nginx-default/sites-enabled" "$TMP_DIR/nginx-default/sites-available"
-: >"$TMP_DIR/nginx-default/sites-available/default"
-ln -s ../sites-available/default "$TMP_DIR/nginx-default/sites-enabled/default"
-EMBY_PROXY_NGINX_DEFAULT_SITE_LINK="$TMP_DIR/nginx-default/sites-enabled/default" \
+# 新版本不再创建 IP HTTP 入口；旧参数与模式必须在 CLI 层拒绝。
 SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY_LIB_ONLY=1 bash -c '
-  set --
+  set -- --mode ip
   source "$SCRIPT_UNDER_TEST"
-  ACCESS_MODE=ip; NGINX_NEWLY_INSTALLED=1
-  disable_new_nginx_default_site
-  [[ ! -e "$NGINX_DEFAULT_SITE_LINK" && "$NGINX_DEFAULT_DISABLED" == 1 ]]
-  restore_new_nginx_default_site
-  [[ -L "$NGINX_DEFAULT_SITE_LINK" && "$(readlink "$NGINX_DEFAULT_SITE_LINK")" == ../sites-available/default ]]
-' || fail "新装 Nginx 默认站点的禁用/回滚失败"
-
-SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY_LIB_ONLY=1 bash -c '
-  set -- --show-unsafe-ip-mode --mode ip --ip-version ipv6 --ip-address 2001:db8::10 --listen-port 18080 --path /media
-  source "$SCRIPT_UNDER_TEST"
-  normalize_unsafe_ip_visibility
-  [[ "$SHOW_UNSAFE_IP_MODE" == 1 && "$ACCESS_MODE" == ip && "$IP_VERSION" == ipv6 && "$PROXY_IP" == 2001:db8::10 && "$LISTEN_PORT" == 18080 && "$PRIMARY_ROUTE_INPUT" == /media ]]
-' || fail "IP 模式命令行参数解析失败"
-
-if SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY_LIB_ONLY=1 bash -c '
-  set -- --mode ip --ip-address 203.0.113.10 --listen-port 18080
-  source "$SCRIPT_UNDER_TEST"
-  normalize_unsafe_ip_visibility
   normalize_access_mode
-  require_unsafe_ip_opt_in
-' >/dev/null 2>&1; then
-  fail "未显式解锁时仍允许了不安全 IP HTTP 模式"
-fi
+' >/dev/null 2>&1 && fail "IP 模式仍能通过模式校验" || true
 
 # 域名冲突检测按完整 token 匹配，不能把 a.example.com 错认成 ba.example.com。
 domain_pattern="$(domain_token_regex 'a.example.com')"
@@ -146,62 +121,9 @@ assert_contains "$TMP_DIR/Caddyfile.final" 'header_down Location "^emby-proxy-pr
 assert_contains "$TMP_DIR/Caddyfile.final" 'header_down Content-Location "^emby-proxy-prefix-preserved://(.*)$" "/a/$1"'
 assert_not_contains "$TMP_DIR/Caddyfile.final" 'reverse_proxy {'
 
-# 无域名 IP HTTP 模式：使用独立高位端口，不生成 TLS/ACME 配置，响应头改写为 IP URL。
-ACCESS_MODE="ip"
-PROXY_IP="203.0.113.10"
-LISTEN_PORT="18080"
-set_ip_access_target >/dev/null
-[[ "$NGINX_ID" =~ ^s[0-9a-f]{12}$ ]] || fail "IP 模式 Nginx 短标识格式错误"
-parse_upstream http://203.0.113.10:8096
-[[ "$UPSTREAM_URL" == http://203.0.113.10:8096 ]] || fail "IP 模式错误拒绝了同机不同端口源站"
-if (parse_upstream http://203.0.113.10:18080) >/dev/null 2>&1; then fail "IP 模式未拒绝入口端口代理循环"; fi
-ROUTE_PATHS=("/" "/a")
-ROUTE_URLS=("http://127.0.0.1:8096" "https://origin-two.example.net")
-ROUTE_HOSTS=("127.0.0.1" "origin-two.example.net")
-write_nginx_ip_config "$TMP_DIR/nginx-ip.conf"
-assert_contains "$TMP_DIR/nginx-ip.conf" '# MANAGED EMBY SITE: ip-203.0.113.10-18080'
-assert_contains "$TMP_DIR/nginx-ip.conf" 'listen 18080;'
-assert_contains "$TMP_DIR/nginx-ip.conf" 'server_name 203.0.113.10;'
-assert_contains "$TMP_DIR/nginx-ip.conf" '"http://203.0.113.10:18080/a/$1";'
-assert_contains "$TMP_DIR/nginx-ip.conf" 'proxy_set_header X-Forwarded-For $remote_addr;'
-assert_not_contains "$TMP_DIR/nginx-ip.conf" 'ssl_certificate'
-assert_not_contains "$TMP_DIR/nginx-ip.conf" 'acme-challenge'
-
-: >"$TMP_DIR/Caddyfile.ip-empty"
-build_candidate_config "$TMP_DIR/Caddyfile.ip-empty" "$TMP_DIR/Caddyfile.ip"
-assert_contains "$TMP_DIR/Caddyfile.ip" '# BEGIN MANAGED EMBY REVERSE PROXY: ip-203.0.113.10-18080'
-assert_contains "$TMP_DIR/Caddyfile.ip" 'http://203.0.113.10:18080 {'
-assert_contains "$TMP_DIR/Caddyfile.ip" 'header_down Location "(?i)^https?://127\.0\.0\.1(?::[0-9]+)?$" "http://203.0.113.10:18080/"'
-assert_not_contains "$TMP_DIR/Caddyfile.ip" 'https://203.0.113.10:18080'
-
-valid_ipv4 203.0.113.10 || fail "合法 IPv4 被拒绝"
-valid_ipv4 999.0.0.1 && fail "非法 IPv4 未被拒绝"
-if (LISTEN_PORT=443; normalize_listen_port) >/dev/null 2>&1; then fail "IP 模式允许了受保护端口 443"; fi
-
-# IPv6 独立端口：URL 使用方括号，Nginx 只监听 IPv6，Caddy 站点地址保持 RFC 3986 格式。
-for valid in 2001:db8::10 ::1 2001:db8:0:1:2:3:4:5; do
-  valid_ipv6 "$valid" || fail "合法 IPv6 被拒绝：$valid"
-done
-for invalid in 2001:db8:::10 2001:db8::1::2 2001:db8:0:1:2:3:4 2001:db8::zz; do
-  valid_ipv6 "$invalid" && fail "非法 IPv6 未被拒绝：$invalid"
-done
-ACCESS_MODE="ip"; IP_VERSION="ipv6"; PROXY_IP="2001:db8::10"; LISTEN_PORT="18082"
-set_ip_access_target >/dev/null
+# 上游 IPv6 仍可作为域名 HTTPS 入口的固定源站。
 parse_upstream 'https://[2001:db8::20]:8443'
 [[ "$UPSTREAM_URL" == 'https://[2001:db8::20]:8443' && "$UPSTREAM_HOST" == '2001:db8::20' ]] || fail "IPv6 源站解析失败"
-ROUTE_PATHS=(/); ROUTE_URLS=('https://[2001:db8::20]:8443'); ROUTE_HOSTS=('2001:db8::20')
-write_nginx_ip_config "$TMP_DIR/nginx-ipv6.conf"
-assert_contains "$TMP_DIR/nginx-ipv6.conf" 'listen [2001:db8::10]:18082 ipv6only=on;'
-assert_not_contains "$TMP_DIR/nginx-ipv6.conf" 'listen 18082;'
-assert_contains "$TMP_DIR/nginx-ipv6.conf" 'if ($host !~ ^\[?2001:db8::10\]?$) { return 444; }'
-assert_contains "$TMP_DIR/nginx-ipv6.conf" 'proxy_pass https://[2001:db8::20]:8443;'
-assert_contains "$TMP_DIR/nginx-ipv6.conf" 'https?://\[2001:db8::20\]'
-: >"$TMP_DIR/Caddyfile.ipv6-empty"
-build_candidate_config "$TMP_DIR/Caddyfile.ipv6-empty" "$TMP_DIR/Caddyfile.ipv6"
-assert_contains "$TMP_DIR/Caddyfile.ipv6" '# BEGIN MANAGED EMBY REVERSE PROXY: ip-2001:db8::10-18082'
-assert_contains "$TMP_DIR/Caddyfile.ipv6" 'http://[2001:db8::10]:18082 {'
-assert_contains "$TMP_DIR/Caddyfile.ipv6" 'reverse_proxy https://[2001:db8::20]:8443 {'
-[[ "$PUBLIC_BASE_URL" == 'http://[2001:db8::10]:18082' ]] || fail "IPv6 公共 URL 未使用方括号"
 
 # 旧版无域名托管标记在更新旧域名时应迁移，新域名不能把它删除。
 cat >"$TMP_DIR/Caddyfile.legacy" <<'EOF'
@@ -298,4 +220,4 @@ if command -v caddy >/dev/null 2>&1; then
   caddy adapt --config "$validation_dir/Caddyfile.ip" --adapter caddyfile --validate >/dev/null
 fi
 
-printf 'PASS: domain HTTPS, IP HTTP, existing-site path attach, multi-domain isolation, ACME-only HTTP, XFF hardening, idempotent rewrites\n'
+printf 'PASS: domain HTTPS only, existing-site path attach, multi-domain isolation, ACME-only HTTP, XFF hardening, idempotent rewrites\n'

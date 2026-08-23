@@ -186,15 +186,16 @@ assert_arg "$TMP_DIR/backend-port.args" 'port'
 assert_arg "$TMP_DIR/backend-port.args" '--https-port'
 assert_arg "$TMP_DIR/backend-port.args" '18443'
 
-FAKE_ARGS_OUT="$TMP_DIR/backend-ip.args" EMBY_PROXY_BACKEND="$TMP_DIR/fake-backend" \
+# 旧 IP 入口只能读取/清理，管理器不得回放或重建。
+if FAKE_ARGS_OUT="$TMP_DIR/backend-ip.args" EMBY_PROXY_BACKEND="$TMP_DIR/fake-backend" \
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
   set --
   source "$MANAGER_UNDER_TEST"
   run_backend_for_state "$EMBY_PROXY_STATE_HOME/sites.d/ip-203.0.113.10-18080.json"
-' || fail "现有 IP 入口状态转后端参数失败"
-assert_arg "$TMP_DIR/backend-ip.args" '--show-unsafe-ip-mode'
-assert_arg "$TMP_DIR/backend-ip.args" '--mode'
-assert_arg "$TMP_DIR/backend-ip.args" 'ip'
+' >"$TMP_DIR/backend-ip.out" 2>&1; then
+  fail "旧 IP 入口仍可被管理器重建"
+fi
+grep -F '旧版 IP HTTP 模式，已被移除' "$TMP_DIR/backend-ip.out" >/dev/null || fail "旧 IP 入口拒绝原因不明确"
 
 FAKE_ARGS_OUT="$TMP_DIR/route-add.args" EMBY_PROXY_BACKEND="$TMP_DIR/fake-backend" \
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
@@ -207,21 +208,22 @@ EOF
 ' >/dev/null || fail "管理器新增路径失败"
 assert_arg "$TMP_DIR/route-add.args" '/c=https://origin-c.example.net'
 
-# 安装后端成功后应写入可被管理器读取的状态索引。
+# 安装后端成功后应写入可被管理器读取的域名 HTTPS 状态索引。
 EMBY_PROXY_STATE_HOME="$TMP_DIR/persisted" EMBY_PROXY_LIB_ONLY=1 INSTALLER_UNDER_TEST="$INSTALLER" bash -c '
   set --
   source "$INSTALLER_UNDER_TEST"
-  ACCESS_MODE=ip
+  ACCESS_MODE=domain
   PROXY_ENGINE=caddy
-  PROXY_IP=198.51.100.20
-  LISTEN_PORT=18081
-  set_ip_access_target >/dev/null
-  ROUTE_PATHS=(/ /a)
-  ROUTE_URLS=(http://127.0.0.1:8096 https://origin-a.example.net)
-  ROUTE_HOSTS=(127.0.0.1 origin-a.example.net)
+  PROXY_DOMAIN=persist.example.com
+  HTTPS_PORT=443
+  DOMAIN_ENTRY_TYPE=subdomain
+  normalize_proxy_domain "$PROXY_DOMAIN"
+  ROUTE_PATHS=(/)
+  ROUTE_URLS=(https://origin-persist.example.net)
+  ROUTE_HOSTS=(origin-persist.example.net)
   persist_site_state >/dev/null
 ' || fail "安装后端写入管理索引失败"
-assert_jq "$TMP_DIR/persisted/sites.d/ip-198.51.100.20-18081.json" '.engine=="caddy" and (.routes|length)==2'
+assert_jq "$TMP_DIR/persisted/sites.d/domain-persist.example.com.json" '.engine=="caddy" and .mode=="domain" and (.routes|length)==1'
 
 # 删除只能移除精确托管片段，必须保留手工站点和其他独立入口。
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_CADDYFILE="$TMP_DIR/caddy/Caddyfile" \
@@ -256,6 +258,6 @@ EMBY_PROXY_LIB_ONLY=1 INSTALLER_UNDER_TEST="$INSTALLER" bash -c '
 ' || fail "管理命令安装失败"
 [[ -x "$TMP_DIR/installed/lib/setup-emby-proxy.sh" ]] || fail "未安装配置后端"
 [[ -x "$TMP_DIR/installed/bin/emby-proxy" ]] || fail "未安装 emby-proxy 命令"
-"$TMP_DIR/installed/bin/emby-proxy" version | grep -F '2.3.0-ipv6' >/dev/null || fail "已安装管理命令不可运行"
+"$TMP_DIR/installed/bin/emby-proxy" version | grep -F '3.0.0-domain-only' >/dev/null || fail "已安装管理命令不可运行"
 
 printf 'PASS: manager install/import, state registry, route replay, exact-marker deletion\n'

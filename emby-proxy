@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="2.3.0-ipv6"
+readonly VERSION="3.0.0-domain-only"
 readonly STATE_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
@@ -167,7 +167,7 @@ print_status() {
   printf '%sEmby Reverse Proxy Manager%s  %s\n\n' "$BOLD" "$RESET" "$VERSION"
   printf '  %s\n' "$(service_line caddy caddy)"
   printf '  %s\n' "$(service_line nginx nginx)"
-  printf '\n  托管入口：%s（域名 HTTPS %s，IP HTTP %s）\n' "$count" "$domain_count" "$ip_count"
+  printf '\n  托管入口：%s（域名 HTTPS %s，旧 IP HTTP %s〔已停用〕）\n' "$count" "$domain_count" "$ip_count"
   printf '  引擎分布：Caddy %s，Nginx %s\n' "$caddy_count" "$nginx_count"
   if command -v ss >/dev/null 2>&1; then
     printf '  监听端口：\n'
@@ -264,7 +264,7 @@ show_site() {
   printf '%s入口详情%s\n\n' "$BOLD" "$RESET"
   jq -r '
     "入口 ID：\(.id)",
-    "访问模式：\(if .mode=="domain" then "域名 HTTPS" elif (.ip|contains(":")) then "公网 IPv6 + HTTP" else "公网 IPv4 + HTTP" end)",
+    "访问模式：\(if .mode=="domain" then "域名 HTTPS" else "旧 IP HTTP（已停用）" end)",
     "访问地址：\(.public_url)",
     "反代程序：\(.engine)",
     "管理方式：\(.managed_kind)",
@@ -687,9 +687,7 @@ run_backend_for_state() {
       args+=(--domain-mode subdomain)
     fi
   else
-    ip="$(jq -r '.ip' "$file")"; port="$(jq -r '.listen_port' "$file")"
-    # 现有 IP 入口已由管理员明确创建；回放时显式解锁隐藏的明文 HTTP 兼容模式。
-    args+=(--show-unsafe-ip-mode --mode ip --ip-address "$ip" --listen-port "$port")
+    die "入口 $(jq -r '.id // empty' "$file") 是旧版 IP HTTP 模式，已被移除；管理器不会重建或修改它，请删除后改用域名 HTTPS。"
   fi
   path="$(jq -r '.routes[0].path' "$file")"; upstream="$(jq -r '.routes[0].upstream' "$file")"
   [[ "$kind" != "caddy_attached" ]] || args+=(--path "$path")
@@ -729,7 +727,7 @@ route_upsert() {
   local action="$1" id="$2" file path upstream temp exists
   file="$(require_site "$id")"
   if [[ "$action" == "add" && "$(jq -r '.mode' "$file")" == "ip" ]]; then
-    die "IP 模式不再新增子路径；请为新的 Emby 新建一个独立 HTTP 端口入口。"
+    die "旧版 IP HTTP 入口已停用，不能新增或修改路径；请改用域名 HTTPS 入口。"
   fi
   if [[ "$action" == "add" && "$(jq -r '.mode' "$file")" == "domain" && "$(site_listen_port "$file")" != "443" ]]; then
     die "独立 HTTPS 端口模式不再新增子路径；请为新的 Emby 新建另一个 HTTPS 端口入口。"
