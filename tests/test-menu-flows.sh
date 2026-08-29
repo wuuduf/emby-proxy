@@ -22,6 +22,28 @@ EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
   [[ "$selected" == domain-select.example.com ]]
 ' <<<'1' 2>"$TMP_DIR/selector-menu.out" || fail "入口选择器返回值混入了菜单文本"
 grep -F 'https://select.example.com' "$TMP_DIR/selector-menu.out" >/dev/null || fail "入口选择器没有显示候选列表"
+if EMBY_PROXY_STATE_HOME="$TMP_DIR/selector" EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 \
+EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  set --; source "$MANAGER_UNDER_TEST"; select_site_id
+' <<<'99' >"$TMP_DIR/selector-invalid.id" 2>"$TMP_DIR/selector-invalid.out"; then
+  fail "无效入口序号仍返回成功"
+fi
+[[ ! -s "$TMP_DIR/selector-invalid.id" ]] || fail "无效入口序号输出了伪造入口 ID"
+grep -F '已返回上一级菜单' "$TMP_DIR/selector-invalid.out" >/dev/null || fail "无效入口序号没有返回提示"
+
+# 复现真实交互：主菜单选 2 后输入错误入口序号，必须回到主菜单而不是退出脚本。
+EMBY_PROXY_STATE_HOME="$TMP_DIR/selector" EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 \
+EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  set --; source "$MANAGER_UNDER_TEST"
+  print_status() { printf "status\n"; }
+  main_menu
+' <<'INPUT' >"$TMP_DIR/selector-return.out" 2>"$TMP_DIR/selector-return.err"
+2
+99
+q
+INPUT
+[[ "$(grep -c 'Emby 反向代理管理面板' "$TMP_DIR/selector-return.out")" -ge 2 ]] || fail "无效入口序号后没有回到主菜单"
+grep -F '已返回上一级菜单' "$TMP_DIR/selector-return.err" >/dev/null || fail "主菜单没有显示返回提示"
 
 # 主面板：无效输入应留在菜单；1-10 与 q 都必须正确分发。
 TRACE="$TMP_DIR/main.trace"
@@ -92,6 +114,20 @@ EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
   set --; source "$MANAGER_UNDER_TEST"; show_site() { :; }; delete_site() { printf "delete %s\n" "$1" >>"$TRACE"; }; manage_site_menu domain-test.example.com
 ' <<<'7' >/dev/null
 assert_trace "$TMP_DIR/site-delete.trace" 'delete domain-test.example.com'
+
+# 子菜单操作内部即使调用 die，也只能结束本次操作，不能带着整个管理面板退出。
+SURVIVED="$TMP_DIR/action-survived" EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 \
+EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  set --; source "$MANAGER_UNDER_TEST"; show_site() { :; }
+  route_upsert() { die "模拟输入错误"; }
+  manage_site_menu domain-test.example.com
+  printf survived >"$SURVIVED"
+' <<'INPUT' >/dev/null 2>"$TMP_DIR/action-error.out"
+1
+0
+INPUT
+grep -Fx survived "$TMP_DIR/action-survived" >/dev/null || fail "子菜单操作错误导致整个面板退出"
+grep -F '操作未完成，已返回当前菜单' "$TMP_DIR/action-error.out" >/dev/null || fail "子菜单错误没有返回提示"
 
 # 日志、备份、服务三个子菜单覆盖全部选项并能返回上一级。
 TRACE="$TMP_DIR/logs.trace"

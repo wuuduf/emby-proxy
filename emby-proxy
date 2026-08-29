@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="3.1.0-menu"
+readonly VERSION="3.1.1-menu"
 readonly STATE_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
@@ -21,6 +21,7 @@ LOCK_FD=""
 DOCTOR_OK=0
 DOCTOR_WARN=0
 DOCTOR_ERROR=0
+MENU_ACTION_STATUS=0
 
 if [[ -t 1 ]]; then
   RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; CYAN=$'\033[36m'; MAGENTA=$'\033[35m'
@@ -71,8 +72,15 @@ ui_pause() {
 }
 
 menu_run() {
-  "$@" || true
+  MENU_ACTION_STATUS=0
+  if ( "$@" ); then
+    MENU_ACTION_STATUS=0
+  else
+    MENU_ACTION_STATUS=$?
+    warn "操作未完成，已返回当前菜单。"
+  fi
   ui_pause
+  return 0
 }
 
 usage() {
@@ -1132,11 +1140,18 @@ self_update() {
 select_site_id() {
   local -a ids=() file choice
   while IFS= read -r file; do ids+=("$(jq -r '.id' "$file")"); done < <(find "$SITES_DIR" -type f -name '*.json' -print 2>/dev/null | sort)
-  ((${#ids[@]})) || die "没有可管理入口。"
+  if ((${#ids[@]} == 0)); then
+    warn "没有可管理入口。"
+    return 1
+  fi
   # 函数通过 stdout 只返回入口 ID；菜单表格和提示写到 stderr，避免命令替换把整张表混进 ID。
   list_sites >&2
   ui_prompt "请选择入口序号" >&2; read -r choice
-  [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#ids[@]})) || die "序号无效。"
+  case "$choice" in 0|q|Q|"") return 1 ;; esac
+  if [[ ! "$choice" =~ ^[0-9]+$ ]] || ((choice<1 || choice>${#ids[@]})); then
+    warn "序号无效，已返回上一级菜单。"
+    return 1
+  fi
   printf '%s' "${ids[$((choice-1))]}"
 }
 
@@ -1163,7 +1178,7 @@ manage_site_menu() {
       4) menu_run run_doctor "$id" ;;
       5) menu_run view_logs "$id" --recent ;;
       6) menu_run show_stats "$id" 24h ;;
-      7) delete_site "$id"; return ;;
+      7) menu_run delete_site "$id"; (( MENU_ACTION_STATUS == 0 )) && return ;;
       0|q|Q) return ;;
       *) warn "请输入有效序号。" ;;
     esac
@@ -1172,7 +1187,10 @@ manage_site_menu() {
 
 logs_stats_menu() {
   local id choice threshold
-  id="$(select_site_id)"
+  if ! id="$(select_site_id)"; then
+    ui_pause
+    return 0
+  fi
   while true; do
     ui_header "日志与流量" "$id"
     ui_section "访问日志"
@@ -1188,7 +1206,7 @@ logs_stats_menu() {
     ui_prompt; read -r choice
     case "$choice" in
       1) menu_run view_logs "$id" --recent ;;
-      2) view_logs "$id" --follow || true ;;
+      2) menu_run view_logs "$id" --follow ;;
       3) menu_run view_logs "$id" --media ;;
       4) menu_run view_logs "$id" --errors ;;
       5) ui_prompt "慢请求阈值秒数（默认 2）"; read -r threshold; menu_run view_logs "$id" --slow "${threshold:-2}" ;;
@@ -1274,9 +1292,9 @@ main_menu() {
     ui_prompt; read -r choice
     case "$choice" in
       1) menu_run list_sites ;;
-      2) id="$(select_site_id)"; menu_run show_site "$id" ;;
+      2) if id="$(select_site_id)"; then menu_run show_site "$id"; else ui_pause; fi ;;
       3) menu_run run_add_wizard ;;
-      4) id="$(select_site_id)"; manage_site_menu "$id" ;;
+      4) if id="$(select_site_id)"; then manage_site_menu "$id"; else ui_pause; fi ;;
       5) menu_run run_doctor ;;
       6) logs_stats_menu ;;
       7) backup_menu ;;
