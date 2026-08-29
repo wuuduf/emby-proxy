@@ -144,6 +144,29 @@ PROBE_TRACE="$TMP_DIR/probe-family.trace" SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY
 grep -F -- '-4' "$TMP_DIR/probe-family.trace" >/dev/null || fail "源站探测未执行 IPv4 回退"
 grep -F 'IPv4 地址族重试成功（HTTP 403）' "$TMP_DIR/probe-family.err" >/dev/null || fail "源站 IPv4 回退没有给出明确提示"
 
+# 成功摘要必须能完整执行：根路径只显示一个 /，日志路径不能因错误续行被当作命令执行。
+SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY_LIB_ONLY=1 bash -c '
+  set --
+  source "$SCRIPT_UNDER_TEST"
+  PROXY_ENGINE=caddy
+  CADDY_ATTACH_EXISTING=0
+  CADDY_ACCESS_LOG=/var/log/caddy/emby-proxy-summary.example.com-access.log
+  PUBLIC_BASE_URL=https://summary.example.com
+  HTTPS_PORT=443
+  ROUTE_PATHS=(/ /a)
+  ROUTE_URLS=(https://origin-one.example.net https://origin-two.example.net)
+  BACKUP_FILE=/tmp/Caddyfile.test-backup
+  entry_status_code() {
+    [[ "$1" == "${HEALTH_PATH}" ]] && printf 200 || printf 403
+  }
+  verify_result
+' >"$TMP_DIR/verify-summary.out" 2>"$TMP_DIR/verify-summary.err" || fail "成功部署摘要执行失败"
+grep -Fx '  https://summary.example.com/' "$TMP_DIR/verify-summary.out" >/dev/null || fail "根路径成功地址格式错误"
+grep -Fx '  https://summary.example.com/a/' "$TMP_DIR/verify-summary.out" >/dev/null || fail "子路径成功地址格式错误"
+assert_not_contains "$TMP_DIR/verify-summary.out" 'https://summary.example.com//'
+assert_contains "$TMP_DIR/verify-summary.out" '请求日志： /var/log/caddy/emby-proxy-summary.example.com-access.log'
+assert_not_contains "$TMP_DIR/verify-summary.err" 'command not found'
+
 # 旧版无域名托管标记在更新旧域名时应迁移，新域名不能把它删除。
 cat >"$TMP_DIR/Caddyfile.legacy" <<'EOF'
 # BEGIN MANAGED EMBY REVERSE PROXY

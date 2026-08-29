@@ -2009,7 +2009,9 @@ verify_result() {
       printf '\n%s部署完成！%s\n' "$GREEN$BOLD" "$RESET"
       printf '可用的 Emby 反代地址：\n'
       for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
-        printf '  %s%s%s/%s\n' "$BOLD" "$PUBLIC_BASE_URL" "${ROUTE_PATHS[$i]}" "$RESET"
+        request_path="${ROUTE_PATHS[$i]}"
+        [[ "$request_path" == "/" ]] || request_path="${request_path}/"
+        printf '  %s%s%s%s\n' "$BOLD" "$PUBLIC_BASE_URL" "$request_path" "$RESET"
       done
       if [[ ${#ROUTE_PATHS[@]} -gt 1 || "${ROUTE_PATHS[0]}" != "/" ]]; then
         warn "路径模式会剥离 /a 等前缀再回源；请用完整路径测试 Web 与客户端。部分 Emby 客户端/Connect 可能不支持额外子路径。"
@@ -2021,7 +2023,7 @@ verify_result() {
         warn "再次确认：云安全组必须放行入站 TCP 80/${HTTPS_PORT}，且客户端地址必须带 :${HTTPS_PORT}。"
       fi
       if [[ -n "$access_log" ]]; then
-        printf '请求日志： %s%s%s（含响应字节数、总耗时及回源耗时，不记录 Nginx 查询参数；Caddy 会隐藏常见 Emby token）\n' \\
+        printf '请求日志： %s%s%s（含响应字节数、总耗时及回源耗时，不记录 Nginx 查询参数；Caddy 会隐藏常见 Emby token）\n' \
           "$BOLD" "$access_log" "$RESET"
         printf '实时查看： sudo tail -F %q\n' "$access_log"
         printf '媒体过滤： sudo tail -F %q | grep -Ei '\''/Videos/|/Audio/|/stream|\\.m3u8'\''\n' "$access_log"
