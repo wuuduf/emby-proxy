@@ -37,6 +37,8 @@ sudo emby-proxy
 
 不带参数会打开交互菜单，可以查看服务与入口概况、列出反代、查看路径详情、新增入口、添加或修改路径、删除脚本托管路径/入口、导入旧版配置，以及验证完整 Caddy/Nginx 配置。
 
+面板采用“主菜单 → 功能分组 → 子菜单 → 操作完成后返回”的交互方式：进入页面会清屏并显示标题、版本和当前状态；`0` 或 `q` 返回/退出；无效输入只提示并留在当前菜单，不会误执行其他操作。新增入口向导固定为“引擎 → 域名结构 → 访问域名 → 固定源站”四步，危险操作仍需单独确认。菜单只负责调用原有的安全后端，不采集使用数据，也不会为了美化改变 Caddy/Nginx 配置行为。
+
 如果 VPS 已经由旧版脚本配置完成，只想安装管理命令、不新增反代，可以执行：
 
 ```bash
@@ -355,12 +357,14 @@ Nginx 日志只记录 `$uri`，不记录查询参数；Caddy 会隐藏常见 `ap
 修改脚本后可以在不接触系统服务的情况下运行：
 
 ```bash
+bash tests/test-cli.sh
 bash tests/test-config-generation.sh
 bash tests/test-manager.sh
 bash tests/test-manager-stage2.sh
+bash tests/test-menu-flows.sh
 ```
 
-测试会检查域名 HTTPS 配置生成、独立端口、已有 Caddy 站点路径插入及更新、路径冲突拒绝、多域名互不覆盖、旧 Caddy 标记迁移、Nginx 每域名变量隔离、管理索引持久化、旧配置导入、状态到安装参数的无损回放、ACME 阶段没有明文 `proxy_pass`、`X-Forwarded-For` 防伪造、子路径响应头改写幂等性，以及第二阶段的诊断、日志过滤、流量统计、备份校验/恢复和校验式自更新。如果本机已安装 Caddy，还会额外执行完整 Caddy 配置验证；正式部署仍会在 reload 前运行 VPS 上的 `caddy validate` 或 `nginx -t`。
+测试会检查域名 HTTPS 配置生成、独立端口、已有 Caddy 站点路径插入及更新、路径冲突拒绝、多域名互不覆盖、旧 Caddy 标记迁移、Nginx 每域名变量隔离、管理索引持久化、旧配置导入、状态到安装参数的无损回放、ACME 阶段没有明文 `proxy_pass`、`X-Forwarded-For` 防伪造、子路径响应头改写幂等性，以及第二阶段的诊断、日志过滤、流量统计、备份校验/恢复和校验式自更新。菜单流程测试会逐项覆盖主菜单 1-10、全部四个子菜单、无效输入恢复、Caddy/Nginx 两种引擎选择，以及子域名、独立 HTTPS 端口、路径三种入口向导。如果本机已安装 Caddy，还会额外执行完整 Caddy 配置验证；正式部署仍会在 reload 前运行 VPS 上的 `caddy validate` 或 `nginx -t`。
 
 ## 手动恢复
 

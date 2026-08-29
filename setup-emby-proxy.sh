@@ -65,9 +65,10 @@ LOCK_FD=""
 (($# == 0)) && BOOTSTRAP_MENU=1
 
 if [[ -t 1 ]]; then
-  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; CYAN=$'\033[36m'
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
 else
-  RED=""; GREEN=""; YELLOW=""; BLUE=""; BOLD=""; RESET=""
+  RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; BOLD=""; DIM=""; RESET=""
 fi
 
 info()  { printf '%s[信息]%s %s\n' "$BLUE" "$RESET" "$*"; }
@@ -75,6 +76,19 @@ ok()    { printf '%s[成功]%s %s\n' "$GREEN" "$RESET" "$*"; }
 warn()  { printf '%s[提醒]%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
 error() { printf '%s[错误]%s %s\n' "$RED" "$RESET" "$*" >&2; }
 die()   { error "$*"; exit 1; }
+
+is_interactive() { [[ "${EMBY_PROXY_FORCE_INTERACTIVE:-0}" == "1" || -t 0 ]]; }
+ui_rule() { printf '%s%s%s\n' "$DIM" '────────────────────────────────────────────────────────────' "$RESET"; }
+ui_step() {
+  local step="$1" total="$2" title="$3"
+  printf '\n%s%s[%s/%s]%s %s%s%s\n' "$BOLD" "$CYAN" "$step" "$total" "$RESET" "$BOLD" "$title" "$RESET"
+  ui_rule
+}
+ui_choice() {
+  local key="$1" label="$2" hint="${3:-}"
+  printf '  %s%2s%s  %-26s %s%s%s\n' "$CYAN" "$key" "$RESET" "$label" "$DIM" "$hint" "$RESET"
+}
+ui_prompt() { printf '%s%s：%s ' "$BOLD" "${1:-请输入你的选择}" "$RESET"; }
 
 usage() {
   cat <<EOF
@@ -432,7 +446,7 @@ detect_existing_services() {
 confirm_existing_service() {
   local engine="$1" answer=""
   PROXY_ENGINE="$engine"
-  if [[ ! -t 0 ]]; then
+  if ! is_interactive; then
     die "检测到现有 $engine 服务。非交互运行时请显式添加 --engine ${engine}，确认在原服务上新增独立站点。"
   fi
   printf '\n检测到现有 %s。是否在其原配置基础上新增 Emby 反代域名或路径？[Y/n]：' "$engine"
@@ -503,9 +517,12 @@ select_proxy_engine() {
       ok "两种服务均已安装但未运行，将按参数复用现有 ${PROXY_ENGINE}。"
       return
     fi
-    [[ -t 0 ]] || die "Caddy 与 Nginx 均已安装但未运行；请用 --engine 明确选择要复用的服务。"
-    printf '\n两种服务均已安装但未运行，请选择要在原配置基础上使用的服务：\n'
-    printf '  1) Caddy\n  2) Nginx\n请输入 1 或 2：'
+    is_interactive || die "Caddy 与 Nginx 均已安装但未运行；请用 --engine 明确选择要复用的服务。"
+    ui_step 1 4 "选择反向代理引擎"
+    warn "两种服务均已安装但未运行；只会复用所选服务，不会改动另一套配置。"
+    ui_choice 1 "Caddy" "自动 HTTPS，配置更简洁"
+    ui_choice 2 "Nginx" "Certbot 管理证书"
+    ui_prompt "请输入 1 或 2"
     read -r choice
     PROXY_ENGINE="$choice"
     normalize_engine_choice
@@ -516,11 +533,12 @@ select_proxy_engine() {
 
   # 只有此处（两种服务均不存在）才让用户自由选择安装哪一种。
   if [[ -z "$requested" ]]; then
-    [[ -t 0 ]] || die "未检测到 Caddy/Nginx。非交互环境请使用 --engine、--domain 和 --upstream。"
-    printf '\n未检测到 Caddy 或 Nginx，请选择要安装的反代程序：\n'
-    printf '  1) Caddy（配置简单，自动管理 HTTPS 证书）\n'
-    printf '  2) Nginx（使用 Certbot 管理 HTTPS 证书）\n'
-    printf '请输入 1 或 2（默认 1）：'
+    is_interactive || die "未检测到 Caddy/Nginx。非交互环境请使用 --engine、--domain 和 --upstream。"
+    ui_step 1 4 "选择反向代理引擎"
+    info "未检测到现有 Web 服务，完成确认后才会安装。"
+    ui_choice 1 "Caddy（推荐）" "自动申请和续期 HTTPS 证书"
+    ui_choice 2 "Nginx" "使用 Certbot 管理证书"
+    ui_prompt "请输入 1 或 2（默认 1）"
     read -r PROXY_ENGINE
     PROXY_ENGINE="${PROXY_ENGINE:-1}"
     normalize_engine_choice
@@ -681,12 +699,12 @@ prompt_inputs() {
   normalize_access_mode
   normalize_domain_entry_type
 
-  if [[ -t 0 && $domain_type_provided -eq 0 && -z "${HTTPS_PORT:-}" && -z "${PRIMARY_ROUTE_INPUT:-}" && ${#ROUTE_SPECS[@]} -eq 0 ]]; then
-    printf '\n请选择域名入口结构：\n'
-    printf '  1) 独立子域名 + HTTPS 443（首选，兼容性最好）\n'
-    printf '  2) 同一域名 + 独立 HTTPS 端口（每个 Emby 一个端口）\n'
-    printf '  3) 同一域名 + 不同路径（高级兼容模式）\n'
-    printf '请输入 1、2 或 3（默认 1）：'
+  if is_interactive && [[ $domain_type_provided -eq 0 && -z "${HTTPS_PORT:-}" && -z "${PRIMARY_ROUTE_INPUT:-}" && ${#ROUTE_SPECS[@]} -eq 0 ]]; then
+    ui_step 2 4 "选择域名入口结构"
+    ui_choice 1 "独立子域名 + 443（推荐）" "兼容性最好，例如 emby.example.com"
+    ui_choice 2 "同一域名 + HTTPS 端口" "例如 example.com:18443"
+    ui_choice 3 "同一域名 + 不同路径" "高级模式，例如 example.com/a"
+    ui_prompt "请输入 1、2 或 3（默认 1）"
     read -r domain_choice
     DOMAIN_ENTRY_TYPE="${domain_choice:-1}"
     normalize_domain_entry_type
@@ -697,8 +715,8 @@ prompt_inputs() {
       HTTPS_PORT="443" ;;
     port)
       if [[ -z "$HTTPS_PORT" || "$HTTPS_PORT" == "443" ]]; then
-        [[ -t 0 ]] || die "port 模式必须使用 --https-port 指定 1024-65535 的独立端口。"
-        printf '%s请输入独立 HTTPS 监听端口%s（例如 18443）：' "$BOLD" "$RESET"
+        is_interactive || die "port 模式必须使用 --https-port 指定 1024-65535 的独立端口。"
+        ui_prompt "请输入独立 HTTPS 监听端口（例如 18443）"
         read -r HTTPS_PORT
       fi
       normalize_https_port
@@ -709,8 +727,9 @@ prompt_inputs() {
       warn "高级路径模式可能与 Emby Web、原生客户端或 Emby Connect 不兼容；能使用独立子域名/端口时不要选它。" ;;
   esac
   if [[ -z "$PROXY_DOMAIN" ]]; then
-    [[ -t 0 ]] || die "域名模式非交互运行时必须使用 --domain。"
-    printf '%s请输入对外访问的反代域名%s（例如 emby.example.com）：' "$BOLD" "$RESET"
+    is_interactive || die "域名模式非交互运行时必须使用 --domain。"
+    ui_step 3 4 "填写访问域名"
+    ui_prompt "请输入已解析到本 VPS 的域名（例如 emby.example.com）"
     read -r PROXY_DOMAIN
   fi
   normalize_proxy_domain "$PROXY_DOMAIN"
@@ -718,8 +737,8 @@ prompt_inputs() {
 
   if (( CADDY_ATTACH_EXISTING )); then
     if [[ -z "$PRIMARY_ROUTE_INPUT" ]]; then
-      [[ -t 0 ]] || die "域名已存在。非交互运行时必须使用 --path /a 指定要新增的非根路径。"
-      printf '%s请输入要添加到现有域名的访问路径%s（例如 /a 或 /emby2）：' "$BOLD" "$RESET"
+      is_interactive || die "域名已存在。非交互运行时必须使用 --path /a 指定要新增的非根路径。"
+      ui_prompt "请输入要添加到现有域名的路径（例如 /a 或 /emby2）"
       read -r PRIMARY_ROUTE_INPUT
     fi
     primary_route="$(normalize_route_path "$PRIMARY_ROUTE_INPUT")"
@@ -730,15 +749,16 @@ prompt_inputs() {
   fi
 
   if [[ -z "$UPSTREAM_INPUT" ]]; then
-    [[ -t 0 ]] || die "非交互环境请使用 --engine、--domain 和 --upstream。"
-    printf '%s请输入 Emby 源站域名或 URL%s（例如 origin.example.com）：' "$BOLD" "$RESET"
+    is_interactive || die "非交互环境请使用 --engine、--domain 和 --upstream。"
+    ui_step 4 4 "填写 Emby 固定源站"
+    ui_prompt "请输入源站域名或 URL（例如 https://origin.example.com）"
     read -r UPSTREAM_INPUT
     interactive_upstream=1
   fi
 
   ROUTE_PATHS=("$primary_route")
   ROUTE_INPUTS=("$UPSTREAM_INPUT")
-  if [[ -t 0 && $interactive_upstream -eq 1 && "$DOMAIN_ENTRY_TYPE" == "path" ]]; then
+  if is_interactive && [[ $interactive_upstream -eq 1 && "$DOMAIN_ENTRY_TYPE" == "path" ]]; then
     local add_more="" route_path="" route_upstream=""
     while true; do
       printf '是否添加另一个路径反代（例如 /a）？[y/N]：'

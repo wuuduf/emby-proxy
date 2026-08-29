@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="3.0.0-domain-only"
+readonly VERSION="3.1.0-menu"
 readonly STATE_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
@@ -23,9 +23,10 @@ DOCTOR_WARN=0
 DOCTOR_ERROR=0
 
 if [[ -t 1 ]]; then
-  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; CYAN=$'\033[36m'; MAGENTA=$'\033[35m'
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
 else
-  RED=""; GREEN=""; YELLOW=""; BLUE=""; BOLD=""; RESET=""
+  RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; MAGENTA=""; BOLD=""; DIM=""; RESET=""
 fi
 
 info()  { printf '%s[信息]%s %s\n' "$BLUE" "$RESET" "$*"; }
@@ -33,6 +34,46 @@ ok()    { printf '%s[正常]%s %s\n' "$GREEN" "$RESET" "$*"; }
 warn()  { printf '%s[提醒]%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
 error() { printf '%s[错误]%s %s\n' "$RED" "$RESET" "$*" >&2; }
 die()   { error "$*"; exit 1; }
+
+ui_clear() {
+  [[ "${EMBY_PROXY_NO_CLEAR:-0}" == "1" || ! -t 1 ]] || printf '\033[H\033[2J'
+}
+
+ui_rule() {
+  printf '%s%s%s\n' "$DIM" '────────────────────────────────────────────────────────────' "$RESET"
+}
+
+ui_header() {
+  local title="$1" subtitle="${2:-}"
+  ui_clear
+  printf '%s%s╭──────────────────────────────────────────────────────────%s\n' "$BOLD" "$CYAN" "$RESET"
+  printf '%s%s│%s  %s%s%s\n' "$BOLD" "$CYAN" "$RESET" "$BOLD" "$title" "$RESET"
+  printf '%s%s│%s  %s%s · v%s%s\n' "$CYAN" "$DIM" "$RESET" "$DIM" "${subtitle:-Emby Reverse Proxy Manager}" "$VERSION" "$RESET"
+  printf '%s%s╰──────────────────────────────────────────────────────────%s\n' "$BOLD" "$CYAN" "$RESET"
+}
+
+ui_section() { printf '\n%s%s%s%s\n' "$BOLD" "$BLUE" "$1" "$RESET"; }
+ui_item() {
+  local key="$1" label="$2" hint="${3:-}"
+  printf '  %s%2s%s  %-24s %s%s%s\n' "$CYAN" "$key" "$RESET" "$label" "$DIM" "$hint" "$RESET"
+}
+
+ui_prompt() {
+  local prompt="${1:-请输入你的选择}"
+  printf '\n%s%s：%s ' "$BOLD" "$prompt" "$RESET"
+}
+
+ui_pause() {
+  [[ "${EMBY_PROXY_NO_PAUSE:-0}" == "1" || ! -t 0 ]] && return 0
+  printf '\n%s按任意键返回菜单…%s' "$DIM" "$RESET"
+  IFS= read -r -n 1 _ || true
+  printf '\n'
+}
+
+menu_run() {
+  "$@" || true
+  ui_pause
+}
 
 usage() {
   cat <<EOF
@@ -157,14 +198,14 @@ service_line() {
 }
 
 print_status() {
-  local count caddy_count nginx_count domain_count ip_count
+  local view="${1:-full}" count caddy_count nginx_count domain_count ip_count
   ensure_state_dirs
   count="$(site_count)"
   caddy_count="$(find "$SITES_DIR" -type f -name '*.json' -exec jq -r 'select(.engine=="caddy") | 1' {} \; 2>/dev/null | wc -l | tr -d ' ')"
   nginx_count="$(find "$SITES_DIR" -type f -name '*.json' -exec jq -r 'select(.engine=="nginx") | 1' {} \; 2>/dev/null | wc -l | tr -d ' ')"
   domain_count="$(find "$SITES_DIR" -type f -name '*.json' -exec jq -r 'select(.mode=="domain") | 1' {} \; 2>/dev/null | wc -l | tr -d ' ')"
   ip_count="$((count-domain_count))"
-  printf '%sEmby Reverse Proxy Manager%s  %s\n\n' "$BOLD" "$RESET" "$VERSION"
+  [[ "$view" == "compact" ]] || printf '%sEmby Reverse Proxy Manager%s  %s\n\n' "$BOLD" "$RESET" "$VERSION"
   printf '  %s\n' "$(service_line caddy caddy)"
   printf '  %s\n' "$(service_line nginx nginx)"
   printf '\n  托管入口：%s（域名 HTTPS %s，旧 IP HTTP %s〔已停用〕）\n' "$count" "$domain_count" "$ip_count"
@@ -1092,8 +1133,9 @@ select_site_id() {
   local -a ids=() file choice
   while IFS= read -r file; do ids+=("$(jq -r '.id' "$file")"); done < <(find "$SITES_DIR" -type f -name '*.json' -print 2>/dev/null | sort)
   ((${#ids[@]})) || die "没有可管理入口。"
-  list_sites
-  printf '请选择序号：'; read -r choice
+  # 函数通过 stdout 只返回入口 ID；菜单表格和提示写到 stderr，避免命令替换把整张表混进 ID。
+  list_sites >&2
+  ui_prompt "请选择入口序号" >&2; read -r choice
   [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#ids[@]})) || die "序号无效。"
   printf '%s' "${ids[$((choice-1))]}"
 }
@@ -1101,28 +1143,28 @@ select_site_id() {
 manage_site_menu() {
   local id="$1" choice
   while true; do
-    printf '\n'; show_site "$id" || true
-    cat <<EOF
-
-  1. 新增路径
-  2. 修改路径源站
-  3. 删除路径
-  4. 运行入口诊断
-  5. 查看最近访问日志
-  6. 查看最近 24h 流量统计
-  7. 删除整个入口
-  0. 返回
-EOF
-    printf '请选择：'; read -r choice
+    ui_header "入口管理" "$id"
+    show_site "$id" || true
+    ui_section "路由配置"
+    ui_item 1 "新增路径" "添加固定 Emby 源站"
+    ui_item 2 "修改路径源站" "更新现有路径的回源"
+    ui_item 3 "删除路径" "保留入口，移除单条路径"
+    ui_section "检查与维护"
+    ui_item 4 "运行入口诊断" "DNS / TLS / 服务 / 源站"
+    ui_item 5 "查看最近访问日志" "最近 200 条请求"
+    ui_item 6 "查看 24h 流量统计" "流量 / 错误 / 慢请求"
+    ui_item 7 "删除整个入口" "危险操作，会先确认"
+    ui_item 0 "返回上一级" ""
+    ui_prompt; read -r choice
     case "$choice" in
-      1) route_upsert add "$id" ;;
-      2) route_upsert set "$id" ;;
-      3) route_delete "$id" ;;
-      4) run_doctor "$id" || true ;;
-      5) view_logs "$id" --recent ;;
-      6) show_stats "$id" 24h ;;
+      1) menu_run route_upsert add "$id" ;;
+      2) menu_run route_upsert set "$id" ;;
+      3) menu_run route_delete "$id" ;;
+      4) menu_run run_doctor "$id" ;;
+      5) menu_run view_logs "$id" --recent ;;
+      6) menu_run show_stats "$id" 24h ;;
       7) delete_site "$id"; return ;;
-      0) return ;;
+      0|q|Q) return ;;
       *) warn "请输入有效序号。" ;;
     esac
   done
@@ -1131,73 +1173,79 @@ EOF
 logs_stats_menu() {
   local id choice threshold
   id="$(select_site_id)"
-  cat <<EOF
-
-  1. 最近请求
-  2. 实时跟踪
-  3. 媒体请求
-  4. 错误请求
-  5. 慢请求
-  6. 最近 24h 流量统计
-  7. 最近 7d 流量统计
-  0. 返回
-EOF
-  printf '请选择：'; read -r choice
-  case "$choice" in
-    1) view_logs "$id" --recent ;;
-    2) view_logs "$id" --follow ;;
-    3) view_logs "$id" --media ;;
-    4) view_logs "$id" --errors ;;
-    5) printf '慢请求阈值秒数（默认 2）：'; read -r threshold; view_logs "$id" --slow "${threshold:-2}" ;;
-    6) show_stats "$id" 24h ;;
-    7) show_stats "$id" 7d ;;
-    0) return ;;
-    *) warn "请输入有效序号。" ;;
-  esac
+  while true; do
+    ui_header "日志与流量" "$id"
+    ui_section "访问日志"
+    ui_item 1 "最近请求" "最近 200 条"
+    ui_item 2 "实时跟踪" "Ctrl+C 停止"
+    ui_item 3 "媒体请求" "Videos / Audio / stream"
+    ui_item 4 "错误请求" "HTTP 4xx / 5xx"
+    ui_item 5 "慢请求" "自定义耗时阈值"
+    ui_section "流量统计"
+    ui_item 6 "最近 24 小时" "请求数与输出流量"
+    ui_item 7 "最近 7 天" "长期趋势"
+    ui_item 0 "返回上一级" ""
+    ui_prompt; read -r choice
+    case "$choice" in
+      1) menu_run view_logs "$id" --recent ;;
+      2) view_logs "$id" --follow || true ;;
+      3) menu_run view_logs "$id" --media ;;
+      4) menu_run view_logs "$id" --errors ;;
+      5) ui_prompt "慢请求阈值秒数（默认 2）"; read -r threshold; menu_run view_logs "$id" --slow "${threshold:-2}" ;;
+      6) menu_run show_stats "$id" 24h ;;
+      7) menu_run show_stats "$id" 7d ;;
+      0|q|Q) return ;;
+      *) warn "请输入有效序号。" ;;
+    esac
+  done
 }
 
 backup_menu() {
   local choice id keep
-  cat <<EOF
-
-  1. 查看备份列表
-  2. 查看备份详情和差异
-  3. 恢复备份
-  4. 清理旧备份
-  0. 返回
-EOF
-  printf '请选择：'; read -r choice
-  case "$choice" in
-    1) backup_list ;;
-    2) printf '请输入备份 ID：'; read -r id; backup_show "$id" ;;
-    3) printf '请输入备份 ID：'; read -r id; restore_backup "$id" ;;
-    4) printf '保留最近多少个备份（默认 20）：'; read -r keep; backup_clean "${keep:-20}" ;;
-    0) return ;;
-    *) warn "请输入有效序号。" ;;
-  esac
+  while true; do
+    ui_header "备份与恢复" "所有写操作均先备份并校验"
+    ui_item 1 "查看备份列表" "按时间倒序"
+    ui_item 2 "查看备份详情" "元数据、SHA256 与差异"
+    ui_item 3 "安全恢复备份" "验证配置后 Reload"
+    ui_item 4 "清理旧备份" "默认保留最近 20 个"
+    ui_item 0 "返回上一级" ""
+    ui_prompt; read -r choice
+    case "$choice" in
+      1) menu_run backup_list ;;
+      2) ui_prompt "请输入备份 ID"; read -r id; menu_run backup_show "$id" ;;
+      3) ui_prompt "请输入备份 ID"; read -r id; menu_run restore_backup "$id" ;;
+      4) ui_prompt "保留最近多少个备份（默认 20）"; read -r keep; menu_run backup_clean "${keep:-20}" ;;
+      0|q|Q) return ;;
+      *) warn "请输入有效序号。" ;;
+    esac
+  done
 }
 
 service_menu() {
   local choice engine
-  cat <<EOF
-
-  1. 查看服务状态
-  2. 安全 Reload
-  3. Restart
-  4. 查看服务日志
-  5. 验证完整配置
-  0. 返回
-EOF
-  printf '请选择：'; read -r choice
-  case "$choice" in
-    1) service_control status ;;
-    2|3|4)
-      printf '请输入 caddy 或 nginx：'; read -r engine
-      case "$choice" in 2) service_control reload "$engine";; 3) service_control restart "$engine";; 4) service_control logs "$engine";; esac ;;
-    5) config_test ;;
-    0) return ;;
-    *) warn "请输入有效序号。" ;;
-  esac
+  while true; do
+    ui_header "Web 服务管理" "Caddy / Nginx"
+    ui_item 1 "查看服务状态" "版本、运行状态、监听端口"
+    ui_item 2 "安全 Reload" "先验证完整配置"
+    ui_item 3 "Restart" "服务异常时使用"
+    ui_item 4 "查看服务日志" "最近 100 行"
+    ui_item 5 "验证完整配置" "不修改服务"
+    ui_item 0 "返回上一级" ""
+    ui_prompt; read -r choice
+    case "$choice" in
+      1) menu_run service_control status ;;
+      2|3|4)
+        ui_prompt "请输入 caddy 或 nginx"; read -r engine
+        case "$choice" in
+          2) menu_run service_control reload "$engine" ;;
+          3) menu_run service_control restart "$engine" ;;
+          4) menu_run service_control logs "$engine" ;;
+        esac ;;
+      5) menu_run config_test ;;
+      0|q|Q) return ;;
+      *) warn "请输入有效序号。" ;;
+    esac
+  done
 }
 
 main_menu() {
@@ -1207,34 +1255,35 @@ main_menu() {
     warn "检测到可能存在旧版脚本配置，可在菜单中选择“导入旧配置”。"
   fi
   while true; do
-    printf '\n'; print_status
-    cat <<EOF
-
-  1. 查看全部反代入口
-  2. 查看入口详情
-  3. 新增反代入口
-  4. 管理已有入口/路径
-  5. 运行环境与入口诊断
-  6. 日志与流量统计
-  7. 备份、差异与恢复
-  8. Caddy/Nginx 服务管理
-  9. 导入旧版脚本配置
- 10. 检查/更新管理程序
-  0. 退出
-EOF
-    printf '请选择：'; read -r choice
+    ui_header "Emby 反向代理管理面板" "域名 HTTPS · 固定源站 · 安全变更"
+    print_status compact
+    ui_section "入口配置"
+    ui_item 1 "查看全部反代入口" "域名、引擎、路径数"
+    ui_item 2 "查看入口详情" "映射、健康检查"
+    ui_item 3 "新增反代入口" "Caddy / Nginx 向导"
+    ui_item 4 "管理已有入口" "路径、源站、删除"
+    ui_section "观察与维护"
+    ui_item 5 "运行完整诊断" "环境、DNS、TLS、源站"
+    ui_item 6 "日志与流量统计" "媒体、错误、慢请求"
+    ui_item 7 "备份、差异与恢复" "带 SHA256 校验"
+    ui_item 8 "Web 服务管理" "安全 Reload / Restart"
+    ui_section "工具"
+    ui_item 9 "导入旧版配置" "只建立管理索引"
+    ui_item 10 "检查/更新程序" "校验 SHA256 后更新"
+    ui_item 0 "退出面板" "也可以输入 q"
+    ui_prompt; read -r choice
     case "$choice" in
-      1) list_sites ;;
-      2) id="$(select_site_id)"; show_site "$id" ;;
-      3) run_add_wizard ;;
+      1) menu_run list_sites ;;
+      2) id="$(select_site_id)"; menu_run show_site "$id" ;;
+      3) menu_run run_add_wizard ;;
       4) id="$(select_site_id)"; manage_site_menu "$id" ;;
-      5) run_doctor || true ;;
+      5) menu_run run_doctor ;;
       6) logs_stats_menu ;;
       7) backup_menu ;;
       8) service_menu ;;
-      9) import_existing ;;
-      10) self_update ;;
-      0) return ;;
+      9) menu_run import_existing ;;
+      10) menu_run self_update ;;
+      0|q|Q) ui_clear; return ;;
       *) warn "请输入有效序号。" ;;
     esac
   done
