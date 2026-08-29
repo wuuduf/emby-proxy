@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="3.1.3-menu"
+readonly VERSION="3.2.0-menu"
 readonly STATE_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
@@ -16,6 +16,7 @@ readonly OS_RELEASE_FILE="${EMBY_PROXY_OS_RELEASE_FILE:-/etc/os-release}"
 readonly HEALTH_PATH="/_emby_proxy_health"
 readonly INSTALLED_BACKEND="${EMBY_PROXY_INSTALLED_BACKEND:-/usr/local/lib/emby-proxy/setup-emby-proxy.sh}"
 readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
+readonly SHORT_BIN="${EMBY_PROXY_SHORT_BIN:-/usr/local/bin/ep}"
 readonly UPDATE_BASE_URL="${EMBY_PROXY_UPDATE_BASE_URL:-https://raw.githubusercontent.com/wuuduf/emby-reverse-proxy-installer/main}"
 LOCK_FD=""
 DOCTOR_OK=0
@@ -88,6 +89,7 @@ usage() {
 Emby Reverse Proxy Manager $VERSION
 
 用法：
+  ep                                      快速打开交互式管理菜单
   sudo emby-proxy                         打开交互式管理菜单
   sudo emby-proxy status                  查看运行概况
   sudo emby-proxy list                    列出所有托管入口
@@ -1089,6 +1091,41 @@ atomic_install_executable() {
   mv "$staged" "$target"
 }
 
+ensure_short_command() {
+  local link_target=""
+  [[ "$SHORT_BIN" != "$MANAGER_BIN" ]] || return 0
+  if [[ -L "$SHORT_BIN" ]]; then
+    link_target="$(readlink "$SHORT_BIN" 2>/dev/null || true)"
+  fi
+  if [[ -e "$SHORT_BIN" || -L "$SHORT_BIN" ]]; then
+    if [[ "$link_target" == "$MANAGER_BIN" ]]; then
+      return 0
+    fi
+    warn "快捷命令 $SHORT_BIN 已被其他程序占用，未覆盖；仍可使用 sudo emby-proxy。"
+    return 1
+  fi
+  install_managed_dir 0755 "$(dirname "$SHORT_BIN")"
+  ln -s "$MANAGER_BIN" "$SHORT_BIN"
+  [[ ${EUID:-$(id -u)} -ne 0 ]] || chown -h root:root "$SHORT_BIN"
+  return 0
+}
+
+installed_manager_version() {
+  [[ -x "$MANAGER_BIN" ]] || { printf '%s' "$VERSION"; return; }
+  "$MANAGER_BIN" version 2>/dev/null | awk 'NR==1 {print $2}'
+}
+
+restart_updated_manager() {
+  local previous_version="$1" installed_version
+  installed_version="$(installed_manager_version)"
+  [[ -n "$installed_version" && "$installed_version" != "$previous_version" ]] || return 0
+  if [[ -t 0 && -t 1 ]]; then
+    info "更新完成，正在自动重新启动管理面板……"
+    exec "$MANAGER_BIN"
+  fi
+  info "更新完成；下次直接输入 ep 即可打开新版本。"
+}
+
 self_update() {
   local option="${1:-}" temp latest_version answer backup_dir timestamp manager_backup="" backend_backup="" nonce manager_url backend_url checksums_url
   [[ -z "$option" || "$option" == "--check" || "$option" == "--force" ]] || die "用法：emby-proxy update [--check|--force]"
@@ -1131,10 +1168,22 @@ self_update() {
     [[ -z "$backend_backup" ]] || cp -a "$backup_dir/setup-emby-proxy.sh" "$INSTALLED_BACKEND"
     release_lock; die "更新安装失败，已恢复旧文件：$backup_dir"
   fi
+  ensure_short_command || true
   release_lock
   rm -rf "$temp"
   ok "已更新到 ${latest_version}；旧版本备份：$backup_dir"
-  info "重新运行 sudo emby-proxy 即可使用新版本。"
+}
+
+menu_update() {
+  local previous_version="$VERSION"
+  if ( self_update ); then
+    restart_updated_manager "$previous_version"
+    ui_pause
+  else
+    warn "更新未完成，已返回当前菜单。"
+    ui_pause
+  fi
+  return 0
 }
 
 select_site_id() {
@@ -1300,7 +1349,7 @@ main_menu() {
       7) backup_menu ;;
       8) service_menu ;;
       9) menu_run import_existing ;;
-      10) menu_run self_update ;;
+      10) menu_update ;;
       0|q|Q) ui_clear; return ;;
       *) warn "请输入有效序号。" ;;
     esac
@@ -1314,6 +1363,7 @@ main() {
     -V|--version|version) printf 'emby-proxy %s\n' "$VERSION"; return ;;
   esac
   require_root "$@"
+  ensure_short_command || true
   require_jq; ensure_state_dirs
   case "$command" in
     menu) main_menu ;;
@@ -1337,7 +1387,11 @@ main() {
         *) die "备份操作支持：list、show、restore、clean。" ;;
       esac ;;
     service) service_control "${2:-status}" "${3:-}" ;;
-    update) self_update "${2:-}" ;;
+    update)
+      local previous_version="$VERSION"
+      self_update "${2:-}"
+      restart_updated_manager "$previous_version"
+      ;;
     delete) [[ $# -ge 2 ]] || die "用法：emby-proxy delete <入口ID>"; delete_site "$2" ;;
     route)
       [[ $# -ge 3 ]] || die "用法：emby-proxy route add|set|delete <入口ID>"

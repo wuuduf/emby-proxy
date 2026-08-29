@@ -17,6 +17,7 @@ readonly MANAGER_COMMAND_URL="https://raw.githubusercontent.com/wuuduf/emby-reve
 readonly MANAGER_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly MANAGER_LIBEXEC="${EMBY_PROXY_LIBEXEC:-/usr/local/lib/emby-proxy}"
 readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
+readonly SHORT_BIN="${EMBY_PROXY_SHORT_BIN:-/usr/local/bin/ep}"
 
 PROXY_ENGINE=""
 MANAGER_ONLY=0
@@ -846,6 +847,30 @@ apt_install_prerequisites() {
   ok "基础依赖已就绪。"
 }
 
+install_manager_shortcut() {
+  local link_target=""
+  [[ "$SHORT_BIN" != "$MANAGER_BIN" ]] || return 0
+  if [[ -L "$SHORT_BIN" ]]; then
+    link_target="$(readlink "$SHORT_BIN" 2>/dev/null || true)"
+  fi
+  if [[ -e "$SHORT_BIN" || -L "$SHORT_BIN" ]]; then
+    if [[ "$link_target" == "$MANAGER_BIN" ]]; then
+      return 0
+    fi
+    warn "快捷命令 $SHORT_BIN 已被其他程序占用，未覆盖；仍可使用 sudo emby-proxy。"
+    return 1
+  fi
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    install -d -o root -g root -m 0755 "$(dirname "$SHORT_BIN")"
+    ln -s "$MANAGER_BIN" "$SHORT_BIN"
+    chown -h root:root "$SHORT_BIN"
+  else
+    install -d -m 0755 "$(dirname "$SHORT_BIN")"
+    ln -s "$MANAGER_BIN" "$SHORT_BIN"
+  fi
+  return 0
+}
+
 install_manager_command() {
   local install_mode="${1:-fallback}" source_candidate temp manager_source=""
   temp="$(mktemp /tmp/emby-proxy-manager.XXXXXX)"
@@ -889,7 +914,8 @@ install_manager_command() {
     install -m 0755 "$temp" "$MANAGER_BIN"
   fi
   rm -f "$temp"
-  ok "管理命令已安装：sudo emby-proxy"
+  install_manager_shortcut || true
+  ok "管理命令已安装：sudo emby-proxy（快捷命令：ep）"
 }
 
 site_state_id() {

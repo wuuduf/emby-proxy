@@ -151,6 +151,7 @@ printf '#!/usr/bin/env bash\necho old-backend\n' >"$TMP_DIR/installed/lib/setup-
 chmod +x "$TMP_DIR/installed/bin/emby-proxy" "$TMP_DIR/installed/lib/setup-emby-proxy.sh"
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" \
 EMBY_PROXY_MANAGER_BIN="$TMP_DIR/installed/bin/emby-proxy" \
+EMBY_PROXY_SHORT_BIN="$TMP_DIR/installed/bin/ep" \
 EMBY_PROXY_INSTALLED_BACKEND="$TMP_DIR/installed/lib/setup-emby-proxy.sh" \
 EMBY_PROXY_UPDATE_BASE_URL="file://$TMP_DIR/update-source" \
 EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
@@ -160,6 +161,7 @@ EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
 ' || fail "带校验自更新失败"
 cmp "$MANAGER" "$TMP_DIR/installed/bin/emby-proxy" >/dev/null || fail "管理器未更新"
 cmp "$INSTALLER" "$TMP_DIR/installed/lib/setup-emby-proxy.sh" >/dev/null || fail "安装后端未更新"
+[[ -L "$TMP_DIR/installed/bin/ep" && "$(readlink "$TMP_DIR/installed/bin/ep")" == "$TMP_DIR/installed/bin/emby-proxy" ]] || fail "自更新没有补齐 ep 快捷命令"
 
 # 仓库发布校验文件必须与当前两个可执行文件一致。
 [[ -f "$ROOT_DIR/checksums.txt" ]] || fail "仓库缺少 checksums.txt"

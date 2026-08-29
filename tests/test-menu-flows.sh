@@ -62,6 +62,7 @@ EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
   service_menu() { printf "service\n" >>"$TRACE"; }
   import_existing() { printf "import\n" >>"$TRACE"; }
   self_update() { printf "update\n" >>"$TRACE"; }
+  restart_updated_manager() { printf "restart_manager\n" >>"$TRACE"; }
   main_menu
 ' <<'INPUT' >"$TMP_DIR/main.out" 2>"$TMP_DIR/main.err"
 x
@@ -77,7 +78,7 @@ x
 10
 q
 INPUT
-for expected in list 'show domain-test.example.com' add 'manage domain-test.example.com' 'doctor all' logs backup service import update; do
+for expected in list 'show domain-test.example.com' add 'manage domain-test.example.com' 'doctor all' logs backup service import update restart_manager; do
   assert_trace "$TRACE" "$expected"
 done
 grep -F '请输入有效序号' "$TMP_DIR/main.err" >/dev/null || fail "主菜单无效输入没有提示"

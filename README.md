@@ -32,10 +32,10 @@ sudo /tmp/setup-emby-proxy.sh
 安装脚本同时会安装长期管理命令：
 
 ```bash
-sudo emby-proxy
+ep
 ```
 
-不带参数会打开交互菜单，可以查看服务与入口概况、列出反代、查看路径详情、新增入口、添加或修改路径、删除脚本托管路径/入口、导入旧版配置，以及验证完整 Caddy/Nginx 配置。
+`ep` 安装在通用 PATH 下的 `/usr/local/bin/ep`，并安全指向 `/usr/local/sbin/emby-proxy`；普通用户运行时会自动通过 `sudo` 获取所需权限。原完整命令 `sudo emby-proxy` 仍然保留。两者不带参数都会打开交互菜单，可以查看服务与入口概况、列出反代、查看路径详情、新增入口、添加或修改路径、删除脚本托管路径/入口、导入旧版配置，以及验证完整 Caddy/Nginx 配置。
 
 面板采用“主菜单 → 功能分组 → 子菜单 → 操作完成后返回”的交互方式：进入页面会清屏并显示标题、版本和当前状态；`0` 或 `q` 返回/退出；无效输入只提示并留在当前菜单，不会误执行其他操作。新增入口向导固定为“引擎 → 域名结构 → 访问域名 → 固定源站”四步，危险操作仍需单独确认。菜单只负责调用原有的安全后端，不采集使用数据，也不会为了美化改变 Caddy/Nginx 配置行为。
 
@@ -93,9 +93,11 @@ sudo emby-proxy service restart nginx
 sudo emby-proxy service logs caddy
 
 # 校验远端 SHA256 后检查或安装更新
-sudo emby-proxy update --check
-sudo emby-proxy update
+ep update --check
+ep update
 ```
+
+在交互终端完成更新后，管理器会自动以新版本重新启动并回到主面板，不再要求手动重新运行脚本。非交互式更新（例如 CI 或管道）不会强行打开菜单。
 
 管理数据保存在：
 
