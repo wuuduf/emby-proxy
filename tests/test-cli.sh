@@ -15,7 +15,7 @@ grep -F -- '仅支持 domain（域名 HTTPS）' "$TMP_DIR/setup-help" >/dev/null
 if grep -Eq -- '--ip-version|--ip-address|--listen-port|--show-unsafe-ip-mode' "$TMP_DIR/setup-help"; then
   fail "帮助仍暴露已移除的 IP 参数"
 fi
-"$ROOT_DIR/emby-proxy" version | grep -F '3.1.1-menu' >/dev/null || fail "版本输出错误"
+"$ROOT_DIR/emby-proxy" version | grep -F '3.1.2-menu' >/dev/null || fail "版本输出错误"
 
 # 非 root 且没有任何 --route 时，sudo 重执行参数不能因空数组 + nounset 崩溃。
 mkdir -p "$TMP_DIR/bin"

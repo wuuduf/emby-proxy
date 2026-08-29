@@ -125,6 +125,25 @@ assert_not_contains "$TMP_DIR/Caddyfile.final" 'reverse_proxy {'
 parse_upstream 'https://[2001:db8::20]:8443'
 [[ "$UPSTREAM_URL" == 'https://[2001:db8::20]:8443' && "$UPSTREAM_HOST" == '2001:db8::20' ]] || fail "IPv6 源站解析失败"
 
+# 常规双栈探测偶发失败时必须自动锁定 IPv4/IPv6 重试；403 等任意 HTTP 响应都算链路可达。
+PROBE_TRACE="$TMP_DIR/probe-family.trace" SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY_LIB_ONLY=1 bash -c '
+  set --
+  source "$SCRIPT_UNDER_TEST"
+  curl() {
+    local arg
+    printf "%s\n" "$*" >>"$PROBE_TRACE"
+    for arg in "$@"; do
+      if [[ "$arg" == -4 ]]; then printf 403; return 0; fi
+    done
+    printf 000
+    return 28
+  }
+  code="$(probe_url https://dualstack-origin.example.net)"
+  [[ "$code" == 403 ]]
+' 2>"$TMP_DIR/probe-family.err" || fail "源站探测没有在常规连接失败后回退 IPv4"
+grep -F -- '-4' "$TMP_DIR/probe-family.trace" >/dev/null || fail "源站探测未执行 IPv4 回退"
+grep -F 'IPv4 地址族重试成功（HTTP 403）' "$TMP_DIR/probe-family.err" >/dev/null || fail "源站 IPv4 回退没有给出明确提示"
+
 # 旧版无域名托管标记在更新旧域名时应迁移，新域名不能把它删除。
 cat >"$TMP_DIR/Caddyfile.legacy" <<'EOF'
 # BEGIN MANAGED EMBY REVERSE PROXY

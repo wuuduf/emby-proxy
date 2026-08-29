@@ -1034,11 +1034,53 @@ prepare_access_target() {
   check_dns
 }
 
-probe_url() {
-  local url="$1" code
-  code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 20 "$url/" 2>/dev/null || true)"
+probe_url_attempt() {
+  local url="$1" family="${2:-}" code
+  local -a curl_args=(
+    --noproxy '*' -sS -o /dev/null -w '%{http_code}'
+    --connect-timeout 8 --max-time 20
+    --retry 1 --retry-all-errors --retry-delay 1 --retry-max-time 30
+  )
+  [[ -z "$family" ]] || curl_args+=("$family")
+  code="$(curl "${curl_args[@]}" "${url%/}/" 2>/dev/null || true)"
   [[ "$code" =~ ^[1-5][0-9][0-9]$ && "$code" != "000" ]] || return 1
   printf '%s' "$code"
+}
+
+probe_url() {
+  local url="$1" code authority host family
+  local -a fallback_families=()
+
+  # 先按系统地址选择策略检测；任何 1xx-5xx 都证明 TCP/TLS/HTTP 链路可达。
+  if code="$(probe_url_attempt "$url")"; then
+    printf '%s' "$code"
+    return 0
+  fi
+
+  # 双栈 DNS、单栈 VPS 或某个 CDN 节点偶发不可达时，curl 的一次自动选择可能误报。
+  # 再分别锁定地址族重试：只要其中一条链路能取得 HTTP 响应，就允许继续配置。
+  authority="${url#*://}"
+  authority="${authority%%/*}"
+  if [[ "$authority" == \[* ]]; then
+    fallback_families=(-6)
+  else
+    host="${authority%%:*}"
+    if valid_ipv4 "$host"; then
+      fallback_families=(-4)
+    else
+      fallback_families=(-4 -6)
+    fi
+  fi
+
+  warn "常规源站探测未取得 HTTP 响应，正在按 IPv4/IPv6 分别重试……" >&2
+  for family in "${fallback_families[@]}"; do
+    if code="$(probe_url_attempt "$url" "$family")"; then
+      info "IPv${family#-} 地址族重试成功（HTTP ${code}）。" >&2
+      printf '%s' "$code"
+      return 0
+    fi
+  done
+  return 1
 }
 
 probe_upstream() {
@@ -1047,7 +1089,7 @@ probe_upstream() {
     info "检测源站连通性：$UPSTREAM_URL"
     if ! code="$(probe_url "$UPSTREAM_URL")"; then
       error "VPS 无法访问源站 ${UPSTREAM_URL}。"
-      printf '修复方法：检查源站协议/端口、防火墙、IP 白名单和 HTTPS 证书；可在 VPS 上执行：\n  curl -v --connect-timeout 10 %q/\n' "$UPSTREAM_URL" >&2
+      printf '已重试常规连接及可用的 IPv4/IPv6 地址族。\n修复方法：检查源站协议/端口、防火墙、IP 白名单和 HTTPS 证书；可在 VPS 上执行：\n  curl -4 -v --connect-timeout 10 %q/\n  curl -6 -v --connect-timeout 10 %q/\n' "$UPSTREAM_URL" "$UPSTREAM_URL" >&2
       exit 1
     fi
   else
