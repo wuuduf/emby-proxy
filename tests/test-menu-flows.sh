@@ -13,7 +13,7 @@ assert_trace() { grep -Fx -- "$2" "$1" >/dev/null || fail "$1 缺少流程：$2"
 # 真实入口选择器必须只把 ID 返回给命令替换，不能把表格和提示混入 ID。
 mkdir -p "$TMP_DIR/selector/sites.d" "$TMP_DIR/selector/backups"
 cat >"$TMP_DIR/selector/sites.d/domain-select.example.com.json" <<'JSON'
-{"id":"domain-select.example.com","engine":"caddy","mode":"domain","domain":"select.example.com","ip":"","listen_port":443,"public_url":"https://select.example.com","managed_kind":"standalone","routes":[{"path":"/","upstream":"https://origin.example.com"}]}
+{"id":"domain-select.example.com","engine":"caddy","domain":"select.example.com","listen_port":443,"public_url":"https://select.example.com","managed_kind":"standalone","routes":[{"path":"/","upstream":"https://origin.example.com"}]}
 JSON
 EMBY_PROXY_STATE_HOME="$TMP_DIR/selector" EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 \
 EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '

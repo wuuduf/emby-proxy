@@ -11,11 +11,8 @@ bash -n "$ROOT_DIR/setup-emby-proxy.sh" || fail "安装后端语法检查失败"
 bash -n "$ROOT_DIR/emby-proxy" || fail "管理器语法检查失败"
 "$ROOT_DIR/setup-emby-proxy.sh" --help >"$TMP_DIR/setup-help"
 "$ROOT_DIR/emby-proxy" --help >"$TMP_DIR/manager-help"
-grep -F -- '仅支持 domain（域名 HTTPS）' "$TMP_DIR/setup-help" >/dev/null || fail "帮助未声明仅支持域名 HTTPS"
-if grep -Eq -- '--ip-version|--ip-address|--listen-port|--show-unsafe-ip-mode' "$TMP_DIR/setup-help"; then
-  fail "帮助仍暴露已移除的 IP 参数"
-fi
-"$ROOT_DIR/emby-proxy" version | grep -F '3.2.0-menu' >/dev/null || fail "版本输出错误"
+grep -F -- '--domain DOMAIN' "$TMP_DIR/setup-help" >/dev/null || fail "帮助缺少域名参数"
+"$ROOT_DIR/emby-proxy" version | grep -F '3.3.0-menu' >/dev/null || fail "版本输出错误"
 
 # 非 root 且没有任何 --route 时，sudo 重执行参数不能因空数组 + nounset 崩溃。
 mkdir -p "$TMP_DIR/bin"
@@ -52,21 +49,4 @@ SCRIPT_UNDER_TEST="$ROOT_DIR/setup-emby-proxy.sh" EMBY_PROXY_LIB_ONLY=1 bash -c 
 ' || fail "首次运行管理菜单初始化失败"
 grep -Fx 'menu' "$TMP_DIR/bootstrap.trace" >/dev/null || fail "首次运行没有打开管理菜单"
 
-# IP 旧入口及相关参数必须明确拒绝，不得进入配置阶段。
-for arg in --show-unsafe-ip-mode --allow-insecure-ip --ip-address --ip-version --listen-port; do
-  if "$ROOT_DIR/setup-emby-proxy.sh" "$arg" value >/dev/null 2>"$TMP_DIR/reject.out"; then
-    fail "已移除参数仍返回成功：$arg"
-  fi
-  grep -F 'IP 明文 HTTP 模式已移除' "$TMP_DIR/reject.out" >/dev/null || fail "拒绝原因不明确：$arg"
-done
-if SCRIPT_UNDER_TEST="$ROOT_DIR/setup-emby-proxy.sh" EMBY_PROXY_LIB_ONLY=1 bash -c '
-  set --
-  source "$SCRIPT_UNDER_TEST"
-  ACCESS_MODE=ip
-  normalize_access_mode
-' >"$TMP_DIR/mode.out" 2>&1; then
-  fail "--mode ip 仍能通过模式校验"
-fi
-grep -F 'IP 明文 HTTP 模式已移除' "$TMP_DIR/mode.out" >/dev/null || fail "--mode ip 拒绝原因不明确"
-
-printf 'PASS: CLI help/version, sudo re-exec with empty arrays, menu bootstrap, IP mode removal\n'
+printf 'PASS: CLI help/version, sudo re-exec with empty arrays, menu bootstrap\n'

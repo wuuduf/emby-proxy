@@ -18,20 +18,12 @@ assert_count() {
 
 EMBY_PROXY_LIB_ONLY=1 source "$SCRIPT"
 
-# 新版本不再创建 IP HTTP 入口；旧参数与模式必须在 CLI 层拒绝。
-SCRIPT_UNDER_TEST="$SCRIPT" EMBY_PROXY_LIB_ONLY=1 bash -c '
-  set -- --mode ip
-  source "$SCRIPT_UNDER_TEST"
-  normalize_access_mode
-' >/dev/null 2>&1 && fail "IP 模式仍能通过模式校验" || true
-
 # 域名冲突检测按完整 token 匹配，不能把 a.example.com 错认成 ba.example.com。
 domain_pattern="$(domain_token_regex 'a.example.com')"
 printf '%s\n' 'ba.example.com {' | grep -E "$domain_pattern" >/dev/null && fail "域名 token 匹配出现子串误判"
 printf '%s\n' 'a.example.com {' | grep -E "$domain_pattern" >/dev/null || fail "域名 token 未匹配完整域名"
 
 set_domain() {
-  ACCESS_MODE="domain"
   HTTPS_PORT="443"
   DOMAIN_ENTRY_TYPE="path"
   PROXY_DOMAIN="$1"
@@ -70,7 +62,7 @@ assert_contains "$TMP_DIR/nginx-two.conf" "log_format emby_proxy_${two_nginx_id}
 assert_not_contains "$TMP_DIR/nginx-two.conf" "emby_proxy_${one_nginx_id}"
 
 # 同一域名的独立 HTTPS 端口必须生成独立标识、URL、日志和监听，不重复声明 TCP 80。
-ACCESS_MODE="domain"; DOMAIN_ENTRY_TYPE="port"; HTTPS_PORT="18443"; PROXY_DOMAIN="ports.example.com"
+DOMAIN_ENTRY_TYPE="port"; HTTPS_PORT="18443"; PROXY_DOMAIN="ports.example.com"
 normalize_proxy_domain "$PROXY_DOMAIN"
 ROUTE_PATHS=("/"); ROUTE_URLS=("https://origin.example.net"); ROUTE_HOSTS=("origin.example.net")
 write_nginx_https_config "$TMP_DIR/nginx-port.conf"
@@ -257,9 +249,6 @@ if command -v caddy >/dev/null 2>&1; then
     "$TMP_DIR/Caddyfile.final" >"$validation_dir/Caddyfile"
   caddy adapt --config "$validation_dir/Caddyfile" --adapter caddyfile --validate >/dev/null
   caddy adapt --config "$existing_dir/updated.caddy" --adapter caddyfile --validate >/dev/null
-  sed "s#/var/log/caddy/emby-proxy-ip-[^ ]*-access.log#$validation_dir/ip-access.log#g" \
-    "$TMP_DIR/Caddyfile.ip" >"$validation_dir/Caddyfile.ip"
-  caddy adapt --config "$validation_dir/Caddyfile.ip" --adapter caddyfile --validate >/dev/null
 fi
 
 printf 'PASS: domain HTTPS only, existing-site path attach, multi-domain isolation, ACME-only HTTP, XFF hardening, idempotent rewrites\n'

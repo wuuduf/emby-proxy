@@ -1,2 +1,2 @@
-1cc3690d6fad22ef509ac07ba4f4aa044de51cbff52cd6c6be3f10c7d829dce9  emby-proxy
-42b89fdde23466e37809c17e7b68e4414f30a64dda5a6110b14e604a296af5d4  setup-emby-proxy.sh
+3bb33fe367ef26ecaa7696d215e86ca270742f5e37b531a50f15ac9193dcb21b  emby-proxy
+abf37762aebee9755bf5e58079f8b6b9f9ade22bf695b88cf7724e0069eaae64  setup-emby-proxy.sh

@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="3.2.0-menu"
+readonly VERSION="3.3.0-menu"
 readonly STATE_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
@@ -157,6 +157,25 @@ ensure_state_dirs() {
   install_managed_dir 0750 "$SITES_DIR" "$BACKUPS_DIR"
 }
 
+normalize_state_registry() {
+  local file temp
+  while IFS= read -r file; do
+    jq -e 'type=="object" and (.routes|type=="array")' "$file" >/dev/null 2>&1 || continue
+    temp="$(mktemp /tmp/emby-proxy-state-normalize.XXXXXX)"
+    jq '{
+      schema_version:2,
+      id,engine,domain,listen_port,entry_type,public_url,managed_kind,config_file,
+      created_at,updated_at,routes
+    }' "$file" >"$temp"
+    if cmp -s "$file" "$temp"; then
+      rm -f "$temp"
+    else
+      install_managed_file 0640 "$temp" "$file"
+      rm -f "$temp"
+    fi
+  done < <(find "$SITES_DIR" -maxdepth 1 -type f -name 'domain-*.json' -print 2>/dev/null | sort)
+}
+
 acquire_lock() {
   command -v flock >/dev/null 2>&1 || return 0
   mkdir -p /run/lock
@@ -182,7 +201,7 @@ backend_path() {
 
 state_file() {
   local id="$1"
-  [[ "$id" =~ ^(domain|ip)-[A-Za-z0-9._:-]+$ ]] || die "入口 ID 格式无效：$id"
+  [[ "$id" =~ ^domain-[A-Za-z0-9.-]+(-https-[0-9]+)?$ ]] || die "入口 ID 格式无效：$id"
   printf '%s/%s.json' "$SITES_DIR" "$id"
 }
 
@@ -194,7 +213,7 @@ require_site() {
 }
 
 site_count() {
-  find "$SITES_DIR" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' '
+  find "$SITES_DIR" -maxdepth 1 -type f -name 'domain-*.json' 2>/dev/null | wc -l | tr -d ' '
 }
 
 service_line() {
@@ -208,17 +227,15 @@ service_line() {
 }
 
 print_status() {
-  local view="${1:-full}" count caddy_count nginx_count domain_count ip_count
+  local view="${1:-full}" count caddy_count nginx_count
   ensure_state_dirs
   count="$(site_count)"
-  caddy_count="$(find "$SITES_DIR" -type f -name '*.json' -exec jq -r 'select(.engine=="caddy") | 1' {} \; 2>/dev/null | wc -l | tr -d ' ')"
-  nginx_count="$(find "$SITES_DIR" -type f -name '*.json' -exec jq -r 'select(.engine=="nginx") | 1' {} \; 2>/dev/null | wc -l | tr -d ' ')"
-  domain_count="$(find "$SITES_DIR" -type f -name '*.json' -exec jq -r 'select(.mode=="domain") | 1' {} \; 2>/dev/null | wc -l | tr -d ' ')"
-  ip_count="$((count-domain_count))"
+  caddy_count="$(find "$SITES_DIR" -type f -name 'domain-*.json' -exec jq -r 'select(.engine=="caddy") | 1' {} \; 2>/dev/null | wc -l | tr -d ' ')"
+  nginx_count="$(find "$SITES_DIR" -type f -name 'domain-*.json' -exec jq -r 'select(.engine=="nginx") | 1' {} \; 2>/dev/null | wc -l | tr -d ' ')"
   [[ "$view" == "compact" ]] || printf '%sEmby Reverse Proxy Manager%s  %s\n\n' "$BOLD" "$RESET" "$VERSION"
   printf '  %s\n' "$(service_line caddy caddy)"
   printf '  %s\n' "$(service_line nginx nginx)"
-  printf '\n  托管入口：%s（域名 HTTPS %s，旧 IP HTTP %s〔已停用〕）\n' "$count" "$domain_count" "$ip_count"
+  printf '\n  托管入口：%s（域名 HTTPS）\n' "$count"
   printf '  引擎分布：Caddy %s，Nginx %s\n' "$caddy_count" "$nginx_count"
   if command -v ss >/dev/null 2>&1; then
     printf '  监听端口：\n'
@@ -239,56 +256,29 @@ health_url_for_file() {
 }
 
 site_listen_port() {
-  local file="$1" mode port
-  mode="$(jq -r '.mode' "$file")"
+  local file="$1" port
   port="$(jq -r '.listen_port // empty' "$file")"
   if [[ -z "$port" || "$port" == "null" ]]; then
-    [[ "$mode" == "domain" ]] && printf '443'
+    printf '443'
   else
     printf '%s' "$port"
   fi
 }
 
 site_proxy_key() {
-  local file="$1" mode domain port
-  mode="$(jq -r '.mode' "$file")"
-  if [[ "$mode" == "ip" ]]; then
-    printf 'ip-%s-%s' "$(jq -r '.ip' "$file")" "$(site_listen_port "$file")"
-  else
-    domain="$(jq -r '.domain' "$file")"; port="$(site_listen_port "$file")"
-    if [[ "$port" == "443" ]]; then printf '%s' "$domain"; else printf '%s-https-%s' "$domain" "$port"; fi
-  fi
-}
-
-format_ip_public_url() {
-  local ip="$1" port="$2"
-  if [[ "$ip" == *:* ]]; then
-    printf 'http://[%s]:%s' "$ip" "$port"
-  else
-    printf 'http://%s:%s' "$ip" "$port"
-  fi
+  local file="$1" domain port
+  domain="$(jq -r '.domain' "$file")"; port="$(site_listen_port "$file")"
+  if [[ "$port" == "443" ]]; then printf '%s' "$domain"; else printf '%s-https-%s' "$domain" "$port"; fi
 }
 
 local_health_code() {
-  local file="$1" health_url mode domain ip port request_path public_url
+  local file="$1" health_url domain port request_path public_url
   health_url="$(health_url_for_file "$file")"
   public_url="$(jq -r '.public_url' "$file")"
   request_path="${health_url#"$public_url"}"
-  mode="$(jq -r '.mode' "$file")"
-  if [[ "$mode" == "ip" ]]; then
-    ip="$(jq -r '.ip' "$file")"; port="$(jq -r '.listen_port' "$file")"
-    if [[ "$ip" == *:* ]]; then
-      curl --noproxy '*' -g -sS -o /dev/null -w '%{http_code}' -H "Host: [$ip]" \
-        --connect-timeout 3 --max-time 8 "http://[::1]:${port}${request_path}" 2>/dev/null || true
-    else
-      curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' -H "Host: $ip" \
-        --connect-timeout 3 --max-time 8 "http://127.0.0.1:${port}${request_path}" 2>/dev/null || true
-    fi
-  else
-    domain="$(jq -r '.domain' "$file")"; port="$(site_listen_port "$file")"
-    curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --resolve "$domain:$port:127.0.0.1" \
-      --connect-timeout 3 --max-time 8 "${public_url}${request_path}" 2>/dev/null || true
-  fi
+  domain="$(jq -r '.domain' "$file")"; port="$(site_listen_port "$file")"
+  curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --resolve "$domain:$port:127.0.0.1" \
+    --connect-timeout 3 --max-time 8 "${public_url}${request_path}" 2>/dev/null || true
 }
 
 list_sites() {
@@ -305,7 +295,7 @@ list_sites() {
     kind="$(jq -r '.managed_kind' "$file")"
     [[ "$kind" != "caddy_attached" ]] || url+="$(jq -r '.routes[0].path // ""' "$file")"
     printf '%-4s %-38s %-7s %-7s %s\n' "$index" "$url" "$engine" "$routes" "$id"
-  done < <(find "$SITES_DIR" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null | sort)
+  done < <(find "$SITES_DIR" -maxdepth 1 -type f -name 'domain-*.json' -print 2>/dev/null | sort)
   (( index > 0 )) || warn "还没有管理索引。若已有旧配置，请运行：sudo emby-proxy import"
 }
 
@@ -315,7 +305,7 @@ show_site() {
   printf '%s入口详情%s\n\n' "$BOLD" "$RESET"
   jq -r '
     "入口 ID：\(.id)",
-    "访问模式：\(if .mode=="domain" then "域名 HTTPS" else "旧 IP HTTP（已停用）" end)",
+    "访问模式：域名 HTTPS",
     "访问地址：\(.public_url)",
     "反代程序：\(.engine)",
     "管理方式：\(.managed_kind)",
@@ -398,38 +388,27 @@ doctor_firewall() {
 }
 
 doctor_site() {
-  local file="$1" id engine mode config port code path upstream upstream_code domain public_ipv4="$2"
-  id="$(jq -r '.id' "$file")"; engine="$(jq -r '.engine' "$file")"; mode="$(jq -r '.mode' "$file")"
+  local file="$1" id engine config port code path upstream upstream_code domain public_ipv4="$2"
+  id="$(jq -r '.id' "$file")"; engine="$(jq -r '.engine' "$file")"
   config="$(jq -r '.config_file' "$file")"
   printf '\n%s入口：%s%s\n' "$BOLD" "$id" "$RESET"
-  jq -e '.schema_version==1 and (.routes|type=="array") and (.routes|length>0)' "$file" >/dev/null 2>&1 && \
+  jq -e '.schema_version==2 and (.routes|type=="array") and (.routes|length>0)' "$file" >/dev/null 2>&1 && \
     doctor_ok "管理索引结构有效。" || doctor_error "管理索引损坏或没有路径：$file"
   [[ -f "$config" ]] && doctor_ok "配置文件存在：$config" || doctor_error "配置文件不存在：$config"
   if systemctl is-active --quiet "$engine" 2>/dev/null; then doctor_ok "$engine 服务运行中。"; else doctor_error "$engine 服务未运行。"; fi
   doctor_config_quiet "$engine" && doctor_ok "$engine 完整配置验证通过。" || doctor_error "$engine 完整配置验证失败。"
-  if [[ "$mode" == "domain" ]]; then
-    domain="$(jq -r '.domain' "$file")"; port="$(site_listen_port "$file")"
-    doctor_dns "$domain" "$public_ipv4"
-    doctor_certificate "$domain" "$port"
-    if ss -H -lnt 2>/dev/null | awk -v port=":$port" '$4 ~ (port "$") {found=1} END{exit !found}'; then
-      doctor_ok "TCP $port 正在监听。"
-    else
-      doctor_error "TCP $port 没有监听。"
-    fi
+  domain="$(jq -r '.domain' "$file")"; port="$(site_listen_port "$file")"
+  doctor_dns "$domain" "$public_ipv4"
+  doctor_certificate "$domain" "$port"
+  if ss -H -lnt 2>/dev/null | awk -v port=":$port" '$4 ~ (port "$") {found=1} END{exit !found}'; then
+    doctor_ok "TCP $port 正在监听。"
   else
-    port="$(jq -r '.listen_port' "$file")"
-    if ss -H -lnt 2>/dev/null | awk -v port=":$port" '$4 ~ (port "$") {found=1} END{exit !found}'; then
-      doctor_ok "TCP $port 正在监听。"
-    else
-      doctor_error "TCP $port 没有监听。"
-    fi
+    doctor_error "TCP $port 没有监听。"
   fi
   doctor_firewall "$port"
-  if [[ "$mode" == "domain" && "$port" != "80" ]]; then
+  if [[ "$port" != "80" ]]; then
     doctor_firewall 80
     doctor_warn "域名证书申请/续期依赖 TCP 80；云安全组也必须放行 TCP 80。"
-  else
-    doctor_warn "云安全组必须放行入站 TCP ${port}；本机防火墙正常不代表云安全组已放行。"
   fi
   code="$(local_health_code "$file")"
   [[ "$code" == "200" ]] && doctor_ok "本机入口健康检查 HTTP 200。" || doctor_error "本机入口健康检查 HTTP ${code:-无响应}。"
@@ -460,7 +439,7 @@ run_doctor() {
   if [[ -n "$id" ]]; then
     file="$(require_site "$id")"; doctor_site "$file" "$public_ipv4"
   else
-    while IFS= read -r file; do doctor_site "$file" "$public_ipv4"; done < <(find "$SITES_DIR" -type f -name '*.json' -print | sort)
+    while IFS= read -r file; do doctor_site "$file" "$public_ipv4"; done < <(find "$SITES_DIR" -type f -name 'domain-*.json' -print | sort)
     (( $(site_count) > 0 )) || doctor_warn "没有管理索引；可运行 emby-proxy import。"
   fi
   printf '\n诊断汇总：正常 %s，提醒 %s，错误 %s\n' "$DOCTOR_OK" "$DOCTOR_WARN" "$DOCTOR_ERROR"
@@ -468,8 +447,8 @@ run_doctor() {
 }
 
 access_log_for_file() {
-  local file="$1" engine mode key kind
-  engine="$(jq -r '.engine' "$file")"; mode="$(jq -r '.mode' "$file")"; kind="$(jq -r '.managed_kind' "$file")"
+  local file="$1" engine key kind
+  engine="$(jq -r '.engine' "$file")"; kind="$(jq -r '.managed_kind' "$file")"
   [[ "$kind" != "caddy_attached" ]] || return 1
   key="$(site_proxy_key "$file")"
   if [[ "$engine" == "caddy" ]]; then
@@ -578,21 +557,19 @@ show_stats() {
 }
 
 write_state_json() {
-  local id="$1" engine="$2" mode="$3" domain="$4" ip="$5" port="$6" url="$7" kind="$8" config="$9" routes="${10}"
+  local id="$1" engine="$2" domain="$3" port="$4" url="$5" kind="$6" config="$7" routes="$8"
   local file temp now entry_type="port"
   file="$(state_file "$id")"
   [[ ! -e "$file" ]] || return 0
   temp="$(mktemp /tmp/emby-proxy-import.XXXXXX)"
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  if [[ "$mode" == "domain" ]]; then
-    if [[ -n "$port" && "$port" != "443" ]]; then entry_type="port"
-    elif [[ "$(jq 'length' <<<"$routes")" -gt 1 || "$kind" == "caddy_attached" ]]; then entry_type="path"
-    else entry_type="subdomain"; fi
-  fi
-  jq -n --argjson schema_version 1 --arg id "$id" --arg engine "$engine" --arg mode "$mode" \
-    --arg domain "$domain" --arg ip "$ip" --arg port "$port" --arg public_url "$url" \
+  if [[ -n "$port" && "$port" != "443" ]]; then entry_type="port"
+  elif [[ "$(jq 'length' <<<"$routes")" -gt 1 || "$kind" == "caddy_attached" ]]; then entry_type="path"
+  else entry_type="subdomain"; fi
+  jq -n --argjson schema_version 2 --arg id "$id" --arg engine "$engine" \
+    --arg domain "$domain" --arg port "$port" --arg public_url "$url" \
     --arg kind "$kind" --arg entry_type "$entry_type" --arg config "$config" --arg now "$now" --argjson routes "$routes" \
-    '{schema_version:$schema_version,id:$id,engine:$engine,mode:$mode,domain:$domain,ip:$ip,
+    '{schema_version:$schema_version,id:$id,engine:$engine,domain:$domain,
       listen_port:($port|if .=="" then null else tonumber end),entry_type:$entry_type,public_url:$public_url,
       managed_kind:$kind,config_file:$config,created_at:$now,updated_at:$now,routes:$routes}' >"$temp"
   install_managed_file 0640 "$temp" "$file"
@@ -616,28 +593,25 @@ routes_tsv_to_json() {
 }
 
 import_caddy_standalone() {
-  local source="$CADDYFILE" key block address mode domain="" ip="" port="" url id routes imported=0
+  local source="$CADDYFILE" key block address domain port url id routes imported=0
   [[ -f "$source" ]] || return 0
   while IFS= read -r key; do
-    id="domain-$key"
-    mode="domain"; domain="$key"; ip=""; port="443"; url="https://$key"
-    if [[ "$key" == ip-* ]]; then
-      ip="${key#ip-}"; port="${ip##*-}"; ip="${ip%-$port}"
-      id="$key"; mode="ip"; domain=""; url="$(format_ip_public_url "$ip" "$port")"
-    elif [[ "$key" =~ ^(.+)-https-([0-9]+)$ ]]; then
+    domain="$key"; port="443"; id="domain-$domain"; url="https://$domain"
+    if [[ "$key" =~ ^(.+)-https-([0-9]+)$ ]]; then
       domain="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
       id="domain-${domain}-https-${port}"; url="https://${domain}:${port}"
     fi
-    [[ ! -f "$(state_file "$id")" ]] || continue
     block="$(mktemp /tmp/emby-caddy-import.XXXXXX)"
     awk -v begin="# BEGIN MANAGED EMBY REVERSE PROXY: $key" -v end="# END MANAGED EMBY REVERSE PROXY: $key" '
       $0==begin {inside=1; next} $0==end {exit} inside {print}
     ' "$source" >"$block"
     address="$(awk '/^[^#[:space:]].*\{[[:space:]]*$/ {line=$0; sub(/[[:space:]]*\{[[:space:]]*$/, "", line); print line; exit}' "$block")"
-    [[ -n "$address" ]] || { rm -f "$block"; continue; }
+    [[ -n "$address" && "$address" != http://* ]] || { rm -f "$block"; continue; }
+    [[ "$domain" =~ ^[A-Za-z0-9.-]+$ && "$domain" == *.* && "$domain" =~ [A-Za-z] ]] || { rm -f "$block"; continue; }
+    [[ ! -f "$(state_file "$id")" ]] || { rm -f "$block"; continue; }
     routes="$(parse_caddy_routes "$block" | routes_tsv_to_json)"
     [[ "$(jq 'length' <<<"$routes")" -gt 0 ]] || { rm -f "$block"; continue; }
-    write_state_json "$id" caddy "$mode" "$domain" "$ip" "$port" "$url" standalone "$source" "$routes"
+    write_state_json "$id" caddy "$domain" "$port" "$url" standalone "$source" "$routes"
     rm -f "$block"
     ((imported+=1))
   done < <(sed -n 's/^# BEGIN MANAGED EMBY REVERSE PROXY: //p' "$source")
@@ -666,7 +640,7 @@ import_caddy_attached() {
       install_managed_file 0640 "$temp" "$state"; rm -f "$temp"
     else
       routes="$(jq -n --arg path "$path" --arg upstream "${upstream%/}" '[{path:$path,upstream:$upstream}]')"
-      write_state_json "$id" caddy domain "$domain" "" "443" "https://$domain" caddy_attached "$file" "$routes"
+      write_state_json "$id" caddy "$domain" "443" "https://$domain" caddy_attached "$file" "$routes"
     fi
     ((imported+=1))
   done < <(grep -RHn '^# BEGIN MANAGED EMBY EXISTING ROUTE: ' "$(dirname "$CADDYFILE")" \
@@ -685,28 +659,21 @@ parse_nginx_routes() {
 }
 
 import_nginx() {
-  local file marker id mode domain ip="" port="" url routes imported=0
+  local file id domain port url routes imported=0
   [[ -d "$NGINX_CONF_DIR" ]] || { printf '0'; return; }
   for file in "$NGINX_CONF_DIR"/emby-proxy-*.conf; do
     [[ -f "$file" ]] || continue
     grep -qE '^[[:space:]]*proxy_pass[[:space:]]+' "$file" || continue
-    marker="$(sed -n 's/^# MANAGED EMBY SITE: //p' "$file" | head -n1)"
-    if [[ "$marker" == ip-* ]]; then
-      id="$marker"; mode="ip"; ip="${marker#ip-}"; port="${ip##*-}"; ip="${ip%-$port}"
-      domain=""; url="$(format_ip_public_url "$ip" "$port")"
-    else
-      domain="$(awk '$1=="server_name" {gsub(/;/,"",$2); print $2; exit}' "$file")"
-      [[ -n "$domain" ]] || continue
-      port="$(awk '$1=="listen" && $0~/ssl/ {value=$2; sub(/^.*:/,"",value); gsub(/[^0-9]/,"",value); print value; exit}' "$file")"
-      port="${port:-443}"
-      mode="domain"; ip=""
-      if [[ "$port" == "443" ]]; then id="domain-$domain"; url="https://$domain"
-      else id="domain-${domain}-https-${port}"; url="https://${domain}:${port}"; fi
-    fi
+    domain="$(awk '$1=="server_name" {gsub(/;/,"",$2); print $2; exit}' "$file")"
+    [[ "$domain" =~ ^[A-Za-z0-9.-]+$ && "$domain" == *.* && "$domain" =~ [A-Za-z] ]] || continue
+    port="$(awk '$1=="listen" && $0~/ssl/ {value=$2; sub(/^.*:/,"",value); gsub(/[^0-9]/,"",value); print value; exit}' "$file")"
+    [[ -n "$port" ]] || continue
+    if [[ "$port" == "443" ]]; then id="domain-$domain"; url="https://$domain"
+    else id="domain-${domain}-https-${port}"; url="https://${domain}:${port}"; fi
     [[ ! -f "$(state_file "$id")" ]] || continue
     routes="$(parse_nginx_routes "$file" | routes_tsv_to_json)"
     [[ "$(jq 'length' <<<"$routes")" -gt 0 ]] || continue
-    write_state_json "$id" nginx "$mode" "$domain" "$ip" "$port" "$url" standalone "$file" "$routes"
+    write_state_json "$id" nginx "$domain" "$port" "$url" standalone "$file" "$routes"
     ((imported+=1))
   done
   printf '%s' "$imported"
@@ -721,24 +688,20 @@ import_existing() {
 }
 
 run_backend_for_state() {
-  local file="$1" backend engine mode domain ip port kind path upstream i
+  local file="$1" backend engine domain port kind path upstream i
   local -a args=()
   backend="$(backend_path)"
-  engine="$(jq -r '.engine' "$file")"; mode="$(jq -r '.mode' "$file")"
+  engine="$(jq -r '.engine' "$file")"
   kind="$(jq -r '.managed_kind' "$file")"
   args+=(--engine "$engine")
-  if [[ "$mode" == "domain" ]]; then
-    domain="$(jq -r '.domain' "$file")"; port="$(site_listen_port "$file")"
-    args+=(--domain "$domain")
-    if [[ "$port" != "443" ]]; then
-      args+=(--domain-mode port --https-port "$port")
-    elif [[ "$(jq -r '.entry_type // empty' "$file")" == "path" || "$(jq '.routes|length' "$file")" -gt 1 || "$kind" == "caddy_attached" ]]; then
-      args+=(--domain-mode path)
-    else
-      args+=(--domain-mode subdomain)
-    fi
+  domain="$(jq -r '.domain' "$file")"; port="$(site_listen_port "$file")"
+  args+=(--domain "$domain")
+  if [[ "$port" != "443" ]]; then
+    args+=(--domain-mode port --https-port "$port")
+  elif [[ "$(jq -r '.entry_type // empty' "$file")" == "path" || "$(jq '.routes|length' "$file")" -gt 1 || "$kind" == "caddy_attached" ]]; then
+    args+=(--domain-mode path)
   else
-    die "入口 $(jq -r '.id // empty' "$file") 是旧版 IP HTTP 模式，已被移除；管理器不会重建或修改它，请删除后改用域名 HTTPS。"
+    args+=(--domain-mode subdomain)
   fi
   path="$(jq -r '.routes[0].path' "$file")"; upstream="$(jq -r '.routes[0].upstream' "$file")"
   [[ "$kind" != "caddy_attached" ]] || args+=(--path "$path")
@@ -777,10 +740,7 @@ check_route_overlap() {
 route_upsert() {
   local action="$1" id="$2" file path upstream temp exists
   file="$(require_site "$id")"
-  if [[ "$action" == "add" && "$(jq -r '.mode' "$file")" == "ip" ]]; then
-    die "旧版 IP HTTP 入口已停用，不能新增或修改路径；请改用域名 HTTPS 入口。"
-  fi
-  if [[ "$action" == "add" && "$(jq -r '.mode' "$file")" == "domain" && "$(site_listen_port "$file")" != "443" ]]; then
+  if [[ "$action" == "add" && "$(site_listen_port "$file")" != "443" ]]; then
     die "独立 HTTPS 端口模式不再新增子路径；请为新的 Emby 新建另一个 HTTPS 端口入口。"
   fi
   printf '请输入访问路径（例如 /a）：'; read -r path; path="$(validate_route_path "$path")"
@@ -824,7 +784,7 @@ backup_target() {
 
 backup_dir() {
   local backup_id="$1"
-  [[ "$backup_id" =~ ^[0-9]{8}-[0-9]{6}-(domain|ip)-[A-Za-z0-9._:-]+(-[0-9]+)?$ ]] || die "备份 ID 格式无效：$backup_id"
+  [[ "$backup_id" =~ ^[0-9]{8}-[0-9]{6}-domain-[A-Za-z0-9.-]+(-https-[0-9]+)?(-[0-9]+)?$ ]] || die "备份 ID 格式无效：$backup_id"
   [[ -d "$BACKUPS_DIR/$backup_id" ]] || die "找不到备份：$backup_id"
   printf '%s/%s' "$BACKUPS_DIR" "$backup_id"
 }
@@ -1010,19 +970,17 @@ delete_site() {
   else
     [[ -f "$target" ]] || die "Nginx 配置文件不存在：$target"
     backup="$(backup_target "$id" "$target")"; rm -f "$target"
-    if [[ "$(jq -r '.mode' "$file")" == "domain" ]]; then
-      domain="$(jq -r '.domain' "$file")"
-      while IFS= read -r state; do
-        [[ "$state" == "$file" ]] && continue
-        [[ "$(jq -r '.mode // empty' "$state" 2>/dev/null)" == "domain" && "$(jq -r '.domain // empty' "$state" 2>/dev/null)" == "$domain" ]] && other_same=1
-      done < <(find "$SITES_DIR" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null)
-      acme="$NGINX_CONF_DIR/emby-proxy-acme-${domain}.conf"
-      if (( other_same == 0 )) && [[ -f "$acme" ]] && grep -Fx "# MANAGED EMBY ACME: $domain" "$acme" >/dev/null 2>&1; then
-        cp -a "$acme" "$backup/$(basename "$acme")"
-        rm -f "$acme"
-      else
-        acme=""
-      fi
+    domain="$(jq -r '.domain' "$file")"
+    while IFS= read -r state; do
+      [[ "$state" == "$file" ]] && continue
+      [[ "$(jq -r '.domain // empty' "$state" 2>/dev/null)" == "$domain" ]] && other_same=1
+    done < <(find "$SITES_DIR" -maxdepth 1 -type f -name 'domain-*.json' -print 2>/dev/null)
+    acme="$NGINX_CONF_DIR/emby-proxy-acme-${domain}.conf"
+    if (( other_same == 0 )) && [[ -f "$acme" ]] && grep -Fx "# MANAGED EMBY ACME: $domain" "$acme" >/dev/null 2>&1; then
+      cp -a "$acme" "$backup/$(basename "$acme")"
+      rm -f "$acme"
+    else
+      acme=""
     fi
     if ! nginx -t || ! systemctl reload nginx; then
       cp -a "$backup/$(basename "$target")" "$target"
@@ -1188,7 +1146,7 @@ menu_update() {
 
 select_site_id() {
   local -a ids=() file choice
-  while IFS= read -r file; do ids+=("$(jq -r '.id' "$file")"); done < <(find "$SITES_DIR" -type f -name '*.json' -print 2>/dev/null | sort)
+  while IFS= read -r file; do ids+=("$(jq -r '.id' "$file")"); done < <(find "$SITES_DIR" -type f -name 'domain-*.json' -print 2>/dev/null | sort)
   if ((${#ids[@]} == 0)); then
     warn "没有可管理入口。"
     return 1
@@ -1364,7 +1322,7 @@ main() {
   esac
   require_root "$@"
   ensure_short_command || true
-  require_jq; ensure_state_dirs
+  require_jq; ensure_state_dirs; normalize_state_registry
   case "$command" in
     menu) main_menu ;;
     status) print_status ;;

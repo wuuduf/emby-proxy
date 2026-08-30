@@ -48,30 +48,6 @@ one.example.com {
 }
 # END MANAGED EMBY REVERSE PROXY: one.example.com
 
-# BEGIN MANAGED EMBY REVERSE PROXY: ip-203.0.113.10-18080
-http://203.0.113.10:18080 {
-    handle /_emby_proxy_health {
-        respond "ok" 200
-    }
-    handle {
-        reverse_proxy http://127.0.0.1:8096 {
-        }
-    }
-}
-# END MANAGED EMBY REVERSE PROXY: ip-203.0.113.10-18080
-
-# BEGIN MANAGED EMBY REVERSE PROXY: ip-2001:db8::10-18082
-http://[2001:db8::10]:18082 {
-    handle /_emby_proxy_health {
-        respond "ok" 200
-    }
-    handle {
-        reverse_proxy https://[2001:db8::20]:8443 {
-        }
-    }
-}
-# END MANAGED EMBY REVERSE PROXY: ip-2001:db8::10-18082
-
 # BEGIN MANAGED EMBY REVERSE PROXY: one.example.com-https-18443
 https://one.example.com:18443 {
     handle {
@@ -131,15 +107,13 @@ MANAGER_UNDER_TEST="$MANAGER" bash -c '
   source "$MANAGER_UNDER_TEST"
   require_jq
   ensure_state_dirs
-  [[ "$(import_caddy_standalone)" == 4 ]]
+  [[ "$(import_caddy_standalone)" == 2 ]]
   [[ "$(import_caddy_attached)" == 1 ]]
   [[ "$(import_nginx)" == 2 ]]
 ' || fail "旧配置导入失败"
 
-assert_jq "$TMP_DIR/state/sites.d/domain-one.example.com.json" '.engine=="caddy" and .mode=="domain" and (.routes|length)==2'
+assert_jq "$TMP_DIR/state/sites.d/domain-one.example.com.json" '.engine=="caddy" and (.routes|length)==2'
 assert_jq "$TMP_DIR/state/sites.d/domain-one.example.com.json" 'any(.routes[]; .path=="/" and .upstream=="https://origin-one.example.net")'
-assert_jq "$TMP_DIR/state/sites.d/ip-203.0.113.10-18080.json" '.mode=="ip" and .listen_port==18080 and .public_url=="http://203.0.113.10:18080"'
-assert_jq "$TMP_DIR/state/sites.d/ip-2001:db8::10-18082.json" '.mode=="ip" and .listen_port==18082 and .public_url=="http://[2001:db8::10]:18082"'
 assert_jq "$TMP_DIR/state/sites.d/domain-existing.example.com.json" '.managed_kind=="caddy_attached" and .routes[0].path=="/media"'
 assert_jq "$TMP_DIR/state/sites.d/domain-nginx.example.com.json" '.engine=="nginx" and (.routes|length)==2'
 assert_jq "$TMP_DIR/state/sites.d/domain-one.example.com-https-18443.json" '.engine=="caddy" and .listen_port==18443 and .entry_type=="port" and .public_url=="https://one.example.com:18443"'
@@ -186,17 +160,6 @@ assert_arg "$TMP_DIR/backend-port.args" 'port'
 assert_arg "$TMP_DIR/backend-port.args" '--https-port'
 assert_arg "$TMP_DIR/backend-port.args" '18443'
 
-# 旧 IP 入口只能读取/清理，管理器不得回放或重建。
-if FAKE_ARGS_OUT="$TMP_DIR/backend-ip.args" EMBY_PROXY_BACKEND="$TMP_DIR/fake-backend" \
-EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
-  set --
-  source "$MANAGER_UNDER_TEST"
-  run_backend_for_state "$EMBY_PROXY_STATE_HOME/sites.d/ip-203.0.113.10-18080.json"
-' >"$TMP_DIR/backend-ip.out" 2>&1; then
-  fail "旧 IP 入口仍可被管理器重建"
-fi
-grep -F '旧版 IP HTTP 模式，已被移除' "$TMP_DIR/backend-ip.out" >/dev/null || fail "旧 IP 入口拒绝原因不明确"
-
 FAKE_ARGS_OUT="$TMP_DIR/route-add.args" EMBY_PROXY_BACKEND="$TMP_DIR/fake-backend" \
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
   set --
@@ -212,7 +175,6 @@ assert_arg "$TMP_DIR/route-add.args" '/c=https://origin-c.example.net'
 EMBY_PROXY_STATE_HOME="$TMP_DIR/persisted" EMBY_PROXY_LIB_ONLY=1 INSTALLER_UNDER_TEST="$INSTALLER" bash -c '
   set --
   source "$INSTALLER_UNDER_TEST"
-  ACCESS_MODE=domain
   PROXY_ENGINE=caddy
   PROXY_DOMAIN=persist.example.com
   HTTPS_PORT=443
@@ -223,7 +185,18 @@ EMBY_PROXY_STATE_HOME="$TMP_DIR/persisted" EMBY_PROXY_LIB_ONLY=1 INSTALLER_UNDER
   ROUTE_HOSTS=(origin-persist.example.net)
   persist_site_state >/dev/null
 ' || fail "安装后端写入管理索引失败"
-assert_jq "$TMP_DIR/persisted/sites.d/domain-persist.example.com.json" '.engine=="caddy" and .mode=="domain" and (.routes|length)==1'
+assert_jq "$TMP_DIR/persisted/sites.d/domain-persist.example.com.json" '.schema_version==2 and .engine=="caddy" and (.routes|length)==1 and (keys|length)==12'
+
+# 管理器启动时按当前白名单整理旧索引，移除已经废弃的多余字段。
+jq '.schema_version=1 | .obsolete="remove-me"' \
+  "$TMP_DIR/persisted/sites.d/domain-persist.example.com.json" >"$TMP_DIR/persisted/old.json"
+mv "$TMP_DIR/persisted/old.json" "$TMP_DIR/persisted/sites.d/domain-persist.example.com.json"
+EMBY_PROXY_STATE_HOME="$TMP_DIR/persisted" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  set --
+  source "$MANAGER_UNDER_TEST"
+  normalize_state_registry
+' || fail "管理索引整理失败"
+assert_jq "$TMP_DIR/persisted/sites.d/domain-persist.example.com.json" '.schema_version==2 and (has("obsolete")|not) and (keys|length)==12'
 
 # 删除只能移除精确托管片段，必须保留手工站点和其他独立入口。
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_CADDYFILE="$TMP_DIR/caddy/Caddyfile" \
@@ -243,7 +216,6 @@ MANAGER_UNDER_TEST="$MANAGER" bash -c '
 ' >/dev/null || fail "安全删除托管片段失败"
 grep -F 'respond "original" 200' "$TMP_DIR/caddy/existing.caddy" >/dev/null || fail "删除附加路径破坏了手工站点"
 ! grep -F 'MANAGED EMBY EXISTING ROUTE' "$TMP_DIR/caddy/existing.caddy" >/dev/null || fail "附加路径标记未删除"
-grep -F '# BEGIN MANAGED EMBY REVERSE PROXY: ip-203.0.113.10-18080' "$TMP_DIR/caddy/Caddyfile" >/dev/null || fail "删除一个入口误删了其他入口"
 ! grep -Fx '# BEGIN MANAGED EMBY REVERSE PROXY: one.example.com' "$TMP_DIR/caddy/Caddyfile" >/dev/null || fail "独立入口未删除"
 grep -Fx '# BEGIN MANAGED EMBY REVERSE PROXY: one.example.com-https-18443' "$TMP_DIR/caddy/Caddyfile" >/dev/null || fail "删除 443 入口误删同域名自定义端口"
 [[ ! -e "$TMP_DIR/nginx/emby-proxy-nginx.example.com.conf" ]] || fail "Nginx 独立入口未删除"
@@ -260,6 +232,6 @@ EMBY_PROXY_LIB_ONLY=1 INSTALLER_UNDER_TEST="$INSTALLER" bash -c '
 [[ -x "$TMP_DIR/installed/lib/setup-emby-proxy.sh" ]] || fail "未安装配置后端"
 [[ -x "$TMP_DIR/installed/bin/emby-proxy" ]] || fail "未安装 emby-proxy 命令"
 [[ -L "$TMP_DIR/installed/bin/ep" && "$(readlink "$TMP_DIR/installed/bin/ep")" == "$TMP_DIR/installed/bin/emby-proxy" ]] || fail "未安装 ep 快捷命令"
-"$TMP_DIR/installed/bin/ep" version | grep -F '3.2.0-menu' >/dev/null || fail "ep 快捷命令不可运行"
+"$TMP_DIR/installed/bin/ep" version | grep -F '3.3.0-menu' >/dev/null || fail "ep 快捷命令不可运行"
 
 printf 'PASS: manager install/import, state registry, route replay, exact-marker deletion\n'

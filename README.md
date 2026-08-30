@@ -2,7 +2,7 @@
 
 给 Emby 源站快速套一层域名 HTTPS 反代. 支持 Caddy / Nginx、多个入口、独立 HTTPS 端口和同域名多路径.
 
-脚本只允许固定源站, 不提供 IP 明文入口或任意目标转发, 避免 VPS 被当成通用代理.
+脚本只允许固定源站, 不提供任意目标转发, 避免 VPS 被当成通用代理.
 
 本项目由 [wuuduf](https://github.com/wuuduf) 编写和维护.
 
@@ -196,7 +196,6 @@ sudo emby-proxy add --engine caddy --domain emby.example.com --domain-mode path 
 - 路径模式是否可用取决于具体 Emby 客户端;
 - 不会绕过源站 TLS 证书错误或关闭证书验证;
 - 源站只能包含协议、主机和端口, 不能带路径、账号或查询参数;
-- IP 明文 HTTP 模式已移除, 旧 IP 入口只允许查看或删除.
 
 ## 测试
 

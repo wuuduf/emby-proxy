@@ -23,7 +23,6 @@ PROXY_ENGINE=""
 MANAGER_ONLY=0
 BOOTSTRAP_MENU=0
 ENTRY_WIZARD=0
-ACCESS_MODE=""
 ACCESS_SCHEME=""
 HTTPS_PORT=""
 DOMAIN_ENTRY_TYPE=""
@@ -102,7 +101,6 @@ usage() {
 选项：
   -e, --engine ENGINE       反代程序：caddy 或 nginx；不填写时交互选择
       --manager-only        只安装 emby-proxy 管理命令并导入旧配置，不新增反代
-  -m, --mode MODE           访问模式：仅支持 domain（域名 HTTPS）
   -d, --domain DOMAIN       对外访问的反代域名（必须已解析到本 VPS）
       --https-port PORT     域名模式的 HTTPS 端口，默认 443；自定义范围 1024-65535
       --domain-mode MODE    域名入口：subdomain、port 或 path
@@ -125,11 +123,6 @@ while (($#)); do
       MANAGER_ONLY=1; shift ;;
     --entry-wizard)
       ENTRY_WIZARD=1; BOOTSTRAP_MENU=0; shift ;;
-    --show-unsafe-ip-mode|--allow-insecure-ip|--ip-address|--ip-version|--listen-port)
-      die "IP 明文 HTTP 模式已移除。请使用已解析域名的 HTTPS 模式；旧入口不会被脚本自动覆盖。" ;;
-    -m|--mode)
-      [[ $# -ge 2 ]] || die "$1 缺少参数。"
-      ACCESS_MODE="$2"; shift 2 ;;
     -d|--domain)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       PROXY_DOMAIN="$2"; shift 2 ;;
@@ -163,7 +156,6 @@ require_root() {
     [[ -n "$PROXY_ENGINE" ]] && sudo_args+=(--engine "$PROXY_ENGINE")
     (( MANAGER_ONLY )) && sudo_args+=(--manager-only)
     (( ENTRY_WIZARD )) && sudo_args+=(--entry-wizard)
-    [[ -n "$ACCESS_MODE" ]] && sudo_args+=(--mode "$ACCESS_MODE")
     [[ -n "$PROXY_DOMAIN" ]] && sudo_args+=(--domain "$PROXY_DOMAIN")
     [[ -n "$HTTPS_PORT" ]] && sudo_args+=(--https-port "$HTTPS_PORT")
     [[ -n "$DOMAIN_ENTRY_TYPE" ]] && sudo_args+=(--domain-mode "$DOMAIN_ENTRY_TYPE")
@@ -258,16 +250,6 @@ valid_ipv6() {
   fi
 }
 
-normalize_access_mode() {
-  ACCESS_MODE="$(printf '%s' "$(trim "$ACCESS_MODE")" | tr '[:upper:]' '[:lower:]')"
-  case "$ACCESS_MODE" in
-    1|domain|https) ACCESS_MODE="domain" ;;
-    2|ip|http|ipv4|ipv6|ip-http)
-      die "IP 明文 HTTP 模式已移除。请使用已解析域名的 HTTPS 模式；旧入口不会被脚本自动覆盖。" ;;
-    *) die "访问模式仅支持 domain（域名 HTTPS）；IP 明文 HTTP 模式已移除。" ;;
-  esac
-}
-
 normalize_https_port() {
   HTTPS_PORT="$(trim "${HTTPS_PORT:-443}")"
   [[ "$HTTPS_PORT" =~ ^[0-9]{1,5}$ ]] || die "HTTPS 监听端口必须是数字：$HTTPS_PORT"
@@ -336,7 +318,7 @@ normalize_proxy_domain() {
     NGINX_ACCESS_LOG="/var/log/nginx/emby-proxy-${PROXY_KEY}-access.log"
   fi
   PUBLIC_BASE_URL="https://$PUBLIC_AUTHORITY"
-  # 稳定短哈希既隔离不同入口，也避免长域名/IP+端口使 Nginx variables_hash 超出默认桶大小。
+  # 稳定短哈希既隔离不同入口，也避免长域名和端口使 Nginx variables_hash 超出默认桶大小。
   set_nginx_id "$PROXY_KEY"
   NGINX_ACME_CONFIG="/etc/nginx/conf.d/emby-proxy-acme-${PROXY_DOMAIN}.conf"
 }
@@ -394,11 +376,7 @@ parse_upstream() {
     [[ "$host" =~ ^[A-Za-z0-9.-]+$ && "$host" != .* && "$host" != *. && "$host" != *..* ]] || die "源站主机名无效：$host"
   fi
   host_lower="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
-  if [[ "$host_lower" == "$PROXY_DOMAIN" ]]; then
-    if [[ "$ACCESS_MODE" == "domain" ]]; then
-      die "源站域名不能与反代域名相同，否则会形成代理循环。"
-    fi
-  fi
+  [[ "$host_lower" != "$PROXY_DOMAIN" ]] || die "源站域名不能与反代域名相同，否则会形成代理循环。"
   UPSTREAM_HOST="$host_lower"
 
   if [[ -n "$scheme" ]]; then
@@ -696,8 +674,6 @@ prompt_inputs() {
   local interactive_upstream=0 primary_route="/" i domain_choice="" domain_type_provided=0
   [[ -z "$DOMAIN_ENTRY_TYPE" ]] || domain_type_provided=1
   select_proxy_engine
-  ACCESS_MODE="domain"
-  normalize_access_mode
   normalize_domain_entry_type
 
   if is_interactive && [[ $domain_type_provided -eq 0 && -z "${HTTPS_PORT:-}" && -z "${PRIMARY_ROUTE_INPUT:-}" && ${#ROUTE_SPECS[@]} -eq 0 ]]; then
@@ -955,14 +931,14 @@ persist_site_state() {
   fi
   routes_json="$(jq -c 'sort_by([if .path=="/" then 0 else 1 end,.path])' <<<"$routes_json")"
   jq -n \
-    --argjson schema_version 1 \
-    --arg id "$site_id" --arg engine "$PROXY_ENGINE" --arg mode "$ACCESS_MODE" \
+    --argjson schema_version 2 \
+    --arg id "$site_id" --arg engine "$PROXY_ENGINE" \
     --arg domain "$PROXY_DOMAIN" \
-    --arg ip "" --arg listen_port "$HTTPS_PORT" --arg public_url "$PUBLIC_BASE_URL" \
+    --arg listen_port "$HTTPS_PORT" --arg public_url "$PUBLIC_BASE_URL" \
     --arg entry_type "$DOMAIN_ENTRY_TYPE" \
     --arg managed_kind "$managed_kind" --arg config_file "$config_file" \
     --arg created_at "$created_at" --arg updated_at "$now" --argjson routes "$routes_json" \
-    '{schema_version:$schema_version,id:$id,engine:$engine,mode:$mode,domain:$domain,ip:$ip,
+    '{schema_version:$schema_version,id:$id,engine:$engine,domain:$domain,
       listen_port:($listen_port|if .=="" then null else tonumber end),entry_type:$entry_type,public_url:$public_url,
       managed_kind:$managed_kind,config_file:$config_file,created_at:$created_at,updated_at:$updated_at,routes:$routes}' \
     >"$temp"
