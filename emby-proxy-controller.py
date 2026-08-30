@@ -117,11 +117,15 @@ class Controller:
             dns_result = None
             if selected and changed:
                 dns_result = self._update_dns(selected)
-            self.state["active_node"] = selected
+            # Cloudflare 更新失败时不要确认切换，否则下一轮会认为已经完成，
+            # 从而永远不再重试；成功或未配置 DNS 才提交 active_node。
+            if not (isinstance(dns_result, dict) and dns_result.get("ok") is False):
+                self.state["active_node"] = selected
             self.state["last_reconcile"] = now()
             self.state["last_dns_result"] = dns_result
             self.save()
-            return {"selected_node": selected, "previous_node": previous, "changed": changed, "dns": dns_result}
+            return {"selected_node": selected, "active_node": self.state.get("active_node"),
+                    "previous_node": previous, "changed": changed, "dns": dns_result}
 
     def _update_dns(self, node_id: str) -> dict:
         dns = self.state.get("dns") or {}
