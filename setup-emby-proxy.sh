@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_SOURCE_URL="${EMBY_PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/wuuduf/emby-reverse-proxy-installer/main/setup-emby-proxy.sh}"
+readonly SCRIPT_SOURCE_URL="${EMBY_PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/main/setup-emby-proxy.sh}"
 
 # `bash <(curl -fsSL URL)` 的入口是 /dev/fd/*。该 fd 会随着 bash 解析脚本
 # 逐步前移，不能在后面直接复制来执行 sudo 重入或安装后端，因此先落到稳定
@@ -46,7 +46,7 @@ readonly NGINX_LEGACY_CONFIG="/etc/nginx/conf.d/emby-proxy-managed.conf"
 readonly NGINX_ACME_ROOT="/var/www/emby-proxy-acme"
 readonly NGINX_HASH_CONFIG="${EMBY_PROXY_NGINX_HASH_CONFIG:-/etc/nginx/conf.d/00-emby-proxy-hash.conf}"
 readonly HEALTH_PATH="/_emby_proxy_health"
-readonly MANAGER_COMMAND_URL="${EMBY_PROXY_MANAGER_URL:-https://raw.githubusercontent.com/wuuduf/emby-reverse-proxy-installer/main/emby-proxy}"
+readonly MANAGER_COMMAND_URL="${EMBY_PROXY_MANAGER_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/main/emby-proxy}"
 readonly MANAGER_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly MANAGER_LIBEXEC="${EMBY_PROXY_LIBEXEC:-/usr/local/lib/emby-proxy}"
 readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
