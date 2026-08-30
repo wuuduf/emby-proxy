@@ -1,4 +1,4 @@
-# EP（Emby Proxy）
+# emby-proxy
 
 给 Emby 源站快速套一层域名 HTTPS 反代. 支持 Caddy / Nginx、多个入口、独立 HTTPS 端口和同域名多路径.
 
@@ -6,7 +6,7 @@
 
 本项目由 [wuuduf](https://github.com/wuuduf) 编写和维护.
 
-项目短名为 **EP**；仓库地址暂保持不变，以兼容已经部署的更新命令.
+项目短命令为 **ep**；仓库改名后仍会保留现有更新地址兼容性.
 
 ## 安装
 
