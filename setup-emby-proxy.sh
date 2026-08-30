@@ -4,8 +4,41 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
-readonly SCRIPT_NAME="$(basename "$SCRIPT_PATH")"
+readonly SCRIPT_SOURCE_URL="${EMBY_PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/wuuduf/emby-reverse-proxy-installer/main/setup-emby-proxy.sh}"
+
+# `bash <(curl -fsSL URL)` 的入口是 /dev/fd/*。该 fd 会随着 bash 解析脚本
+# 逐步前移，不能在后面直接复制来执行 sudo 重入或安装后端，因此先落到稳定
+# 的临时文件。普通本地执行仍然使用原始脚本路径，不增加额外网络请求。
+SCRIPT_ORIGIN="${BASH_SOURCE[0]}"
+SCRIPT_PATH="$(readlink -f "$SCRIPT_ORIGIN" 2>/dev/null || printf '%s' "$SCRIPT_ORIGIN")"
+SCRIPT_TEMP_PATH="${EMBY_PROXY_TEMP_SCRIPT:-}"
+if [[ "$SCRIPT_ORIGIN" == /dev/fd/* || "$SCRIPT_ORIGIN" == /proc/*/fd/* || ! -f "$SCRIPT_PATH" ]]; then
+  if [[ -n "$SCRIPT_TEMP_PATH" && -f "$SCRIPT_TEMP_PATH" ]]; then
+    SCRIPT_PATH="$SCRIPT_TEMP_PATH"
+  else
+    SCRIPT_TEMP_PATH="$(mktemp /tmp/emby-proxy-installer.XXXXXX)"
+    if command -v curl >/dev/null 2>&1; then
+      if ! curl -fsSL --connect-timeout 8 --max-time 30 "$SCRIPT_SOURCE_URL" -o "$SCRIPT_TEMP_PATH"; then
+        printf '[错误] 无法读取安装脚本，请检查网络后重试。\n' >&2
+        rm -f -- "$SCRIPT_TEMP_PATH"
+        exit 1
+      fi
+    elif command -v wget >/dev/null 2>&1; then
+      if ! wget -q --timeout=30 -O "$SCRIPT_TEMP_PATH" "$SCRIPT_SOURCE_URL"; then
+        printf '[错误] 无法读取安装脚本，请检查网络后重试。\n' >&2
+        rm -f -- "$SCRIPT_TEMP_PATH"
+        exit 1
+      fi
+    else
+      printf '[错误] 需要 curl 或 wget 才能从进程替换入口启动。\n' >&2
+      rm -f -- "$SCRIPT_TEMP_PATH"
+      exit 1
+    fi
+    chmod 0755 "$SCRIPT_TEMP_PATH"
+  fi
+  SCRIPT_PATH="$SCRIPT_TEMP_PATH"
+fi
+SCRIPT_NAME="$(basename "$SCRIPT_PATH")"
 readonly CADDYFILE="/etc/caddy/Caddyfile"
 readonly BEGIN_MARKER="# BEGIN MANAGED EMBY REVERSE PROXY"
 readonly END_MARKER="# END MANAGED EMBY REVERSE PROXY"
@@ -13,7 +46,7 @@ readonly NGINX_LEGACY_CONFIG="/etc/nginx/conf.d/emby-proxy-managed.conf"
 readonly NGINX_ACME_ROOT="/var/www/emby-proxy-acme"
 readonly NGINX_HASH_CONFIG="${EMBY_PROXY_NGINX_HASH_CONFIG:-/etc/nginx/conf.d/00-emby-proxy-hash.conf}"
 readonly HEALTH_PATH="/_emby_proxy_health"
-readonly MANAGER_COMMAND_URL="https://raw.githubusercontent.com/wuuduf/emby-reverse-proxy-installer/main/emby-proxy"
+readonly MANAGER_COMMAND_URL="${EMBY_PROXY_MANAGER_URL:-https://raw.githubusercontent.com/wuuduf/emby-reverse-proxy-installer/main/emby-proxy}"
 readonly MANAGER_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly MANAGER_LIBEXEC="${EMBY_PROXY_LIBEXEC:-/usr/local/lib/emby-proxy}"
 readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"

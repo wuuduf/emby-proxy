@@ -27,6 +27,17 @@ SUDO_ARGS_OUT="$TMP_DIR/sudo.args" PATH="$TMP_DIR/bin:$PATH" \
 grep -Fx -- '--engine' "$TMP_DIR/sudo.args" >/dev/null || fail "sudo 参数缺少 --engine"
 grep -Fx -- 'caddy' "$TMP_DIR/sudo.args" >/dev/null || fail "sudo 参数缺少 caddy"
 
+# 进程替换入口（bash <(curl ... )）在 sudo 重执行时必须落到稳定临时文件，
+# 不能把已经读过的 /dev/fd/* 传给 sudo。
+cp "$ROOT_DIR/setup-emby-proxy.sh" "$TMP_DIR/process-source.sh"
+SUDO_ARGS_OUT="$TMP_DIR/process-sudo.args" \
+EMBY_PROXY_SCRIPT_URL="file://$TMP_DIR/process-source.sh" \
+PATH="$TMP_DIR/bin:$PATH" \
+  bash <(cat "$TMP_DIR/process-source.sh") --engine caddy --domain example.com --upstream https://origin.example.com \
+  >"$TMP_DIR/process.out" 2>&1 || fail "进程替换入口启动失败"
+grep -F '/dev/fd/' "$TMP_DIR/process-sudo.args" >/dev/null && fail "进程替换入口仍把 /dev/fd 传给 sudo"
+grep -F -- '--engine' "$TMP_DIR/process-sudo.args" >/dev/null || fail "进程替换入口 sudo 参数缺少 --engine"
+
 # 首次无参数运行只进入管理菜单，不应调用配置向导或安装 Web 服务。
 cat >"$TMP_DIR/fake-manager" <<'MANAGER'
 #!/bin/sh

@@ -1,4 +1,4 @@
-# Emby Reverse Proxy Installer
+# EP（Emby Proxy）
 
 给 Emby 源站快速套一层域名 HTTPS 反代. 支持 Caddy / Nginx、多个入口、独立 HTTPS 端口和同域名多路径.
 
@@ -11,16 +11,23 @@
 Debian / Ubuntu VPS 执行:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/wuuduf/emby-reverse-proxy-installer/main/setup-emby-proxy.sh -o /tmp/setup-emby-proxy.sh && chmod +x /tmp/setup-emby-proxy.sh && sudo /tmp/setup-emby-proxy.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/wuuduf/emby-reverse-proxy-installer/main/setup-emby-proxy.sh)
 ```
 
-跑完直接出菜单. 脚本会安装到 `/usr/local/sbin/emby-proxy`, 同时创建短命令 `/usr/local/bin/ep`, 以后敲:
+跑完直接出菜单. 脚本会安装管理器 `emby-proxy`, 同时创建短命令 `ep`, 以后敲:
 
 ```bash
 ep
 ```
 
 普通用户执行 `ep` 会自动调用 sudo. 首次安装只部署管理菜单, 不会立刻安装 Web 服务或修改现有站点.
+
+如果不想使用进程替换, 也可以继续使用传统三步命令:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wuuduf/emby-reverse-proxy-installer/main/setup-emby-proxy.sh -o /tmp/setup-emby-proxy.sh
+chmod +x /tmp/setup-emby-proxy.sh && sudo /tmp/setup-emby-proxy.sh
+```
 
 ## 快速上手
 
