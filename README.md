@@ -6,6 +6,8 @@
 
 本项目由 [wuuduf](https://github.com/wuuduf) 编写和维护.
 
+项目短名为 **EP**；仓库地址暂保持不变，以兼容已经部署的更新命令.
+
 ## 安装
 
 Debian / Ubuntu VPS 执行:
