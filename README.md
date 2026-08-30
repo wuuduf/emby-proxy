@@ -6,7 +6,7 @@
 
 本项目由 [wuuduf](https://github.com/wuuduf) 编写和维护.
 
-项目短命令为 **ep**；仓库已改名为 `emby-proxy`，旧地址会自动跳转.
+项目短命令为 **ep**
 
 ## 安装
 
