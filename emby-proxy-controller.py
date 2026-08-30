@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import secrets
@@ -158,7 +159,9 @@ class Controller:
 
     def status(self) -> dict:
         with self.lock:
-            result = dict(self.state)
+            # 节点字典是嵌套对象，浅复制后删除 token_hash 会误删运行态凭据，
+            # 导致后续合法心跳全部返回 403。
+            result = copy.deepcopy(self.state)
             result.pop("enroll_tokens", None)
             for node in result.get("nodes", {}).values():
                 node.pop("token_hash", None)
