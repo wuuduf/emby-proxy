@@ -195,6 +195,8 @@ sudo ep controller master-install --state /etc/emby-proxy/controller.json \
 
 也可以直接在 `ep` 菜单选择 `11 多线路控制器`，按向导完成：初始化主控入口、生成一次性边缘注册命令、安装/启动主控服务、查看节点状态、立即同步 DNS 和查看主控服务状态。输入错误或底层检查失败只会返回控制器菜单，不会退出整个面板。
 
+菜单初始化时不需要手动查找 `zone_id`、`record_id` 或填写文件路径：脚本会隐藏读取 API Token，将它保存为主控本地 `600` 权限的 `cf.token`，然后按对外域名自动查找匹配的 Zone 和 A 记录。该域名必须先在 Cloudflare DNS 中存在一条 A 记录（建议使用 DNS only/灰云）。命令行 `controller init` 仍保留显式参数，适合自动化部署。
+
 `0.0.0.0:19090` 只适合配合 HTTPS/WireGuard 使用；不要把未加密控制器端口直接暴露到公网。
 
 把 `controller issue` 输出的 `node-install` 命令复制到对应边缘 VPS 执行即可（边缘 VPS 需先安装同一个 `emby-proxy` 脚本）. 节点会注册、配置心跳定时器并按优先级参与选择. 节点达到配额或连续失联后, 主控会选择下一台健康线路并更新 A 记录.

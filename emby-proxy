@@ -1574,10 +1574,40 @@ controller_require_state() {
   printf '%s' "$state"
 }
 
+controller_cf_curl() {
+  local token_file="$1" token
+  shift
+  token="$(cat "$token_file")"
+  curl -fsS --connect-timeout 8 --max-time 20 \
+    -H "Authorization: Bearer $token" -H 'Content-Type: application/json' "$@"
+}
+
+controller_cf_discover_ids() {
+  local token_file="$1" domain="$2" zones zone_id record_id records
+  zones="$(controller_cf_curl "$token_file" -G 'https://api.cloudflare.com/client/v4/zones' --data-urlencode 'per_page=1000')" || {
+    warn "Cloudflare Zone 查询失败，请检查 Token 权限和网络。"; return 1;
+  }
+  zone_id="$(jq -r --arg domain "$domain" '[((.result // [])[] as $z | select($domain == $z.name or ($domain|endswith("." + $z.name))) | $z)] | sort_by(.name|length) | last | .id // empty' <<<"$zones")"
+  [[ -n "$zone_id" ]] || { warn "没有找到 $domain 对应的 Cloudflare Zone。"; return 1; }
+  records="$(controller_cf_curl "$token_file" -G "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records" --data-urlencode 'type=A' --data-urlencode "name=$domain" --data-urlencode 'per_page=100')" || {
+    warn "Cloudflare DNS 记录查询失败，请检查 Token 是否有 Zone DNS Read/Edit 权限。"; return 1;
+  }
+  record_id="$(jq -r --arg domain "$domain" '[((.result // [])[]) | select(.type=="A" and .name==$domain)] | first.id // empty' <<<"$records")"
+  [[ -n "$record_id" ]] || {
+    warn "没有找到 $domain 的 A 记录，请先在 Cloudflare DNS 中创建一条 A 记录（建议灰云），再重试。"
+    return 1
+  }
+  printf '%s\t%s' "$zone_id" "$record_id"
+}
+
 controller_init_menu() {
-  local state entry_id domain source engine zone_id record_id token_file answer
+  local state entry_id domain source engine zone_id record_id token_file answer cf_token discovered
   state="$(controller_state_path)"
   printf '\n主控状态文件（默认 %s）：' "$state"; read -r answer; state="${answer:-$state}"
+  if [[ -f "$state" ]]; then
+    printf '状态文件已存在，覆盖会清空节点注册信息，确认？[y/N]：'; read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]] || { warn "已取消初始化。"; return 0; }
+  fi
   printf '入口 ID（例如 domain-emby.example.com）：'; read -r entry_id
   printf '对外域名（例如 emby.example.com）：'; read -r domain
   printf 'Emby 源站 URL（固定源站）：'; read -r source
@@ -1590,16 +1620,15 @@ controller_init_menu() {
   printf '是否启用 Cloudflare A 记录切换？[y/N]：'; read -r answer
   local -a args=(init --state "$state" --entry-id "$entry_id" --domain "$domain" --source "$source" --engine "$engine")
   if [[ "$answer" =~ ^[Yy]$ ]]; then
-    printf 'Cloudflare zone_id：'; read -r zone_id
-    printf 'Cloudflare record_id：'; read -r record_id
-    printf 'API Token 文件路径（不会把 Token 写入状态文件）：'; read -r token_file
-    [[ -n "$zone_id" && -n "$record_id" && -n "$token_file" ]] || { warn "Cloudflare 三项不能为空。"; return 1; }
-    [[ -r "$token_file" ]] || { warn "Token 文件不存在或不可读，请先创建并 chmod 600。"; return 1; }
+    token_file="$STATE_HOME/cf.token"
+    printf 'Cloudflare API Token（输入不回显）：'; IFS= read -r -s cf_token; printf '\n'
+    [[ -n "$cf_token" ]] || { warn "API Token 不能为空。"; return 1; }
+    install_managed_dir 0750 "$(dirname "$token_file")"
+    umask 077; printf '%s\n' "$cf_token" >"$token_file"; chmod 600 "$token_file"; unset cf_token
+    discovered="$(controller_cf_discover_ids "$token_file" "$domain")" || return 1
+    IFS=$'\t' read -r zone_id record_id <<<"$discovered"
+    info "已自动获取 zone_id=$zone_id，record_id=$record_id"
     args+=(--zone-id "$zone_id" --record-id "$record_id" --token-file "$token_file")
-  fi
-  if [[ -f "$state" ]]; then
-    printf '状态文件已存在，覆盖会清空节点注册信息，确认？[y/N]：'; read -r answer
-    [[ "$answer" =~ ^[Yy]$ ]] || { warn "已取消初始化。"; return 0; }
   fi
   controller_cli "${args[@]}"
 }
