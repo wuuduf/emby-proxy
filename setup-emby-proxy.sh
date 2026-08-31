@@ -51,12 +51,6 @@ readonly MANAGER_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly MANAGER_LIBEXEC="${EMBY_PROXY_LIBEXEC:-/usr/local/lib/emby-proxy}"
 readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
 readonly SHORT_BIN="${EMBY_PROXY_SHORT_BIN:-/usr/local/bin/ep}"
-readonly CONTROLLER_SOURCE_URL="${EMBY_PROXY_CONTROLLER_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/main/emby-proxy-controller.py}"
-readonly EDGE_BOOTSTRAP_SOURCE_URL="${EMBY_PROXY_EDGE_BOOTSTRAP_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/main/edge-bootstrap.sh}"
-readonly EDGE_AGENT_SOURCE_URL="${EMBY_PROXY_EDGE_AGENT_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/main/edge-agent.sh}"
-readonly CONTROLLER_BIN="${EMBY_PROXY_CONTROLLER_BIN:-${EMBY_PROXY_LIBEXEC:-/usr/local/lib/emby-proxy}/emby-proxy-controller.py}"
-readonly EDGE_BOOTSTRAP_BIN="${EMBY_PROXY_EDGE_BOOTSTRAP_BIN:-${EMBY_PROXY_LIBEXEC:-/usr/local/lib/emby-proxy}/edge-bootstrap.sh}"
-readonly EDGE_AGENT_BIN="${EMBY_PROXY_EDGE_AGENT_BIN:-${EMBY_PROXY_LIBEXEC:-/usr/local/lib/emby-proxy}/edge-agent.sh}"
 
 PROXY_ENGINE=""
 MANAGER_ONLY=0
@@ -928,39 +922,6 @@ install_manager_command() {
     install -m 0755 "$SCRIPT_PATH" "$MANAGER_LIBEXEC/setup-emby-proxy.sh"
     install -m 0755 "$temp" "$MANAGER_BIN"
   fi
-  # 实验版多线路组件与管理器一起安装；缺失时不阻断普通单线路安装。
-  for component in emby-proxy-controller.py edge-bootstrap.sh edge-agent.sh; do
-    component_source="$(dirname -- "$SCRIPT_PATH")/$component"
-    component_target="$MANAGER_LIBEXEC/$component"
-    [[ "$component" == "emby-proxy-controller.py" ]] && component_target="$CONTROLLER_BIN"
-    [[ "$component" == "edge-bootstrap.sh" ]] && component_target="$EDGE_BOOTSTRAP_BIN"
-    [[ "$component" == "edge-agent.sh" ]] && component_target="$EDGE_AGENT_BIN"
-    component_url="$CONTROLLER_SOURCE_URL"
-    [[ "$component" == "edge-bootstrap.sh" ]] && component_url="$EDGE_BOOTSTRAP_SOURCE_URL"
-    [[ "$component" == "edge-agent.sh" ]] && component_url="$EDGE_AGENT_SOURCE_URL"
-    component_temp="$(mktemp /tmp/emby-proxy-component.XXXXXX)"
-    if [[ -f "$component_source" ]]; then
-      cp -a "$component_source" "$component_temp"
-    elif curl -fsSL --connect-timeout 8 --max-time 30 "$component_url" -o "$component_temp"; then
-      :
-    else
-      rm -f "$component_temp"
-      warn "未找到多线路组件 $component；单线路功能仍可正常使用。"
-      continue
-    fi
-    if [[ "$component" == "emby-proxy-controller.py" ]]; then
-      python3 -m py_compile "$component_temp" 2>/dev/null || { rm -f "$component_temp"; warn "组件 $component 语法验证失败，跳过安装。"; continue; }
-    else
-      bash -n "$component_temp" 2>/dev/null || { rm -f "$component_temp"; warn "组件 $component 语法验证失败，跳过安装。"; continue; }
-    fi
-    install -d -m 0755 "$(dirname "$component_target")"
-    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
-      install -o root -g root -m 0755 "$component_temp" "$component_target"
-    else
-      install -m 0755 "$component_temp" "$component_target"
-    fi
-    rm -f "$component_temp"
-  done
   rm -f "$temp"
   install_manager_shortcut || true
   ok "管理命令已安装：sudo emby-proxy（快捷命令：ep）"

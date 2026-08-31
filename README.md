@@ -156,33 +156,34 @@ sudo emby-proxy service reload caddy
 
 交互终端更新完成后会自动打开新版本面板. 不会重启 Caddy/Nginx, 不会中断正在播放的媒体.
 
-## 多线路主控（实验版，暂未上传）
+## 多线路主控（实验版，单脚本）
 
-本地实验分支另外集成了“优先级 + 流量配额”的多线路控制器. 控制器只负责节点注册、心跳、节点选择和 Cloudflare A 记录切换, **不经过它转发媒体流量**. 每台边缘 VPS 仍需先用本脚本配置同一个域名和同一个 Emby 源站.
+多线路功能已经合并进 `emby-proxy` 本身. 控制器只负责节点注册、心跳、节点选择和 Cloudflare A 记录切换, **不经过它转发媒体流量**. 每台边缘 VPS 只需要安装同一个脚本，并先配置同一个域名和 Emby 源站.
 
 主控端示例:
 
 ```bash
 # 创建入口状态；Cloudflare token 只放在主控本地权限为 600 的文件中
-sudo emby-proxy controller init --state /etc/emby-proxy/controller.json \
+sudo ep controller init --state /etc/emby-proxy/controller.json \
   --entry-id domain-emby.example.com \
   --domain emby.example.com --source https://origin.example.com \
   --zone-id <ZONE_ID> --record-id <RECORD_ID> --token-file /etc/emby-proxy/cf.token
 
 # 为每台边缘 VPS 生成一次性注册命令；priority 数字越大越优先，quota 为字节数，0 表示不限额
-sudo emby-proxy controller issue --state /etc/emby-proxy/controller.json \
+sudo ep controller issue --state /etc/emby-proxy/controller.json \
   --controller-url https://control.example.com:19090 --node-id edge-a \
   --name 香港线路 --priority 100 --quota-bytes 1099511627776 --public-ip <EDGE_A_IP>
 
-# 主控循环每 30 秒检查健康节点并同步 DNS（实验阶段应放在 HTTPS/WireGuard 后）
-sudo emby-proxy controller serve --state /etc/emby-proxy/controller.json \
-  --listen 0.0.0.0:19090 --edge-bootstrap /usr/local/lib/emby-proxy/edge-bootstrap.sh \
-  --edge-agent /usr/local/lib/emby-proxy/edge-agent.sh
+# 主控循环每 30 秒检查健康节点并同步 DNS（安装为 systemd 服务）
+sudo ep controller master-install --state /etc/emby-proxy/controller.json \
+  --listen 0.0.0.0:19090
 ```
 
-把 `controller issue` 输出的整行命令复制到对应边缘 VPS 执行即可. 边缘脚本会注册节点、配置 Caddy/Nginx、安装心跳定时器. 节点达到配额或连续失联后, 主控会按优先级选择下一台健康线路并更新 A 记录.
+`0.0.0.0:19090` 只适合配合 HTTPS/WireGuard 使用；不要把未加密控制器端口直接暴露到公网。
 
-这个功能目前仍是实验实现: 控制器 HTTP 接口没有内置 TLS/管理员认证, 注册令牌只使用一次, 流量计数需要边缘侧写入 `/var/lib/emby-proxy-edge/used_bytes`. 不要直接暴露到公网生产使用; 应先套 HTTPS、WireGuard 或访问控制. 该节对应的 `emby-proxy-controller.py`、`edge-bootstrap.sh` 和 `edge-agent.sh` 仅保存在本地实验分支, 不会修改或上传公开仓库.
+把 `controller issue` 输出的 `node-install` 命令复制到对应边缘 VPS 执行即可（边缘 VPS 需先安装同一个 `emby-proxy` 脚本）. 节点会注册、配置心跳定时器并按优先级参与选择. 节点达到配额或连续失联后, 主控会选择下一台健康线路并更新 A 记录.
+
+这个功能目前仍是实验实现: 控制器 HTTP 接口没有内置 TLS/管理员认证, 注册令牌只使用一次, 流量计数需要边缘侧写入 `/var/lib/emby-proxy/used_bytes`. 正式使用应放在 WireGuard 或 HTTPS 访问控制后. 本次改动只保存在本地实验分支, 不会修改或上传公开仓库.
 
 ## 非交互创建
 
@@ -218,9 +219,6 @@ sudo emby-proxy add --engine caddy --domain emby.example.com --domain-mode path 
 /usr/local/bin/ep
 /usr/local/sbin/emby-proxy
 /usr/local/lib/emby-proxy/setup-emby-proxy.sh
-/usr/local/lib/emby-proxy/emby-proxy-controller.py  # 实验版主控
-/usr/local/lib/emby-proxy/edge-bootstrap.sh          # 实验版边缘注册
-/usr/local/lib/emby-proxy/edge-agent.sh              # 实验版心跳
 /etc/emby-proxy/sites.d/*.json
 /etc/emby-proxy/backups/
 /etc/caddy/Caddyfile
@@ -246,7 +244,6 @@ bash -n setup-emby-proxy.sh emby-proxy tests/*.sh
 ./tests/test-manager.sh
 ./tests/test-manager-stage2.sh
 ./tests/test-menu-flows.sh
-./tests/test-controller.sh
 sha256sum -c checksums.txt
 ```
 

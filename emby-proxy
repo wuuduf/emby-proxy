@@ -18,7 +18,6 @@ readonly INSTALLED_BACKEND="${EMBY_PROXY_INSTALLED_BACKEND:-/usr/local/lib/emby-
 readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
 readonly SHORT_BIN="${EMBY_PROXY_SHORT_BIN:-/usr/local/bin/ep}"
 readonly UPDATE_BASE_URL="${EMBY_PROXY_UPDATE_BASE_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/main}"
-readonly CONTROLLER_BIN="${EMBY_PROXY_CONTROLLER_BIN:-/usr/local/lib/emby-proxy/emby-proxy-controller.py}"
 LOCK_FD=""
 DOCTOR_OK=0
 DOCTOR_WARN=0
@@ -1275,16 +1274,161 @@ service_menu() {
   done
 }
 
+controller_cli() {
+  command -v python3 >/dev/null 2>&1 || die "多线路功能需要 python3。"
+  python3 - "$@" <<'PY'
+import argparse, copy, hashlib, json, os, secrets, shlex, subprocess, sys, threading, time
+import urllib.error, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
+
+def now(): return int(time.time())
+def digest(v): return hashlib.sha256(v.encode()).hexdigest()
+def atomic_write(path, data):
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + '.tmp'); tmp.write_text(json.dumps(data, indent=2, sort_keys=True)); tmp.replace(path)
+def post_json(url, payload, token=''):
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type':'application/json'}, method='POST')
+    if token: req.add_header('Authorization', 'Bearer ' + token)
+    with urllib.request.urlopen(req, timeout=20) as r: return json.loads(r.read())
+
+class Controller:
+    def __init__(self, path):
+        self.path = Path(path); self.lock = threading.RLock(); self.state = json.loads(self.path.read_text())
+        self.state.setdefault('schema_version', 1); self.state.setdefault('enroll_tokens', {}); self.state.setdefault('nodes', {}); self.state.setdefault('active_node', None)
+    def save(self): atomic_write(self.path, self.state)
+    def enroll(self, b):
+        with self.lock:
+            if b.get('entry_id') != self.state['entry_id']: return 404, {'error':'unknown_entry'}
+            node, reg = str(b.get('node_id','')), str(b.get('enroll_token',''))
+            if not node or self.state['enroll_tokens'].get(node) != reg: return 403, {'error':'invalid_or_expired_enroll_token'}
+            token = secrets.token_urlsafe(32); self.state['enroll_tokens'].pop(node, None)
+            item = {'name':b.get('name',node), 'priority':int(b.get('priority',0)), 'quota_bytes':int(b.get('quota_bytes',0)), 'used_bytes':0, 'healthy':False, 'status':'enrolled', 'last_seen':now(), 'version':b.get('version','unknown'), 'token_hash':digest(token)}
+            if b.get('public_ip'): item['public_ip'] = str(b['public_ip'])
+            self.state['nodes'][node] = item; self.save()
+            return 200, {'node_token':token, 'entry_id':self.state['entry_id'], 'domain':self.state['domain'], 'source':self.state['source'], 'engine':self.state.get('engine','caddy')}
+    def heartbeat(self, b, token):
+        with self.lock:
+            node = self.state['nodes'].get(str(b.get('node_id','')))
+            if not node or node.get('token_hash') != digest(token): return 403, {'error':'invalid_node_token'}
+            used = max(int(node.get('used_bytes',0)), int(b.get('used_bytes',0)))
+            node.update(healthy=bool(b.get('healthy',False)), used_bytes=used, status='healthy' if b.get('healthy') else 'unhealthy', last_seen=now(), version=b.get('version',node.get('version','unknown')), last_event=b.get('event','heartbeat'))
+            if b.get('public_ip'): node['public_ip'] = str(b['public_ip'])
+            selected = self.select(); self.save(); return 200, {'selected_node':selected, 'accepted_used_bytes':used}
+    def select(self):
+        out=[]
+        for nid,n in self.state['nodes'].items():
+            quota=int(n.get('quota_bytes',0)); online=now()-int(n.get('last_seen',0)) <= 90; within=quota <= 0 or int(n.get('used_bytes',0)) < quota
+            if n.get('healthy') and online and within: out.append((int(n.get('priority',0)), nid))
+        return max(out, default=(0,None))[1]
+    def reconcile(self):
+        with self.lock:
+            selected=self.select(); previous=self.state.get('active_node'); changed=selected != previous; dns_result=None
+            if selected and changed: dns_result=self.update_dns(selected)
+            if not (isinstance(dns_result,dict) and dns_result.get('ok') is False): self.state['active_node']=selected
+            self.state['last_reconcile']=now(); self.state['last_dns_result']=dns_result; self.save()
+            return {'selected_node':selected,'active_node':self.state.get('active_node'),'previous_node':previous,'changed':changed,'dns':dns_result}
+    def update_dns(self, nid):
+        dns=self.state.get('dns') or {}; node=self.state['nodes'][nid]
+        if dns.get('provider') != 'cloudflare': return {'skipped':'dns provider not configured'}
+        if not node.get('public_ip'): return {'ok':False,'error':'selected node has no public_ip'}
+        try: token=Path(dns['token_file']).read_text().strip()
+        except OSError as e: return {'ok':False,'error':str(e)}
+        payload={'type':'A','name':self.state['domain'],'content':node['public_ip'],'ttl':int(dns.get('ttl',60)),'proxied':False}
+        req=urllib.request.Request('https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s' % (dns['zone_id'],dns['record_id']), data=json.dumps(payload).encode(), headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'}, method='PUT')
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r: result=json.loads(r.read())
+            return {'ok':True,'content':node['public_ip']} if result.get('success') else {'ok':False,'errors':result.get('errors',[])}
+        except (OSError, urllib.error.URLError) as e: return {'ok':False,'error':str(e)}
+    def public_status(self):
+        result=copy.deepcopy(self.state); result.pop('enroll_tokens',None)
+        for n in result.get('nodes',{}).values(): n.pop('token_hash',None)
+        result['selected_node']=self.select(); return result
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args): print('[controller] '+(fmt % args), flush=True)
+    def reply(self, code, body):
+        raw=json.dumps(body,separators=(',',':')).encode(); self.send_response(code); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw)
+    def body(self): return json.loads(self.rfile.read(int(self.headers.get('Content-Length','0')) or 0) or b'{}')
+    def do_GET(self):
+        if urlparse(self.path).path == '/status': self.reply(200, self.server.controller.public_status())
+        else: self.reply(404, {'error':'not_found'})
+    def do_POST(self):
+        try:
+            path=urlparse(self.path).path; b=self.body()
+            if path == '/enroll': code,result=self.server.controller.enroll(b)
+            elif path == '/heartbeat': code,result=self.server.controller.heartbeat(b,self.headers.get('Authorization','').removeprefix('Bearer ').strip())
+            elif path == '/reconcile': code,result=200,self.server.controller.reconcile()
+            else: code,result=404,{'error':'not_found'}
+        except (ValueError, KeyError, json.JSONDecodeError) as e: code,result=400,{'error':'bad_request:'+str(e)}
+        self.reply(code,result)
+
+class Server(ThreadingHTTPServer):
+    def __init__(self, address, controller): super().__init__(address, Handler); self.controller=controller
+
+def init_state(a):
+    state={'schema_version':1,'entry_id':a.entry_id,'domain':a.domain,'source':a.source,'engine':a.engine,'active_node':None,'enroll_tokens':{},'nodes':{}}
+    if a.zone_id and a.record_id and a.token_file: state['dns']={'provider':'cloudflare','zone_id':a.zone_id,'record_id':a.record_id,'token_file':a.token_file,'ttl':60}
+    atomic_write(a.state,state); print('已创建多线路入口：'+a.state)
+def issue(a):
+    path=Path(a.state); state=json.loads(path.read_text()); token=secrets.token_urlsafe(24); state.setdefault('enroll_tokens',{})[a.node_id]=token; atomic_write(path,state)
+    values=['sudo','ep','controller','node-install','--controller-url',a.controller_url.rstrip('/'),'--entry-id',state['entry_id'],'--node-id',a.node_id,'--name',a.name,'--priority',str(a.priority),'--quota-bytes',str(a.quota_bytes)]
+    if a.public_ip: values += ['--public-ip',a.public_ip]
+    values += ['--enroll-token',token]
+    print(' '.join(shlex.quote(str(v)) for v in values))
+def serve(a):
+    host,port=a.listen.rsplit(':',1); c=Controller(a.state); s=Server((host,int(port)),c); print('多线路主控监听 '+a.listen,flush=True); stop=threading.Event()
+    def loop():
+        while not stop.wait(a.reconcile_interval):
+            try: print(json.dumps(c.reconcile(),ensure_ascii=False),flush=True)
+            except Exception as e: print('[controller] reconcile failed: '+str(e),flush=True)
+    threading.Thread(target=loop,daemon=True).start()
+    try: s.serve_forever()
+    except KeyboardInterrupt: stop.set()
+def master_install(a):
+    if os.geteuid() != 0: raise SystemExit('master-install 需要 root 或 sudo')
+    unit='''[Unit]\nDescription=emby-proxy multiline master\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nExecStart=/usr/local/sbin/emby-proxy controller serve --state %s --listen %s --reconcile-interval %s\nRestart=on-failure\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\n''' % (a.state,a.listen,a.reconcile_interval)
+    Path('/etc/systemd/system/emby-proxy-master.service').write_text(unit); subprocess.run(['systemctl','daemon-reload'],check=False); subprocess.run(['systemctl','enable','--now','emby-proxy-master.service'],check=False); print('主控服务已启动：emby-proxy-master.service')
+def node_install(a):
+    if os.geteuid() != 0: raise SystemExit('node-install 需要 root 或 sudo')
+    result=post_json(a.controller_url.rstrip('/')+'/enroll',{'entry_id':a.entry_id,'node_id':a.node_id,'name':a.name,'priority':a.priority,'quota_bytes':a.quota_bytes,'enroll_token':a.enroll_token,'public_ip':a.public_ip,'version':'single-script-0.1'})
+    base=Path('/var/lib/emby-proxy'); base.mkdir(parents=True,exist_ok=True); Path('/etc/emby-proxy').mkdir(parents=True,exist_ok=True); used=base/'used_bytes'; used.touch(exist_ok=True)
+    state={'controller':a.controller_url.rstrip('/'),'entry_id':a.entry_id,'node_id':a.node_id,'node_token':result['node_token'],'domain':result['domain'],'source':result['source'],'engine':result.get('engine','caddy'),'public_ip':a.public_ip,'used_file':str(used)}; atomic_write('/etc/emby-proxy/multiline-node.json',state); os.chmod('/etc/emby-proxy/multiline-node.json',0o600)
+    backend=Path('/usr/local/lib/emby-proxy/setup-emby-proxy.sh')
+    if backend.exists(): subprocess.run([str(backend),'--engine',state['engine'],'--domain',state['domain'],'--upstream',state['source']],check=False)
+    else: print('提醒：未找到安装后端，请先用同一个 emby-proxy 脚本完成本机反代配置。')
+    Path('/etc/systemd/system/emby-proxy-node.service').write_text('[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/emby-proxy controller node --state /etc/emby-proxy/multiline-node.json\n')
+    Path('/etc/systemd/system/emby-proxy-node.timer').write_text('[Unit]\n[Timer]\nOnBootSec=20s\nOnUnitActiveSec=30s\nPersistent=true\n[Install]\nWantedBy=timers.target\n'); subprocess.run(['systemctl','daemon-reload'],check=False); subprocess.run(['systemctl','enable','--now','emby-proxy-node.timer'],check=False); node_once(type('A',(),{'state':'/etc/emby-proxy/multiline-node.json'})()); print('边缘节点注册成功：'+a.node_id)
+def node_once(a):
+    st=json.loads(Path(a.state).read_text()); used=0
+    try: used=int(''.join(Path(st.get('used_file','')).read_text().split()) or 0)
+    except (OSError,ValueError): pass
+    healthy=any(subprocess.run(['systemctl','is-active','--quiet',svc],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0 for svc in ('caddy','nginx'))
+    result=post_json(st['controller']+'/heartbeat',{'node_id':st['node_id'],'used_bytes':used,'healthy':healthy,'public_ip':st.get('public_ip'),'event':'edge_heartbeat','version':'single-script-0.1'},st['node_token']); print(json.dumps(result,ensure_ascii=False))
+def main():
+    p=argparse.ArgumentParser(prog='emby-proxy controller'); sub=p.add_subparsers(dest='cmd',required=True)
+    x=sub.add_parser('init'); x.add_argument('--state',required=True); x.add_argument('--entry-id',required=True); x.add_argument('--domain',required=True); x.add_argument('--source',required=True); x.add_argument('--engine',default='caddy'); x.add_argument('--zone-id'); x.add_argument('--record-id'); x.add_argument('--token-file'); x.set_defaults(fn=init_state)
+    x=sub.add_parser('issue'); x.add_argument('--state',required=True); x.add_argument('--controller-url',required=True); x.add_argument('--node-id',required=True); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',required=True); x.set_defaults(fn=issue)
+    x=sub.add_parser('serve'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=serve)
+    x=sub.add_parser('master-install'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=master_install)
+    x=sub.add_parser('node-install'); x.add_argument('--controller-url',required=True); x.add_argument('--entry-id',required=True); x.add_argument('--node-id',required=True); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',required=True); x.add_argument('--enroll-token',required=True); x.set_defaults(fn=node_install)
+    x=sub.add_parser('node'); x.add_argument('--state',default='/etc/emby-proxy/multiline-node.json'); x.set_defaults(fn=node_once)
+    x=sub.add_parser('status'); x.add_argument('--state',required=True); x.set_defaults(fn=lambda a: print(json.dumps(Controller(a.state).public_status(),ensure_ascii=False,indent=2)))
+    x=sub.add_parser('reconcile'); x.add_argument('--state',required=True); x.set_defaults(fn=lambda a: print(json.dumps(Controller(a.state).reconcile(),ensure_ascii=False)))
+    a=p.parse_args(); a.fn(a)
+if __name__ == '__main__': main()
+PY
+}
+
 controller_menu() {
   ui_header "多线路控制器" "主控 / 边缘注册 / 优先级配额"
-  if [[ ! -x "$CONTROLLER_BIN" ]]; then
-    warn "当前未安装控制器组件。请在实验分支运行安装脚本或手动安装 emby-proxy-controller.py。"
-  fi
-  printf '\n主控命令示例：\n'
-  printf '  sudo emby-proxy controller init ...\n'
-  printf '  sudo emby-proxy controller issue ...\n'
-  printf '  sudo emby-proxy controller serve ...\n'
-  printf '\n边缘节点命令由 controller issue 生成，注册码只使用一次。\n'
+  printf '\n所有主控和边缘节点只需要安装同一个 emby-proxy 脚本。\n'
+  printf '  sudo ep controller init ...\n'
+  printf '  sudo ep controller issue ...\n'
+  printf '  sudo ep controller master-install ...\n'
+  printf '  sudo ep controller serve ...\n'
+  printf '\nissue 生成的 node-install 命令复制到边缘 VPS 执行，注册码只使用一次。\n'
   ui_pause
 }
 
@@ -1379,9 +1523,7 @@ main() {
     config) [[ "${2:-}" == "test" ]] || die "用法：emby-proxy config test"; config_test ;;
     controller)
       shift
-      [[ -x "$CONTROLLER_BIN" ]] || die "找不到控制器组件：$CONTROLLER_BIN"
-      command -v python3 >/dev/null 2>&1 || die "控制器需要 python3。"
-      exec python3 "$CONTROLLER_BIN" "$@" ;;
+      controller_cli "$@" ;;
     *) die "未知命令：${command}。运行 emby-proxy --help 查看帮助。" ;;
   esac
 }
