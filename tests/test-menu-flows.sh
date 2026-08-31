@@ -45,7 +45,7 @@ INPUT
 [[ "$(grep -c 'Emby 反向代理管理面板' "$TMP_DIR/selector-return.out")" -ge 2 ]] || fail "无效入口序号后没有回到主菜单"
 grep -F '已返回上一级菜单' "$TMP_DIR/selector-return.err" >/dev/null || fail "主菜单没有显示返回提示"
 
-# 主面板：无效输入应留在菜单；1-10 与 q 都必须正确分发。
+# 主面板：无效输入应留在菜单；1-12 与 q 都必须正确分发。
 TRACE="$TMP_DIR/main.trace"
 TRACE="$TRACE" EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 \
 EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
@@ -63,6 +63,8 @@ EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
   import_existing() { printf "import\n" >>"$TRACE"; }
   self_update() { printf "update\n" >>"$TRACE"; }
   restart_updated_manager() { printf "restart_manager\n" >>"$TRACE"; }
+  controller_menu() { printf "controller\n" >>"$TRACE"; }
+  uninstall_manager() { UNINSTALL_COMPLETED=0; printf "uninstall\n" >>"$TRACE"; }
   main_menu
 ' <<'INPUT' >"$TMP_DIR/main.out" 2>"$TMP_DIR/main.err"
 x
@@ -76,9 +78,11 @@ x
 8
 9
 10
+11
+12
 q
 INPUT
-for expected in list 'show domain-test.example.com' add 'manage domain-test.example.com' 'doctor all' logs backup service import update restart_manager; do
+for expected in list 'show domain-test.example.com' add 'manage domain-test.example.com' 'doctor all' logs backup service import update restart_manager controller uninstall; do
   assert_trace "$TRACE" "$expected"
 done
 grep -F '请输入有效序号' "$TMP_DIR/main.err" >/dev/null || fail "主菜单无效输入没有提示"
