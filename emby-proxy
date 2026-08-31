@@ -1669,6 +1669,11 @@ controller_issue_menu() {
   [[ "$node_id" =~ ^[A-Za-z0-9._-]+$ ]] || { warn "节点 ID 只能包含字母、数字、点、下划线和短横线。"; return 1; }
   [[ "$public_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { warn "公网 IPv4 格式无效。"; return 1; }
   [[ "$priority" =~ ^[0-9]+$ && "$quota" =~ ^[0-9]+$ ]] || { warn "优先级和配额必须是非负整数。"; return 1; }
+  info "正在测试主控连通性：$controller_url/status"
+  curl -fsS --connect-timeout 5 --max-time 10 "$controller_url/status" >/dev/null || {
+    warn "当前无法访问主控。请先在主控服务器选择 3 启动服务，并放行控制器端口；HTTPS 地址还必须已经配置 TLS。"
+    return 1
+  }
   controller_cli issue --state "$state" --controller-url "$controller_url" --node-id "$node_id" --name "$name" --priority "$priority" --quota-bytes "$quota" --public-ip "$public_ip"
   printf '\n请把上面生成的一次性 node-install 命令复制到边缘 VPS 执行。注册码只能使用一次。\n'
 }
