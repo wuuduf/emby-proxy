@@ -1455,7 +1455,14 @@ def atomic_write(path, data):
 def post_json(url, payload, token=''):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type':'application/json'}, method='POST')
     if token: req.add_header('Authorization', 'Bearer ' + token)
-    with urllib.request.urlopen(req, timeout=20) as r: return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r: return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try: detail=json.loads(e.read().decode()).get('error','')
+        except Exception: detail=''
+        raise RuntimeError('主控返回 HTTP %s%s' % (e.code, ': '+detail if detail else ''))
+    except urllib.error.URLError as e:
+        raise RuntimeError('无法连接主控：%s' % e.reason)
 
 class Controller:
     def __init__(self, path):
@@ -1580,7 +1587,10 @@ def main():
     x=sub.add_parser('node'); x.add_argument('--state',default='/etc/emby-proxy/multiline-node.json'); x.set_defaults(fn=node_once)
     x=sub.add_parser('status'); x.add_argument('--state',required=True); x.set_defaults(fn=lambda a: print(json.dumps(Controller(a.state).public_status(),ensure_ascii=False,indent=2)))
     x=sub.add_parser('reconcile'); x.add_argument('--state',required=True); x.set_defaults(fn=lambda a: print(json.dumps(Controller(a.state).reconcile(),ensure_ascii=False)))
-    a=p.parse_args(); a.fn(a)
+    a=p.parse_args()
+    try: a.fn(a)
+    except RuntimeError as e:
+        print('错误：'+str(e), file=sys.stderr); raise SystemExit(1)
 if __name__ == '__main__': main()
 PY
 }
