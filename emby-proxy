@@ -1594,6 +1594,7 @@ controller_init_menu() {
     printf 'Cloudflare record_id：'; read -r record_id
     printf 'API Token 文件路径（不会把 Token 写入状态文件）：'; read -r token_file
     [[ -n "$zone_id" && -n "$record_id" && -n "$token_file" ]] || { warn "Cloudflare 三项不能为空。"; return 1; }
+    [[ -r "$token_file" ]] || { warn "Token 文件不存在或不可读，请先创建并 chmod 600。"; return 1; }
     args+=(--zone-id "$zone_id" --record-id "$record_id" --token-file "$token_file")
   fi
   if [[ -f "$state" ]]; then
