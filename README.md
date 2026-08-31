@@ -13,7 +13,7 @@
 Debian / Ubuntu VPS 执行:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/wuuduf/emby-proxy/main/setup-emby-proxy.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/wuuduf/emby-proxy/codex/multiline-lab/setup-emby-proxy.sh)
 ```
 
 跑完直接出菜单. 脚本会安装管理器 `emby-proxy`, 同时创建短命令 `ep`, 以后敲:
@@ -27,7 +27,7 @@ ep
 如果不想使用进程替换, 也可以继续使用传统三步命令:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/wuuduf/emby-proxy/main/setup-emby-proxy.sh -o /tmp/setup-emby-proxy.sh
+curl -fsSL https://raw.githubusercontent.com/wuuduf/emby-proxy/codex/multiline-lab/setup-emby-proxy.sh -o /tmp/setup-emby-proxy.sh
 chmod +x /tmp/setup-emby-proxy.sh && sudo /tmp/setup-emby-proxy.sh
 ```
 
