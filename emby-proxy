@@ -10,11 +10,15 @@ readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
 readonly CADDYFILE="${EMBY_PROXY_CADDYFILE:-/etc/caddy/Caddyfile}"
 readonly NGINX_CONF_DIR="${EMBY_PROXY_NGINX_CONF_DIR:-/etc/nginx/conf.d}"
+readonly NGINX_LEGACY_CONFIG="${EMBY_PROXY_NGINX_LEGACY_CONFIG:-/etc/nginx/conf.d/emby-proxy-managed.conf}"
+readonly NGINX_HASH_CONFIG="${EMBY_PROXY_NGINX_HASH_CONFIG:-/etc/nginx/conf.d/00-emby-proxy-hash.conf}"
+readonly NGINX_ACME_ROOT="${EMBY_PROXY_NGINX_ACME_ROOT:-/var/www/emby-proxy-acme}"
 readonly CADDY_LOG_DIR="${EMBY_PROXY_CADDY_LOG_DIR:-/var/log/caddy}"
 readonly NGINX_LOG_DIR="${EMBY_PROXY_NGINX_LOG_DIR:-/var/log/nginx}"
 readonly OS_RELEASE_FILE="${EMBY_PROXY_OS_RELEASE_FILE:-/etc/os-release}"
 readonly HEALTH_PATH="/_emby_proxy_health"
 readonly INSTALLED_BACKEND="${EMBY_PROXY_INSTALLED_BACKEND:-/usr/local/lib/emby-proxy/setup-emby-proxy.sh}"
+readonly MANAGER_LIBEXEC="${EMBY_PROXY_LIBEXEC:-/usr/local/lib/emby-proxy}"
 readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
 readonly SHORT_BIN="${EMBY_PROXY_SHORT_BIN:-/usr/local/bin/ep}"
 readonly UPDATE_BASE_URL="${EMBY_PROXY_UPDATE_BASE_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/codex/multiline-lab}"
@@ -23,6 +27,7 @@ DOCTOR_OK=0
 DOCTOR_WARN=0
 DOCTOR_ERROR=0
 MENU_ACTION_STATUS=0
+UNINSTALL_COMPLETED=0
 
 if [[ -t 1 ]]; then
   RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; CYAN=$'\033[36m'; MAGENTA=$'\033[35m'
@@ -108,6 +113,7 @@ Emby Reverse Proxy Manager $VERSION
   sudo emby-proxy backup restore <备份ID> 安全恢复备份
   sudo emby-proxy service status          查看或管理 Web 服务
   sudo emby-proxy update [--check]        检查或安装管理器更新
+  sudo emby-proxy uninstall [--yes]       干净卸载脚本（保留 Caddy/Nginx 和证书）
   sudo emby-proxy controller ...         多线路控制器（实验版）
   emby-proxy version
 
@@ -1069,6 +1075,142 @@ ensure_short_command() {
   return 0
 }
 
+uninstall_archive() {
+  local backup_root="$1" timestamp="$2" archive="$backup_root/emby-proxy-uninstall-$timestamp.tar.gz" sha items=() file
+  install_managed_dir 0750 "$backup_root"
+  # 只打包脚本明确管理的路径；不会把整台机器或 Caddy/Nginx 证书带走。
+  for file in "$STATE_HOME" "$CADDYFILE" "$NGINX_LEGACY_CONFIG" "$NGINX_HASH_CONFIG" \
+    "$NGINX_ACME_ROOT" "$MANAGER_BIN" "$SHORT_BIN" "$INSTALLED_BACKEND" "$MANAGER_LIBEXEC" \
+    /etc/systemd/system/emby-proxy-master.service /etc/systemd/system/emby-proxy-node.service \
+    /etc/systemd/system/emby-proxy-node.timer; do
+    [[ -e "$file" || -L "$file" ]] && items+=("$file")
+  done
+  while IFS= read -r file; do items+=("$file"); done < <(find "$CADDY_LOG_DIR" "$NGINX_LOG_DIR" -maxdepth 1 -type f -name 'emby-proxy-*-access.log' -print 2>/dev/null || true)
+  if ((${#items[@]} == 0)); then
+    tar -czf "$archive" --files-from /dev/null
+  else
+    tar -czf "$archive" "${items[@]}"
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha="$(sha256sum "$archive" | awk '{print $1}')"
+  else
+    sha="$(shasum -a 256 "$archive" | awk '{print $1}')"
+  fi
+  printf '%s  %s\n' "$sha" "$(basename "$archive")" >"$archive.sha256"
+  printf '%s' "$archive"
+}
+
+uninstall_remove_caddy_markers() {
+  local target="${1:-$CADDYFILE}" begin end begins ends temp saved
+  [[ -f "$target" ]] || return 0
+  begin="$(grep -Ec '^# BEGIN MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE):' "$target" 2>/dev/null || true)"
+  end="$(grep -Ec '^# END MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE):' "$target" 2>/dev/null || true)"
+  (( begin == 0 && end == 0 )) && return 0
+  if (( begin != end )); then
+    warn "Caddyfile 中脚本标记不完整，保留原文件：$target"
+    return 0
+  fi
+  temp="$(mktemp /tmp/emby-proxy-uninstall-caddy.XXXXXX)"
+  awk '/^# BEGIN MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE):/{skip=1;next} /^# END MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE):/{if(skip){skip=0;next}} !skip{print}' "$target" >"$temp"
+  saved="$(mktemp /tmp/emby-proxy-uninstall-caddy-old.XXXXXX)"; cp -a "$target" "$saved"
+  cat "$temp" >"$target"; rm -f "$temp"
+  if command -v caddy >/dev/null 2>&1 && ! caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1; then
+    cp -a "$saved" "$target"; rm -f "$saved"
+    warn "Caddy 清理后配置验证失败，已恢复：$target"
+    return 0
+  fi
+  rm -f "$saved"
+  systemctl reload caddy >/dev/null 2>&1 || warn "Caddy 已清理，但 reload 失败，请手动检查服务。"
+}
+
+uninstall_remove_nginx_owned_file() {
+  local target="$1" marker="$2" saved
+  [[ -f "$target" ]] || return 0
+  grep -F "$marker" "$target" >/dev/null 2>&1 || return 0
+  saved="$(mktemp /tmp/emby-proxy-uninstall-nginx.XXXXXX)"; cp -a "$target" "$saved"; rm -f "$target"
+  if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+    cp -a "$saved" "$target"; rm -f "$saved"
+    warn "Nginx 清理后配置验证失败，已恢复：$target"
+    return 0
+  fi
+  rm -f "$saved"
+  systemctl reload nginx >/dev/null 2>&1 || warn "Nginx 已清理，但 reload 失败，请手动检查服务。"
+}
+
+uninstall_manager() {
+  local option="${1:-}" answer backup_root timestamp archive file id
+  local -a ids=()
+  UNINSTALL_COMPLETED=0
+  [[ -z "$option" || "$option" == "--yes" ]] || die "用法：emby-proxy uninstall [--yes]"
+  if [[ "$option" != "--yes" ]]; then
+    printf '\n这会删除 emby-proxy 管理器、脚本托管入口、主控/边缘服务和管理索引。\n'
+    printf 'Caddy/Nginx 程序、其他站点配置和证书不会删除。\n'
+    printf '删除前会生成可校验备份；输入 REMOVE EMBY-PROXY 确认：'; read -r answer
+    [[ "$answer" == "REMOVE EMBY-PROXY" ]] || { warn "已取消卸载。"; return 0; }
+  fi
+  backup_root="${EMBY_PROXY_UNINSTALL_BACKUP_DIR:-/var/backups}"
+  timestamp="$(date -u +%Y%m%d-%H%M%S)"
+  archive="$(uninstall_archive "$backup_root" "$timestamp")"
+  ok "卸载前备份已创建：$archive"
+  ok "SHA256：$archive.sha256"
+
+  # 先导入旧版索引，再逐个调用已有的严格删除逻辑；缺失标记时会停止而不碰未知配置。
+  if command -v jq >/dev/null 2>&1; then
+    ensure_state_dirs
+    import_existing >/dev/null 2>&1 || true
+    while IFS= read -r file; do
+      id="$(jq -r '.id // empty' "$file" 2>/dev/null || true)"
+      [[ -n "$id" ]] && ids+=("$id")
+    done < <(find "$SITES_DIR" -maxdepth 1 -type f -name 'domain-*.json' -print 2>/dev/null | sort)
+    if ((${#ids[@]} > 0)); then
+      for id in "${ids[@]}"; do
+        [[ -f "$(state_file "$id")" ]] || continue
+        delete_site "$id" <<<"y"
+      done
+    fi
+  else
+    warn "未找到 jq，跳过入口索引清理；配置备份仍已生成。"
+  fi
+
+  uninstall_remove_caddy_markers
+  if [[ -d "$(dirname "$CADDYFILE")" ]]; then
+    while IFS= read -r file; do
+      [[ "$file" == "$CADDYFILE" ]] || uninstall_remove_caddy_markers "$file"
+    done < <(find "$(dirname "$CADDYFILE")" -maxdepth 1 -type f \( -name '*.caddy' -o -name '*.conf' \) -print 2>/dev/null | sort)
+  fi
+  uninstall_remove_nginx_owned_file "$NGINX_LEGACY_CONFIG" "MANAGED EMBY"
+  uninstall_remove_nginx_owned_file "$NGINX_HASH_CONFIG" "MANAGED EMBY NGINX HASH CAPACITY"
+  if [[ -d "$NGINX_CONF_DIR" ]]; then
+    while IFS= read -r file; do
+      uninstall_remove_nginx_owned_file "$file" "MANAGED EMBY SITE"
+    done < <(find "$NGINX_CONF_DIR" -maxdepth 1 -type f -name 'emby-proxy-*.conf' -print 2>/dev/null | sort)
+    while IFS= read -r file; do
+      uninstall_remove_nginx_owned_file "$file" "MANAGED EMBY ACME"
+    done < <(find "$NGINX_CONF_DIR" -maxdepth 1 -type f -name 'emby-proxy-acme-*.conf' -print 2>/dev/null | sort)
+  fi
+  if [[ "$NGINX_ACME_ROOT" == */emby-proxy-acme && -d "$NGINX_ACME_ROOT" ]] && ! find "$NGINX_ACME_ROOT" -type f -print -quit 2>/dev/null | grep -q .; then
+    rm -rf -- "$NGINX_ACME_ROOT"
+  fi
+  for file in /etc/systemd/system/emby-proxy-master.service /etc/systemd/system/emby-proxy-node.service /etc/systemd/system/emby-proxy-node.timer; do
+    systemctl disable --now "$(basename "$file")" >/dev/null 2>&1 || true
+    rm -f -- "$file"
+  done
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  find "$CADDY_LOG_DIR" "$NGINX_LOG_DIR" -maxdepth 1 -type f -name 'emby-proxy-*-access.log' -delete 2>/dev/null || true
+  if [[ -d "$STATE_HOME" && "$STATE_HOME" != "/" && "$STATE_HOME" != "/etc" && "$STATE_HOME" != "/var" && \
+    ( "$STATE_HOME" == */emby-proxy* || ( -d "$STATE_HOME/sites.d" && -d "$STATE_HOME/backups" ) ) ]]; then
+    rm -rf -- "$STATE_HOME"
+  elif [[ -d "$STATE_HOME" ]]; then
+    warn "自定义管理目录未满足安全路径检查，已保留：$STATE_HOME"
+  fi
+  rm -f -- "$INSTALLED_BACKEND" "$MANAGER_BIN"
+  if [[ -L "$SHORT_BIN" ]] && [[ "$(readlink "$SHORT_BIN" 2>/dev/null || true)" == "$MANAGER_BIN" ]]; then rm -f -- "$SHORT_BIN"; fi
+  if [[ -d "$MANAGER_LIBEXEC" && "$MANAGER_LIBEXEC" == */emby-proxy ]]; then rm -rf -- "$MANAGER_LIBEXEC"; fi
+  UNINSTALL_COMPLETED=1
+  ok "emby-proxy 已完全卸载。Caddy/Nginx 及其证书保持不变。"
+  info "如需恢复，请保留备份并使用 tar -xzf 查看：$archive"
+}
+
 installed_manager_version() {
   [[ -x "$MANAGER_BIN" ]] || { printf '%s' "$VERSION"; return; }
   "$MANAGER_BIN" version 2>/dev/null | awk 'NR==1 {print $2}'
@@ -1455,6 +1597,7 @@ main_menu() {
     ui_item 9 "导入旧版配置" "只建立管理索引"
     ui_item 10 "检查/更新程序" "校验 SHA256 后更新"
     ui_item 11 "多线路控制器" "主控、节点注册与优先级配额（实验版）"
+    ui_item 12 "完全卸载 emby-proxy" "删除脚本托管内容，保留 Caddy/Nginx 和证书"
     ui_item 0 "退出面板" "也可以输入 q"
     ui_prompt; read -r choice
     case "$choice" in
@@ -1469,6 +1612,7 @@ main_menu() {
       9) menu_run import_existing ;;
       10) menu_update ;;
       11) controller_menu ;;
+      12) uninstall_manager; if (( UNINSTALL_COMPLETED == 1 )); then exit 0; fi ;;
       0|q|Q) ui_clear; return ;;
       *) warn "请输入有效序号。" ;;
     esac
@@ -1482,6 +1626,10 @@ main() {
     -V|--version|version) printf 'emby-proxy %s\n' "$VERSION"; return ;;
   esac
   require_root "$@"
+  if [[ "$command" == "uninstall" ]]; then
+    uninstall_manager "${2:-}"
+    return
+  fi
   ensure_short_command || true
   require_jq; ensure_state_dirs; normalize_state_registry
   case "$command" in

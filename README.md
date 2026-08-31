@@ -120,6 +120,8 @@ sudo emby-proxy route add domain-emby.example.com
 工具
  9  导入旧版配置       只建立管理索引
 10  检查/更新程序      校验 SHA256 后更新
+11  多线路控制器       主控、节点注册与优先级配额（实验版）
+12  完全卸载 emby-proxy 删除脚本托管内容，保留 Caddy/Nginx 和证书
  0  退出面板            也可以输入 q
 ```
 
@@ -134,6 +136,7 @@ ep list                                 # 列出入口
 ep doctor                               # 完整诊断
 ep update --check                       # 检查更新
 ep update                               # 更新并自动重启面板
+sudo ep uninstall                       # 安全确认后完全卸载（保留 Web 服务和证书）
 
 sudo emby-proxy show <入口ID>
 sudo emby-proxy route add <入口ID>
@@ -153,6 +156,17 @@ sudo emby-proxy backup list
 sudo emby-proxy backup restore <备份ID>
 sudo emby-proxy service reload caddy
 ```
+
+### 完全卸载
+
+```bash
+sudo ep uninstall
+```
+
+卸载前会把脚本管理的索引、入口配置、日志、主控/边缘 systemd 单元和管理器文件打包到
+`/var/backups/emby-proxy-uninstall-时间.tar.gz`，并生成同名 `.sha256` 校验文件；需要输入
+`REMOVE EMBY-PROXY` 才会继续。卸载只删除带脚本标记的内容，不会卸载 Caddy/Nginx，不会删除其他站点配置，也不会删除 TLS 证书。
+如需无交互执行，可使用 `sudo ep uninstall --yes`，但请先确认备份目录可写。
 
 交互终端更新完成后会自动打开新版本面板. 不会重启 Caddy/Nginx, 不会中断正在播放的媒体.
 
@@ -183,7 +197,7 @@ sudo ep controller master-install --state /etc/emby-proxy/controller.json \
 
 把 `controller issue` 输出的 `node-install` 命令复制到对应边缘 VPS 执行即可（边缘 VPS 需先安装同一个 `emby-proxy` 脚本）. 节点会注册、配置心跳定时器并按优先级参与选择. 节点达到配额或连续失联后, 主控会选择下一台健康线路并更新 A 记录.
 
-这个功能目前仍是实验实现: 控制器 HTTP 接口没有内置 TLS/管理员认证, 注册令牌只使用一次, 流量计数需要边缘侧写入 `/var/lib/emby-proxy/used_bytes`. 正式使用应放在 WireGuard 或 HTTPS 访问控制后. 本次改动只保存在本地实验分支, 不会修改或上传公开仓库.
+这个功能目前仍是实验实现: 控制器 HTTP 接口没有内置 TLS/管理员认证, 注册令牌只使用一次, 流量计数需要边缘侧写入 `/var/lib/emby-proxy/used_bytes`. 正式使用应放在 WireGuard 或 HTTPS 访问控制后. 当前改动只在 `codex/multiline-lab` 实验分支，未修改 `main`.
 
 ## 非交互创建
 
