@@ -1563,15 +1563,109 @@ if __name__ == '__main__': main()
 PY
 }
 
+controller_state_path() {
+  printf '%s' "${EMBY_PROXY_CONTROLLER_STATE:-$STATE_HOME/controller.json}"
+}
+
+controller_require_state() {
+  local state
+  state="$(controller_state_path)"
+  [[ -f "$state" ]] || { warn "还没有主控状态，请先选择 1 初始化主控入口。"; return 1; }
+  printf '%s' "$state"
+}
+
+controller_init_menu() {
+  local state entry_id domain source engine zone_id record_id token_file answer
+  state="$(controller_state_path)"
+  printf '\n主控状态文件（默认 %s）：' "$state"; read -r answer; state="${answer:-$state}"
+  printf '入口 ID（例如 domain-emby.example.com）：'; read -r entry_id
+  printf '对外域名（例如 emby.example.com）：'; read -r domain
+  printf 'Emby 源站 URL（固定源站）：'; read -r source
+  printf '边缘节点使用的反代引擎 [caddy/nginx，默认 caddy]：'; read -r engine; engine="${engine:-caddy}"
+  [[ "$engine" == "caddy" || "$engine" == "nginx" ]] || { warn "引擎只能是 caddy 或 nginx。"; return 1; }
+  [[ -n "$entry_id" && -n "$domain" && -n "$source" ]] || { warn "入口 ID、域名和源站不能为空。"; return 1; }
+  printf '是否启用 Cloudflare A 记录切换？[y/N]：'; read -r answer
+  local -a args=(init --state "$state" --entry-id "$entry_id" --domain "$domain" --source "$source" --engine "$engine")
+  if [[ "$answer" =~ ^[Yy]$ ]]; then
+    printf 'Cloudflare zone_id：'; read -r zone_id
+    printf 'Cloudflare record_id：'; read -r record_id
+    printf 'API Token 文件路径（不会把 Token 写入状态文件）：'; read -r token_file
+    [[ -n "$zone_id" && -n "$record_id" && -n "$token_file" ]] || { warn "Cloudflare 三项不能为空。"; return 1; }
+    args+=(--zone-id "$zone_id" --record-id "$record_id" --token-file "$token_file")
+  fi
+  if [[ -f "$state" ]]; then
+    printf '状态文件已存在，覆盖会清空节点注册信息，确认？[y/N]：'; read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]] || { warn "已取消初始化。"; return 0; }
+  fi
+  controller_cli "${args[@]}"
+}
+
+controller_issue_menu() {
+  local state node_id name priority quota public_ip controller_url answer
+  state="$(controller_require_state)" || return 1
+  printf '主控访问地址（例如 https://control.example.com:19090）：'; read -r controller_url
+  printf '节点 ID（例如 edge-a）：'; read -r node_id
+  printf '节点名称（例如 香港线路）：'; read -r name
+  printf '优先级（数字越大越优先，默认 100）：'; read -r priority; priority="${priority:-100}"
+  printf '配额字节数（0 表示不限额，默认 0）：'; read -r quota; quota="${quota:-0}"
+  printf '边缘节点公网 IPv4（用于 DNS 切换）：'; read -r public_ip
+  [[ -n "$controller_url" && -n "$node_id" && -n "$name" && -n "$public_ip" ]] || { warn "主控地址、节点信息和公网 IPv4 不能为空。"; return 1; }
+  [[ "$priority" =~ ^[0-9]+$ && "$quota" =~ ^[0-9]+$ ]] || { warn "优先级和配额必须是非负整数。"; return 1; }
+  controller_cli issue --state "$state" --controller-url "$controller_url" --node-id "$node_id" --name "$name" --priority "$priority" --quota-bytes "$quota" --public-ip "$public_ip"
+  printf '\n请把上面生成的一次性 node-install 命令复制到边缘 VPS 执行。注册码只能使用一次。\n'
+}
+
+controller_master_menu() {
+  local state listen interval answer
+  state="$(controller_require_state)" || return 1
+  printf '主控监听地址（默认 127.0.0.1:19090；公网使用请放到 HTTPS/WireGuard 后）：'; read -r listen; listen="${listen:-127.0.0.1:19090}"
+  printf 'DNS/健康检查间隔秒数（默认 30）：'; read -r interval; interval="${interval:-30}"
+  [[ "$interval" =~ ^[1-9][0-9]*$ ]] || { warn "间隔必须是正整数。"; return 1; }
+  controller_cli master-install --state "$state" --listen "$listen" --reconcile-interval "$interval"
+  printf '是否立即查看主控服务状态？[Y/n]：'; read -r answer
+  [[ ! "$answer" =~ ^[Nn]$ ]] && systemctl --no-pager --full status emby-proxy-master.service || true
+}
+
+controller_status_menu() {
+  local state
+  state="$(controller_require_state)" || return 1
+  controller_cli status --state "$state"
+}
+
+controller_reconcile_menu() {
+  local state
+  state="$(controller_require_state)" || return 1
+  controller_cli reconcile --state "$state"
+}
+
+controller_logs_menu() {
+  systemctl --no-pager -n 100 status emby-proxy-master.service || true
+}
+
 controller_menu() {
-  ui_header "多线路控制器" "主控 / 边缘注册 / 优先级配额"
-  printf '\n所有主控和边缘节点只需要安装同一个 emby-proxy 脚本。\n'
-  printf '  sudo ep controller init ...\n'
-  printf '  sudo ep controller issue ...\n'
-  printf '  sudo ep controller master-install ...\n'
-  printf '  sudo ep controller serve ...\n'
-  printf '\nissue 生成的 node-install 命令复制到边缘 VPS 执行，注册码只使用一次。\n'
-  ui_pause
+  local choice
+  while true; do
+    ui_header "多线路控制器" "主控 / 边缘注册 / 优先级配额"
+    printf '\n主控只负责节点注册、健康检查、优先级选择和 Cloudflare A 记录切换，不转发媒体流量。\n'
+    ui_item 1 "初始化主控入口" "固定源站、域名和可选 Cloudflare"
+    ui_item 2 "生成边缘注册命令" "一次性注册码，复制到边缘 VPS"
+    ui_item 3 "安装/启动主控服务" "systemd 每 30 秒检查"
+    ui_item 4 "查看主控状态" "节点健康、配额、当前节点"
+    ui_item 5 "立即同步 DNS" "按优先级选择健康节点"
+    ui_item 6 "查看主控服务" "systemd 状态和最近日志"
+    ui_item 0 "返回上一级" ""
+    ui_prompt; read -r choice
+    case "$choice" in
+      1) menu_run controller_init_menu ;;
+      2) menu_run controller_issue_menu ;;
+      3) menu_run controller_master_menu ;;
+      4) menu_run controller_status_menu ;;
+      5) menu_run controller_reconcile_menu ;;
+      6) menu_run controller_logs_menu ;;
+      0|q|Q) return ;;
+      *) warn "请输入有效序号。" ;;
+    esac
+  done
 }
 
 main_menu() {

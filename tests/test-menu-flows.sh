@@ -88,6 +88,46 @@ done
 grep -F '请输入有效序号' "$TMP_DIR/main.err" >/dev/null || fail "主菜单无效输入没有提示"
 grep -F '入口配置' "$TMP_DIR/main.out" >/dev/null || fail "主菜单缺少美化分组"
 
+# 多线路控制器子菜单：状态、DNS 同步和服务查看都必须能从菜单进入并返回。
+mkdir -p "$TMP_DIR/controller/sites.d" "$TMP_DIR/controller/backups"
+cat >"$TMP_DIR/controller/controller.json" <<'JSON'
+{"schema_version":1,"entry_id":"domain-test.example.com","domain":"test.example.com","source":"https://origin.example.com","engine":"caddy","nodes":{},"enroll_tokens":{},"active_node":null}
+JSON
+TRACE="$TMP_DIR/controller.trace" EMBY_PROXY_CONTROLLER_STATE="$TMP_DIR/controller/controller.json" \
+EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" \
+bash -c '
+  set --; source "$MANAGER_UNDER_TEST"
+  controller_cli() { printf "controller %s\n" "$*" >>"$TRACE"; }
+  systemctl() { printf "systemctl %s\n" "$*" >>"$TRACE"; return 0; }
+  controller_menu
+' <<'INPUT' >/dev/null
+x
+4
+5
+6
+0
+INPUT
+grep -Fx 'controller status' "$TMP_DIR/controller.trace" >/dev/null || fail "控制器菜单未进入状态查看"
+grep -Fx 'controller reconcile' "$TMP_DIR/controller.trace" >/dev/null || fail "控制器菜单未进入 DNS 同步"
+grep -Fx 'systemctl --no-pager' "$TMP_DIR/controller.trace" >/dev/null || fail "控制器菜单未进入服务查看"
+
+# 控制器初始化向导必须把用户输入完整传给底层 CLI。
+TRACE="$TMP_DIR/controller-wizard.trace" EMBY_PROXY_CONTROLLER_STATE="$TMP_DIR/controller/new.json" \
+EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" \
+bash -c '
+  set --; source "$MANAGER_UNDER_TEST"
+  controller_cli() { printf "controller %s\n" "$*" >>"$TRACE"; }
+  controller_init_menu
+' <<'INPUT' >/dev/null
+
+domain-test.example.com
+test.example.com
+https://origin.example.com
+caddy
+n
+INPUT
+grep -Fx 'controller init' "$TMP_DIR/controller-wizard.trace" >/dev/null || fail "控制器初始化向导未调用 init"
+
 # 入口管理子菜单：覆盖 1-6、返回、以及独立的删除入口分支。
 TRACE="$TMP_DIR/site.trace"
 TRACE="$TRACE" EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 \
