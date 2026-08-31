@@ -1584,6 +1584,9 @@ controller_init_menu() {
   printf '边缘节点使用的反代引擎 [caddy/nginx，默认 caddy]：'; read -r engine; engine="${engine:-caddy}"
   [[ "$engine" == "caddy" || "$engine" == "nginx" ]] || { warn "引擎只能是 caddy 或 nginx。"; return 1; }
   [[ -n "$entry_id" && -n "$domain" && -n "$source" ]] || { warn "入口 ID、域名和源站不能为空。"; return 1; }
+  [[ "$entry_id" =~ ^domain-[A-Za-z0-9.-]+$ ]] || { warn "入口 ID 必须类似 domain-emby.example.com。"; return 1; }
+  [[ "$domain" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { warn "对外域名格式无效。"; return 1; }
+  [[ "$source" =~ ^https?://[^[:space:]]+$ ]] || { warn "源站必须是 http:// 或 https:// URL，不能包含空格。"; return 1; }
   printf '是否启用 Cloudflare A 记录切换？[y/N]：'; read -r answer
   local -a args=(init --state "$state" --entry-id "$entry_id" --domain "$domain" --source "$source" --engine "$engine")
   if [[ "$answer" =~ ^[Yy]$ ]]; then
@@ -1610,6 +1613,9 @@ controller_issue_menu() {
   printf '配额字节数（0 表示不限额，默认 0）：'; read -r quota; quota="${quota:-0}"
   printf '边缘节点公网 IPv4（用于 DNS 切换）：'; read -r public_ip
   [[ -n "$controller_url" && -n "$node_id" && -n "$name" && -n "$public_ip" ]] || { warn "主控地址、节点信息和公网 IPv4 不能为空。"; return 1; }
+  [[ "$controller_url" =~ ^https?://[^[:space:]]+$ ]] || { warn "主控地址必须是 http:// 或 https:// URL。"; return 1; }
+  [[ "$node_id" =~ ^[A-Za-z0-9._-]+$ ]] || { warn "节点 ID 只能包含字母、数字、点、下划线和短横线。"; return 1; }
+  [[ "$public_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { warn "公网 IPv4 格式无效。"; return 1; }
   [[ "$priority" =~ ^[0-9]+$ && "$quota" =~ ^[0-9]+$ ]] || { warn "优先级和配额必须是非负整数。"; return 1; }
   controller_cli issue --state "$state" --controller-url "$controller_url" --node-id "$node_id" --name "$name" --priority "$priority" --quota-bytes "$quota" --public-ip "$public_ip"
   printf '\n请把上面生成的一次性 node-install 命令复制到边缘 VPS 执行。注册码只能使用一次。\n'
@@ -1620,6 +1626,7 @@ controller_master_menu() {
   state="$(controller_require_state)" || return 1
   printf '主控监听地址（默认 127.0.0.1:19090；公网使用请放到 HTTPS/WireGuard 后）：'; read -r listen; listen="${listen:-127.0.0.1:19090}"
   printf 'DNS/健康检查间隔秒数（默认 30）：'; read -r interval; interval="${interval:-30}"
+  [[ "$listen" =~ ^[^[:space:]]+:[0-9]{1,5}$ ]] || { warn "监听地址必须是 host:port 格式。"; return 1; }
   [[ "$interval" =~ ^[1-9][0-9]*$ ]] || { warn "间隔必须是正整数。"; return 1; }
   controller_cli master-install --state "$state" --listen "$listen" --reconcile-interval "$interval"
   printf '是否立即查看主控服务状态？[Y/n]：'; read -r answer
