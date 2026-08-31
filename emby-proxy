@@ -28,6 +28,7 @@ DOCTOR_WARN=0
 DOCTOR_ERROR=0
 MENU_ACTION_STATUS=0
 UNINSTALL_COMPLETED=0
+UPDATE_CHANGED=0
 
 if [[ -t 1 ]]; then
   RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; CYAN=$'\033[36m'; MAGENTA=$'\033[35m'
@@ -1216,10 +1217,19 @@ installed_manager_version() {
   "$MANAGER_BIN" version 2>/dev/null | awk 'NR==1 {print $2}'
 }
 
+file_sha256() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  else
+    shasum -a 256 "$file" | awk '{print $1}'
+  fi
+}
+
 restart_updated_manager() {
   local previous_version="$1" installed_version
   installed_version="$(installed_manager_version)"
-  [[ -n "$installed_version" && "$installed_version" != "$previous_version" ]] || return 0
+  (( UPDATE_CHANGED == 1 )) || [[ -n "$installed_version" && "$installed_version" != "$previous_version" ]] || return 0
   if [[ -t 0 && -t 1 ]]; then
     info "更新完成，正在自动重新启动管理面板……"
     exec "$MANAGER_BIN"
@@ -1229,6 +1239,8 @@ restart_updated_manager() {
 
 self_update() {
   local option="${1:-}" temp latest_version answer backup_dir timestamp manager_backup="" backend_backup="" nonce manager_url backend_url checksums_url
+  local remote_manager_sha remote_backend_sha current_manager_sha="" current_backend_sha=""
+  UPDATE_CHANGED=0
   [[ -z "$option" || "$option" == "--check" || "$option" == "--force" ]] || die "用法：emby-proxy update [--check|--force]"
   temp="$(mktemp -d /tmp/emby-proxy-update.XXXXXX)"
   nonce="$(date +%s%N)"
@@ -1248,13 +1260,23 @@ self_update() {
   bash -n "$temp/emby-proxy" "$temp/setup-emby-proxy.sh" || die "更新文件语法验证失败。"
   latest_version="$(sed -n 's/^readonly VERSION="\([^"]*\)"/\1/p' "$temp/emby-proxy" | head -n1)"
   [[ -n "$latest_version" ]] || die "无法识别更新版本。"
+  remote_manager_sha="$(file_sha256 "$temp/emby-proxy")"
+  remote_backend_sha="$(file_sha256 "$temp/setup-emby-proxy.sh")"
+  [[ -f "$MANAGER_BIN" ]] && current_manager_sha="$(file_sha256 "$MANAGER_BIN")"
+  [[ -f "$INSTALLED_BACKEND" ]] && current_backend_sha="$(file_sha256 "$INSTALLED_BACKEND")"
+  [[ -n "$current_manager_sha" && "$current_manager_sha" == "$remote_manager_sha" && \
+    -n "$current_backend_sha" && "$current_backend_sha" == "$remote_backend_sha" ]] || UPDATE_CHANGED=1
   printf '当前版本：%s\n远端版本：%s\n' "$VERSION" "$latest_version"
   if [[ "$option" == "--check" ]]; then
-    [[ "$latest_version" == "$VERSION" ]] && ok "当前已是最新版本。" || info "发现可更新版本：$latest_version"
+    if [[ "$UPDATE_CHANGED" == 0 && "$latest_version" == "$VERSION" ]]; then
+      ok "当前已是最新版本。"
+    else
+      info "发现可更新内容：$latest_version（版本或文件校验值发生变化）"
+    fi
     rm -rf "$temp"
     return
   fi
-  if [[ "$latest_version" == "$VERSION" && "$option" != "--force" ]]; then ok "当前已是最新版本。"; rm -rf "$temp"; return; fi
+  if [[ "$UPDATE_CHANGED" == 0 && "$latest_version" == "$VERSION" && "$option" != "--force" ]]; then ok "当前已是最新版本。"; rm -rf "$temp"; return; fi
   if [[ "$option" != "--force" ]]; then
     printf '确认更新管理命令和安装后端？[y/N]：'; read -r answer; [[ "$answer" =~ ^[Yy]$ ]] || die "已取消。"
   fi
@@ -1788,7 +1810,7 @@ main() {
     update)
       local previous_version="$VERSION"
       self_update "${2:-}"
-      restart_updated_manager "$previous_version"
+      [[ "${2:-}" == "--check" ]] || restart_updated_manager "$previous_version"
       ;;
     delete) [[ $# -ge 2 ]] || die "用法：emby-proxy delete <入口ID>"; delete_site "$2" ;;
     route)
