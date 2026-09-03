@@ -1595,6 +1595,12 @@ def master_install(a):
     Path('/etc/systemd/system/emby-proxy-master.service').write_text(unit); subprocess.run(['systemctl','daemon-reload'],check=False); subprocess.run(['systemctl','enable','--now','emby-proxy-master.service'],check=False); print('主控服务已启动：emby-proxy-master.service')
 def node_install(a):
     if os.geteuid() != 0: raise SystemExit('node-install 需要 root 或 sudo')
+    node_file=Path('/etc/emby-proxy/multiline-node.json')
+    if node_file.exists():
+        try: old=json.loads(node_file.read_text())
+        except (OSError, ValueError): old={}
+        if old.get('node_id') and (old.get('node_id') != a.node_id or old.get('controller','').rstrip('/') != a.controller_url.rstrip('/')):
+            raise RuntimeError('本机已有边缘节点 %s；一台 VPS 只支持一个 node-id，请先卸载旧节点再注册。' % old.get('node_id'))
     result=post_json(a.controller_url.rstrip('/')+'/enroll',{'entry_id':a.entry_id,'node_id':a.node_id,'name':a.name,'priority':a.priority,'quota_bytes':a.quota_bytes,'enroll_token':a.enroll_token,'public_ip':a.public_ip,'version':'single-script-0.1'})
     base=Path('/var/lib/emby-proxy'); base.mkdir(parents=True,exist_ok=True); Path('/etc/emby-proxy').mkdir(parents=True,exist_ok=True); used=base/'used_bytes'; used.touch(exist_ok=True)
     state={'controller':a.controller_url.rstrip('/'),'entry_id':a.entry_id,'node_id':a.node_id,'node_token':result['node_token'],'domain':result['domain'],'source':result['source'],'engine':result.get('engine','caddy'),'public_ip':a.public_ip,'used_file':str(used)}; atomic_write('/etc/emby-proxy/multiline-node.json',state); os.chmod('/etc/emby-proxy/multiline-node.json',0o600)
