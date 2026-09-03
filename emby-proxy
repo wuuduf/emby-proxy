@@ -1443,15 +1443,32 @@ controller_cli() {
   python3 - "$@" <<'PY'
 import argparse, copy, hashlib, json, os, secrets, shlex, subprocess, sys, threading, time
 import urllib.error, urllib.request
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Linux is the supported runtime
+    fcntl = None
 
 def now(): return int(time.time())
 def digest(v): return hashlib.sha256(v.encode()).hexdigest()
 def atomic_write(path, data):
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + '.tmp'); tmp.write_text(json.dumps(data, indent=2, sort_keys=True)); tmp.replace(path)
+@contextmanager
+def state_lock(path):
+    """Serialize CLI updates and the long-running master service."""
+    lock_path = Path(str(path) + '.lock'); lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if fcntl is not None: fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        if fcntl is not None: fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 def post_json(url, payload, token=''):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type':'application/json'}, method='POST')
     if token: req.add_header('Authorization', 'Bearer ' + token)
@@ -1466,11 +1483,15 @@ def post_json(url, payload, token=''):
 
 class Controller:
     def __init__(self, path):
-        self.path = Path(path); self.lock = threading.RLock(); self.state = json.loads(self.path.read_text())
+        self.path = Path(path); self.lock = threading.RLock(); self.state = {}
+        self.reload()
+    def reload(self):
+        self.state = json.loads(self.path.read_text())
         self.state.setdefault('schema_version', 1); self.state.setdefault('enroll_tokens', {}); self.state.setdefault('nodes', {}); self.state.setdefault('active_node', None)
     def save(self): atomic_write(self.path, self.state)
     def enroll(self, b):
-        with self.lock:
+        with self.lock, state_lock(self.path):
+            self.reload()
             if b.get('entry_id') != self.state['entry_id']: return 404, {'error':'unknown_entry'}
             node, reg = str(b.get('node_id','')), str(b.get('enroll_token',''))
             if not node or self.state['enroll_tokens'].get(node) != reg: return 403, {'error':'invalid_or_expired_enroll_token'}
@@ -1480,7 +1501,8 @@ class Controller:
             self.state['nodes'][node] = item; self.save()
             return 200, {'node_token':token, 'entry_id':self.state['entry_id'], 'domain':self.state['domain'], 'source':self.state['source'], 'engine':self.state.get('engine','caddy')}
     def heartbeat(self, b, token):
-        with self.lock:
+        with self.lock, state_lock(self.path):
+            self.reload()
             node = self.state['nodes'].get(str(b.get('node_id','')))
             if not node or node.get('token_hash') != digest(token): return 403, {'error':'invalid_node_token'}
             used = max(int(node.get('used_bytes',0)), int(b.get('used_bytes',0)))
@@ -1494,7 +1516,8 @@ class Controller:
             if n.get('healthy') and online and within: out.append((int(n.get('priority',0)), nid))
         return max(out, default=(0,None))[1]
     def reconcile(self):
-        with self.lock:
+        with self.lock, state_lock(self.path):
+            self.reload()
             selected=self.select(); previous=self.state.get('active_node'); changed=selected != previous; dns_result=None
             if selected and changed: dns_result=self.update_dns(selected)
             if not (isinstance(dns_result,dict) and dns_result.get('ok') is False): self.state['active_node']=selected
@@ -1513,7 +1536,9 @@ class Controller:
             return {'ok':True,'content':node['public_ip']} if result.get('success') else {'ok':False,'errors':result.get('errors',[])}
         except (OSError, urllib.error.URLError) as e: return {'ok':False,'error':str(e)}
     def public_status(self):
-        result=copy.deepcopy(self.state); result.pop('enroll_tokens',None)
+        with self.lock, state_lock(self.path):
+            self.reload(); result=copy.deepcopy(self.state)
+        result.pop('enroll_tokens',None)
         for n in result.get('nodes',{}).values(): n.pop('token_hash',None)
         result['selected_node']=self.select(); return result
 
@@ -1541,9 +1566,12 @@ class Server(ThreadingHTTPServer):
 def init_state(a):
     state={'schema_version':1,'entry_id':a.entry_id,'domain':a.domain,'source':a.source,'engine':a.engine,'active_node':None,'enroll_tokens':{},'nodes':{}}
     if a.zone_id and a.record_id and a.token_file: state['dns']={'provider':'cloudflare','zone_id':a.zone_id,'record_id':a.record_id,'token_file':a.token_file,'ttl':60}
-    atomic_write(a.state,state); print('已创建多线路入口：'+a.state)
+    with state_lock(a.state): atomic_write(a.state,state)
+    print('已创建多线路入口：'+a.state)
 def issue(a):
-    path=Path(a.state); state=json.loads(path.read_text()); token=secrets.token_urlsafe(24); state.setdefault('enroll_tokens',{})[a.node_id]=token; atomic_write(path,state)
+    path=Path(a.state)
+    with state_lock(path):
+        state=json.loads(path.read_text()); token=secrets.token_urlsafe(24); state.setdefault('enroll_tokens',{})[a.node_id]=token; atomic_write(path,state)
     values=['sudo','ep','controller','node-install','--controller-url',a.controller_url.rstrip('/'),'--entry-id',state['entry_id'],'--node-id',a.node_id,'--name',a.name,'--priority',str(a.priority),'--quota-bytes',str(a.quota_bytes)]
     if a.public_ip: values += ['--public-ip',a.public_ip]
     values += ['--enroll-token',token]
