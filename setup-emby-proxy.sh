@@ -2118,7 +2118,8 @@ main() {
   fi
   if (( MANAGER_ONLY )); then
     apt_install_prerequisites
-    install_manager_command
+    # manager-only 同时承担“安装/升级管理器”职责；旧版管理器不能挡住实验分支更新。
+    install_manager_command current || die "管理命令安装失败，请检查 GitHub 网络连接后重试。"
     [[ -x "$MANAGER_BIN" ]] || die "管理命令安装失败，请检查 GitHub 网络连接后重试。"
     release_operation_lock
     "$MANAGER_BIN" import || warn "管理命令已安装，但旧配置自动导入未完成；稍后运行 sudo emby-proxy import 重试。"
