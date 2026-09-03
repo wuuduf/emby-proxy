@@ -1575,10 +1575,10 @@ def issue(a):
     values=['sudo','ep','controller','node-install','--controller-url',a.controller_url.rstrip('/'),'--entry-id',state['entry_id'],'--node-id',a.node_id,'--name',a.name,'--priority',str(a.priority),'--quota-bytes',str(a.quota_bytes)]
     if a.public_ip: values += ['--public-ip',a.public_ip]
     values += ['--enroll-token',token]
-    # 边缘 VPS 可以是全新机器；命令先按需安装管理器，再执行一次性注册。
+    # 边缘 VPS 可以是全新机器或旧版管理器；命令先确保当前管理器具备 node-install，再注册。
     bootstrap_url=os.environ.get('EMBY_PROXY_BOOTSTRAP_URL','https://raw.githubusercontent.com/wuuduf/emby-proxy/refs/heads/codex/multiline-lab/setup-emby-proxy.sh')
     command=' '.join(shlex.quote(str(v)) for v in values)
-    print("command -v ep >/dev/null 2>&1 || (curl -fsSL %s | sudo bash -s -- --manager-only) && %s" % (shlex.quote(bootstrap_url), command))
+    print("(command -v ep >/dev/null 2>&1 && sudo ep controller --help 2>&1 | grep -q node-install) || (curl -fsSL %s | sudo bash -s -- --manager-only); %s" % (shlex.quote(bootstrap_url), command))
 def serve(a):
     host,port=a.listen.rsplit(':',1); c=Controller(a.state); s=Server((host,int(port)),c); print('多线路主控监听 '+a.listen,flush=True); stop=threading.Event()
     def loop():
