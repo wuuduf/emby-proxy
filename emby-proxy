@@ -1576,7 +1576,8 @@ def issue(a):
     if a.public_ip: values += ['--public-ip',a.public_ip]
     values += ['--enroll-token',token]
     # 边缘 VPS 可以是全新机器或旧版管理器；命令先确保当前管理器具备 node-install，再注册。
-    bootstrap_url=os.environ.get('EMBY_PROXY_BOOTSTRAP_URL','https://raw.githubusercontent.com/wuuduf/emby-proxy/refs/heads/codex/multiline-lab/setup-emby-proxy.sh')
+    # 使用不可变安装脚本，避免 raw 分支缓存把旧版 setup 送到全新边缘机；setup 内部仍会拉取当前 manager。
+    bootstrap_url=os.environ.get('EMBY_PROXY_BOOTSTRAP_URL','https://raw.githubusercontent.com/wuuduf/emby-proxy/2b42b59/setup-emby-proxy.sh')
     command=' '.join(shlex.quote(str(v)) for v in values)
     print("(command -v ep >/dev/null 2>&1 && sudo ep controller --help 2>&1 | grep -q node-install) || (curl -fsSL %s | sudo bash -s -- --manager-only); %s" % (shlex.quote(bootstrap_url), command))
 def serve(a):
