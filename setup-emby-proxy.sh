@@ -56,6 +56,8 @@ PROXY_ENGINE=""
 MANAGER_ONLY=0
 BOOTSTRAP_MENU=0
 ENTRY_WIZARD=0
+SKIP_DNS_CHECK=0
+SKIP_VERIFY=0
 ACCESS_SCHEME=""
 HTTPS_PORT=""
 DOMAIN_ENTRY_TYPE=""
@@ -137,6 +139,8 @@ usage() {
   -d, --domain DOMAIN       对外访问的反代域名（必须已解析到本 VPS）
       --https-port PORT     域名模式的 HTTPS 端口，默认 443；自定义范围 1024-65535
       --domain-mode MODE    域名入口：subdomain、port 或 path
+      --skip-dns-check      仅用于边缘节点预配置：暂不要求域名当前指向本 VPS
+      --skip-verify         仅用于边缘节点预配置：配置成功后不等待本机 HTTPS 验证
   -p, --path PATH           主源站的访问路径，默认 /；已有 Caddy 域名必须填写非根路径
   -u, --upstream ADDRESS    Emby 源站域名或 URL，可带端口
                             例如 origin.example.com、https://origin.example.com、http://1.2.3.4:8096
@@ -165,6 +169,10 @@ while (($#)); do
     --domain-mode)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       DOMAIN_ENTRY_TYPE="$2"; shift 2 ;;
+    --skip-dns-check)
+      SKIP_DNS_CHECK=1; shift ;;
+    --skip-verify)
+      SKIP_VERIFY=1; shift ;;
     -p|--path)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       PRIMARY_ROUTE_INPUT="$2"; shift 2 ;;
@@ -1066,6 +1074,10 @@ check_dns() {
 }
 
 prepare_access_target() {
+  if (( SKIP_DNS_CHECK )); then
+    warn "已跳过 DNS 指向检查（仅用于边缘节点预配置）；切换流量前必须让域名解析到本节点并确认 TLS。"
+    return 0
+  fi
   check_dns
 }
 
@@ -2131,7 +2143,11 @@ main() {
   else
     apply_nginx_config
   fi
-  verify_result
+  if (( SKIP_VERIFY )); then
+    warn "已跳过本机 HTTPS 验证（仅用于边缘节点预配置）；域名切换到本节点后请运行 ep diagnose。"
+  else
+    verify_result
+  fi
   persist_site_state
 }
 

@@ -1595,7 +1595,10 @@ def node_install(a):
     base=Path('/var/lib/emby-proxy'); base.mkdir(parents=True,exist_ok=True); Path('/etc/emby-proxy').mkdir(parents=True,exist_ok=True); used=base/'used_bytes'; used.touch(exist_ok=True)
     state={'controller':a.controller_url.rstrip('/'),'entry_id':a.entry_id,'node_id':a.node_id,'node_token':result['node_token'],'domain':result['domain'],'source':result['source'],'engine':result.get('engine','caddy'),'public_ip':a.public_ip,'used_file':str(used)}; atomic_write('/etc/emby-proxy/multiline-node.json',state); os.chmod('/etc/emby-proxy/multiline-node.json',0o600)
     backend=Path('/usr/local/lib/emby-proxy/setup-emby-proxy.sh')
-    if backend.exists(): subprocess.run([str(backend),'--engine',state['engine'],'--domain',state['domain'],'--upstream',state['source']],check=False)
+    if backend.exists():
+        # 边缘节点的域名通常仍指向当前活动节点，不能因为 DNS 尚未切换就阻止预配置。
+        # Caddy/Nginx 会先落配置；控制器切换 DNS 后再完成最终 TLS 验证。
+        subprocess.run([str(backend),'--engine',state['engine'],'--domain',state['domain'],'--upstream',state['source'],'--skip-dns-check','--skip-verify'],check=False)
     else: print('提醒：未找到安装后端，请先用同一个 emby-proxy 脚本完成本机反代配置。')
     Path('/etc/systemd/system/emby-proxy-node.service').write_text('[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/emby-proxy controller node --state /etc/emby-proxy/multiline-node.json\n')
     Path('/etc/systemd/system/emby-proxy-node.timer').write_text('[Unit]\n[Timer]\nOnBootSec=20s\nOnUnitActiveSec=30s\nPersistent=true\n[Install]\nWantedBy=timers.target\n'); subprocess.run(['systemctl','daemon-reload'],check=False); subprocess.run(['systemctl','enable','--now','emby-proxy-node.timer'],check=False); node_once(type('A',(),{'state':'/etc/emby-proxy/multiline-node.json'})()); print('边缘节点注册成功：'+a.node_id)
