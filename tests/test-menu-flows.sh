@@ -17,7 +17,7 @@ cat >"$TMP_DIR/selector/sites.d/domain-select.example.com.json" <<'JSON'
 JSON
 EMBY_PROXY_STATE_HOME="$TMP_DIR/selector" EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 \
 EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
-  set --; source "$MANAGER_UNDER_TEST"
+  source "$MANAGER_UNDER_TEST"
   selected="$(select_site_id)"
   [[ "$selected" == domain-select.example.com ]]
 ' <<<'1' 2>"$TMP_DIR/selector-menu.out" || fail "入口选择器返回值混入了菜单文本"
@@ -34,7 +34,7 @@ grep -F '已返回上一级菜单' "$TMP_DIR/selector-invalid.out" >/dev/null ||
 # 复现真实交互：主菜单选 2 后输入错误入口序号，必须回到主菜单而不是退出脚本。
 EMBY_PROXY_STATE_HOME="$TMP_DIR/selector" EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 \
 EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
-  set --; source "$MANAGER_UNDER_TEST"
+  source "$MANAGER_UNDER_TEST"
   print_status() { printf "status\n"; }
   main_menu
 ' <<'INPUT' >"$TMP_DIR/selector-return.out" 2>"$TMP_DIR/selector-return.err"
@@ -120,13 +120,32 @@ bash -c '
   controller_init_menu
 ' <<'INPUT' >/dev/null
 
-domain-test.example.com
+test.example.com
+https://origin.example.com
+caddy
+n
 test.example.com
 https://origin.example.com
 caddy
 n
 INPUT
 grep -Fx 'controller init' "$TMP_DIR/controller-wizard.trace" >/dev/null || fail "控制器初始化向导未调用 init"
+
+# 入口 ID 不再要求用户手填：CLI 省略 --entry-id 时按规范自动生成并统一小写。
+AUTO_STATE="$TMP_DIR/controller/auto.json"
+EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  source "$MANAGER_UNDER_TEST"
+  controller_cli init --state "$1" --domain EXAMPLE.COM --source https://origin.example.com --engine caddy
+' bash "$AUTO_STATE" >/dev/null
+[[ "$(jq -r .entry_id "$AUTO_STATE")" == "domain-example.com" ]] || fail "入口 ID 未按域名自动生成"
+
+# 节点 ID 由公网 IP 自动生成；重复 IP 会安全追加序号。配额支持人类可读单位。
+printf '%s\n' '{"nodes":{"edge-192-0-2-1":{}},"enroll_tokens":{}}' >"$TMP_DIR/controller/node.json"
+EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  source "$MANAGER_UNDER_TEST"
+  [[ "$(controller_generate_node_id "$1" 192.0.2.1)" == "edge-192-0-2-1-2" ]]
+  [[ "$(controller_parse_quota 1.5 GB)" == "1610612736" ]]
+' bash "$TMP_DIR/controller/node.json" || fail "节点 ID 或配额单位换算错误"
 
 # 入口管理子菜单：覆盖 1-6、返回、以及独立的删除入口分支。
 TRACE="$TMP_DIR/site.trace"

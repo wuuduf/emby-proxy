@@ -195,7 +195,7 @@ sudo ep controller master-install --state /etc/emby-proxy/controller.json \
 
 也可以直接在 `ep` 菜单选择 `11 多线路控制器`，按向导完成：初始化主控入口、生成一次性边缘注册命令、安装/启动主控服务、查看节点状态、立即同步 DNS 和查看主控服务状态。输入错误或底层检查失败只会返回控制器菜单，不会退出整个面板。
 
-菜单初始化时不需要手动查找 `zone_id`、`record_id` 或填写文件路径：脚本会隐藏读取 API Token，将它保存为主控本地 `600` 权限的 `cf.token`，然后按对外域名自动查找匹配的 Zone 和 A 记录。该域名必须先在 Cloudflare DNS 中存在一条 A 记录（建议使用 DNS only/灰云）。命令行 `controller init` 仍保留显式参数，适合自动化部署。
+菜单初始化时不需要手动查找 `entry_id`、`zone_id`、`record_id` 或填写文件路径：脚本会根据域名自动生成 `domain-<domain>` 入口 ID，隐藏读取 API Token，将它保存为主控本地 `600` 权限的 `cf.token`，然后按对外域名自动查找匹配的 Zone 和 A 记录。该域名必须先在 Cloudflare DNS 中存在一条 A 记录（建议使用 DNS only/灰云）。命令行 `controller init` 也支持省略 `--entry-id` 自动生成，或显式传入自定义 ID 以兼容自动化部署。
 
 `0.0.0.0:19090` 只适合配合 HTTPS/WireGuard 使用；不要把未加密控制器端口直接暴露到公网。
 
@@ -251,21 +251,19 @@ ep
 | 提示 | 示例 | 说明 |
 | --- | --- | --- |
 | 状态文件 | `/etc/emby-proxy/controller.json` | 直接回车使用默认值 |
-| 入口 ID | `domain-emby.example.com` | 同一入口的唯一标识 |
 | 对外域名 | `emby.example.com` | 必须与 Cloudflare A 记录名称一致 |
 | 固定源站 | `https://origin.example.com` | 所有边缘使用同一个源站 |
 | 引擎 | `caddy` | 所有边缘应保持一致 |
 | Cloudflare | `y` | 需要自动切换 DNS 时启用 |
 | API Token | 直接粘贴 | 输入时隐藏，不需要创建文件 |
 
-脚本会根据域名自动查找 `zone_id` 和 `record_id`，并把 Token 保存为主控本地 `600` 权限文件。不要把 Token 写进 Git、工单或注册命令。
+脚本会自动把入口 ID 生成为 `domain-emby.example.com`（域名统一转小写），再根据域名查找 `zone_id` 和 `record_id`，并把 Token 保存为主控本地 `600` 权限文件。不要把 Token 写进 Git、工单或注册命令。
 
 也可以使用命令行初始化（适合自动化）：
 
 ```bash
 sudo ep controller init \
   --state /etc/emby-proxy/controller.json \
-  --entry-id domain-emby.example.com \
   --domain emby.example.com \
   --source https://origin.example.com \
   --engine caddy \
@@ -323,18 +321,20 @@ sudo ufw allow 443/tcp
 
 ```text
 主控访问地址：http://161.114.15.74:19090
-节点 ID：edge-a
 节点名称：香港线路
+边缘节点公网 IPv4：64.49.28.81
 优先级：100
-配额字节数：1099511627776
-边缘公网 IPv4：64.49.28.81
+配额数值：1
+配额单位：TB
 ```
 
 参数含义：
 
 - `priority` 越大越优先，例如 `100` 优先于 `50`；
-- `quota-bytes` 为该节点允许使用的累计字节数，`0` 表示不限额；
-- `node-id` 在同一个主控入口中必须唯一，一台 VPS 只注册一个节点；
+- 节点 ID 不需要手填，脚本会根据公网 IPv4 自动生成，例如 `edge-64-49-28-81`；如果重复会自动追加序号；
+- 配额直接输入数值和单位，支持 `B`、`KB`、`MB`、`GB`、`TB`，例如 `1 TB` 会转换为 `1099511627776` 字节；
+- 配额数值为 `0` 表示不限额；
+- 自动生成的节点 ID 在同一个主控入口中唯一，一台 VPS 只注册一个节点；
 - 注册码是一次性的，只能在对应边缘 VPS 使用一次。
 
 复制菜单输出的**整行命令**，不要把 Markdown 的 `[]()` 或提示文字一起复制。

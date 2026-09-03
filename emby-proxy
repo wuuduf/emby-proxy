@@ -1571,7 +1571,9 @@ class Server(ThreadingHTTPServer):
     def __init__(self, address, controller): super().__init__(address, Handler); self.controller=controller
 
 def init_state(a):
-    state={'schema_version':1,'entry_id':a.entry_id,'domain':a.domain,'source':a.source,'engine':a.engine,'active_node':None,'enroll_tokens':{},'nodes':{}}
+    domain=a.domain.strip().lower().rstrip('.')
+    entry_id=(a.entry_id.strip() if a.entry_id else '') or ('domain-'+domain)
+    state={'schema_version':1,'entry_id':entry_id,'domain':domain,'source':a.source,'engine':a.engine,'active_node':None,'enroll_tokens':{},'nodes':{}}
     if a.zone_id and a.record_id and a.token_file: state['dns']={'provider':'cloudflare','zone_id':a.zone_id,'record_id':a.record_id,'token_file':a.token_file,'ttl':60}
     with state_lock(a.state): atomic_write(a.state,state)
     print('已创建多线路入口：'+a.state)
@@ -1631,7 +1633,7 @@ def node_once(a):
     result=post_json(st['controller']+'/heartbeat',{'node_id':st['node_id'],'used_bytes':used,'healthy':healthy,'public_ip':st.get('public_ip'),'event':'edge_heartbeat','version':'single-script-0.1'},st['node_token']); print(json.dumps(result,ensure_ascii=False))
 def main():
     p=argparse.ArgumentParser(prog='emby-proxy controller'); sub=p.add_subparsers(dest='cmd',required=True)
-    x=sub.add_parser('init'); x.add_argument('--state',required=True); x.add_argument('--entry-id',required=True); x.add_argument('--domain',required=True); x.add_argument('--source',required=True); x.add_argument('--engine',default='caddy'); x.add_argument('--zone-id'); x.add_argument('--record-id'); x.add_argument('--token-file'); x.set_defaults(fn=init_state)
+    x=sub.add_parser('init'); x.add_argument('--state',required=True); x.add_argument('--entry-id',default=''); x.add_argument('--domain',required=True); x.add_argument('--source',required=True); x.add_argument('--engine',default='caddy'); x.add_argument('--zone-id'); x.add_argument('--record-id'); x.add_argument('--token-file'); x.set_defaults(fn=init_state)
     x=sub.add_parser('issue'); x.add_argument('--state',required=True); x.add_argument('--controller-url',required=True); x.add_argument('--node-id',required=True); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',required=True); x.set_defaults(fn=issue)
     x=sub.add_parser('serve'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=serve)
     x=sub.add_parser('master-install'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=master_install)
@@ -1692,12 +1694,14 @@ controller_init_menu() {
     printf '状态文件已存在，覆盖会清空节点注册信息，确认？[y/N]：'; read -r answer
     [[ "$answer" =~ ^[Yy]$ ]] || { warn "已取消初始化。"; return 0; }
   fi
-  printf '入口 ID（例如 domain-emby.example.com）：'; read -r entry_id
   printf '对外域名（例如 emby.example.com）：'; read -r domain
+  domain="$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')"
+  entry_id="domain-$domain"
+  printf '[信息] 已自动生成入口 ID：%s\n' "$entry_id"
   printf 'Emby 源站 URL（固定源站）：'; read -r source
   printf '边缘节点使用的反代引擎 [caddy/nginx，默认 caddy]：'; read -r engine; engine="${engine:-caddy}"
   [[ "$engine" == "caddy" || "$engine" == "nginx" ]] || { warn "引擎只能是 caddy 或 nginx。"; return 1; }
-  [[ -n "$entry_id" && -n "$domain" && -n "$source" ]] || { warn "入口 ID、域名和源站不能为空。"; return 1; }
+  [[ -n "$domain" && -n "$source" ]] || { warn "域名和源站不能为空。"; return 1; }
   [[ "$entry_id" =~ ^domain-[A-Za-z0-9.-]+$ ]] || { warn "入口 ID 必须类似 domain-emby.example.com。"; return 1; }
   [[ "$domain" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { warn "对外域名格式无效。"; return 1; }
   [[ "$source" =~ ^https?://[^[:space:]]+$ ]] || { warn "源站必须是 http:// 或 https:// URL，不能包含空格。"; return 1; }
@@ -1717,15 +1721,55 @@ controller_init_menu() {
   controller_cli "${args[@]}"
 }
 
+controller_generate_node_id() {
+  local state="$1" public_ip="$2" base candidate suffix=2
+  base="edge-$(printf '%s' "$public_ip" | tr '.' '-')"
+  candidate="$base"
+  while jq -e --arg id "$candidate" '(.nodes[$id] != null) or (.enroll_tokens[$id] != null)' "$state" >/dev/null 2>&1; do
+    candidate="${base}-${suffix}"
+    ((suffix++))
+  done
+  printf '%s' "$candidate"
+}
+
+controller_parse_quota() {
+  local value="$1" unit="$2"
+  python3 - "$value" "$unit" <<'PY'
+import sys
+from decimal import Decimal, InvalidOperation
+value, unit = sys.argv[1], sys.argv[2].upper()
+units = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4}
+if unit not in units:
+    raise SystemExit('单位必须是 B、KB、MB、GB 或 TB')
+try:
+    number = Decimal(value)
+except InvalidOperation:
+    raise SystemExit('配额数值必须是非负数字')
+if number < 0 or not number.is_finite():
+    raise SystemExit('配额数值必须是非负数字')
+result = int(number * units[unit])
+if result < 0:
+    raise SystemExit('配额超出可支持范围')
+print(result)
+PY
+}
+
 controller_issue_menu() {
-  local state node_id name priority quota public_ip controller_url answer
+  local state node_id name priority quota quota_value quota_unit public_ip controller_url answer
   state="$(controller_require_state)" || return 1
   printf '主控访问地址（例如 https://control.example.com:19090）：'; read -r controller_url
-  printf '节点 ID（例如 edge-a）：'; read -r node_id
   printf '节点名称（例如 香港线路）：'; read -r name
-  printf '优先级（数字越大越优先，默认 100）：'; read -r priority; priority="${priority:-100}"
-  printf '配额字节数（0 表示不限额，默认 0）：'; read -r quota; quota="${quota:-0}"
   printf '边缘节点公网 IPv4（用于 DNS 切换）：'; read -r public_ip
+  node_id="$(controller_generate_node_id "$state" "$public_ip")"
+  info "已自动生成节点 ID：$node_id"
+  printf '优先级（数字越大越优先，默认 100）：'; read -r priority; priority="${priority:-100}"
+  printf '配额数值（0 表示不限额，默认 0）：'; read -r quota_value; quota_value="${quota_value:-0}"
+  printf '配额单位 [B/KB/MB/GB/TB，默认 GB]：'; read -r quota_unit; quota_unit="${quota_unit:-GB}"
+  quota_unit="$(printf '%s' "$quota_unit" | tr '[:lower:]' '[:upper:]')"
+  if ! quota="$(controller_parse_quota "$quota_value" "$quota_unit" 2>&1)"; then
+    warn "配额输入无效：$quota"; return 1
+  fi
+  info "配额换算结果：$quota_value $quota_unit = $quota bytes"
   [[ -n "$controller_url" && -n "$node_id" && -n "$name" && -n "$public_ip" ]] || { warn "主控地址、节点信息和公网 IPv4 不能为空。"; return 1; }
   [[ "$controller_url" =~ ^https?://[^[:space:]]+$ ]] || { warn "主控地址必须是 http:// 或 https:// URL。"; return 1; }
   [[ "$node_id" =~ ^[A-Za-z0-9._-]+$ ]] || { warn "节点 ID 只能包含字母、数字、点、下划线和短横线。"; return 1; }
