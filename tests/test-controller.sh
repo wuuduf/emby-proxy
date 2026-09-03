@@ -28,10 +28,13 @@ run_cli serve --state "$STATE" --listen "127.0.0.1:$PORT" --reconcile-interval 1
 PID=$!
 sleep 0.2
 for i in $(seq 1 8); do
-  run_cli issue \
+  output="$(run_cli issue \
     --state "$STATE" --controller-url "http://127.0.0.1:$PORT" \
     --node-id "edge-$i" --name "edge-$i" --priority "$i" \
-    --quota-bytes 0 --public-ip "192.0.2.$i" >/dev/null
+    --quota-bytes 0 --public-ip "192.0.2.$i")"
+  if [[ "$i" == 1 ]]; then
+    grep -F 'command -v ep' <<<"$output" >/dev/null || fail "生成命令没有包含全新边缘机自引导安装"
+  fi
 done
 python3 - "$STATE" <<'PY' || exit 1
 import json, sys
