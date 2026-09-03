@@ -21,7 +21,7 @@ readonly INSTALLED_BACKEND="${EMBY_PROXY_INSTALLED_BACKEND:-/usr/local/lib/emby-
 readonly MANAGER_LIBEXEC="${EMBY_PROXY_LIBEXEC:-/usr/local/lib/emby-proxy}"
 readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
 readonly SHORT_BIN="${EMBY_PROXY_SHORT_BIN:-/usr/local/bin/ep}"
-readonly UPDATE_BASE_URL="${EMBY_PROXY_UPDATE_BASE_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/codex/multiline-lab}"
+readonly UPDATE_BASE_URL="${EMBY_PROXY_UPDATE_BASE_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/refs/heads/codex/multiline-lab}"
 LOCK_FD=""
 DOCTOR_OK=0
 DOCTOR_WARN=0
@@ -1576,7 +1576,7 @@ def issue(a):
     if a.public_ip: values += ['--public-ip',a.public_ip]
     values += ['--enroll-token',token]
     # 边缘 VPS 可以是全新机器；命令先按需安装管理器，再执行一次性注册。
-    bootstrap_url=os.environ.get('EMBY_PROXY_BOOTSTRAP_URL','https://raw.githubusercontent.com/wuuduf/emby-proxy/codex/multiline-lab/setup-emby-proxy.sh')
+    bootstrap_url=os.environ.get('EMBY_PROXY_BOOTSTRAP_URL','https://raw.githubusercontent.com/wuuduf/emby-proxy/refs/heads/codex/multiline-lab/setup-emby-proxy.sh')
     command=' '.join(shlex.quote(str(v)) for v in values)
     print("command -v ep >/dev/null 2>&1 || (curl -fsSL %s | sudo bash -s -- --manager-only) && %s" % (shlex.quote(bootstrap_url), command))
 def serve(a):
