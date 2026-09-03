@@ -20,6 +20,9 @@ readonly HEALTH_PATH="/_emby_proxy_health"
 readonly INSTALLED_BACKEND="${EMBY_PROXY_INSTALLED_BACKEND:-/usr/local/lib/emby-proxy/setup-emby-proxy.sh}"
 readonly MANAGER_LIBEXEC="${EMBY_PROXY_LIBEXEC:-/usr/local/lib/emby-proxy}"
 readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
+# 早期版本曾把管理命令直接装到 /usr/local/bin/emby-proxy；仅在内容带有
+# 本项目标识时清理，避免误删同名的第三方程序。
+readonly LEGACY_MANAGER_BIN="${EMBY_PROXY_LEGACY_MANAGER_BIN:-/usr/local/bin/emby-proxy}"
 readonly SHORT_BIN="${EMBY_PROXY_SHORT_BIN:-/usr/local/bin/ep}"
 readonly UPDATE_BASE_URL="${EMBY_PROXY_UPDATE_BASE_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/refs/heads/codex/multiline-lab}"
 LOCK_FD=""
@@ -1081,7 +1084,7 @@ uninstall_archive() {
   install_managed_dir 0750 "$backup_root"
   # 只打包脚本明确管理的路径；不会把整台机器或 Caddy/Nginx 证书带走。
   for file in "$STATE_HOME" "$CADDYFILE" "$NGINX_LEGACY_CONFIG" "$NGINX_HASH_CONFIG" \
-    "$NGINX_ACME_ROOT" "$MANAGER_BIN" "$SHORT_BIN" "$INSTALLED_BACKEND" "$MANAGER_LIBEXEC" \
+    "$NGINX_ACME_ROOT" "$MANAGER_BIN" "$LEGACY_MANAGER_BIN" "$SHORT_BIN" "$INSTALLED_BACKEND" "$MANAGER_LIBEXEC" \
     /etc/systemd/system/emby-proxy-master.service /etc/systemd/system/emby-proxy-node.service \
     /etc/systemd/system/emby-proxy-node.timer; do
     [[ -e "$file" || -L "$file" ]] && items+=("$file")
@@ -1205,6 +1208,10 @@ uninstall_manager() {
     warn "自定义管理目录未满足安全路径检查，已保留：$STATE_HOME"
   fi
   rm -f -- "$INSTALLED_BACKEND" "$MANAGER_BIN"
+  if [[ "$LEGACY_MANAGER_BIN" != "$MANAGER_BIN" && -f "$LEGACY_MANAGER_BIN" ]] &&
+     grep -Fq 'Emby 反向代理管理命令' "$LEGACY_MANAGER_BIN" 2>/dev/null; then
+    rm -f -- "$LEGACY_MANAGER_BIN"
+  fi
   if [[ -L "$SHORT_BIN" ]] && [[ "$(readlink "$SHORT_BIN" 2>/dev/null || true)" == "$MANAGER_BIN" ]]; then rm -f -- "$SHORT_BIN"; fi
   if [[ -d "$MANAGER_LIBEXEC" && "$MANAGER_LIBEXEC" == */emby-proxy ]]; then rm -rf -- "$MANAGER_LIBEXEC"; fi
   UNINSTALL_COMPLETED=1
