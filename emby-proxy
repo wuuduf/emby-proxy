@@ -1601,7 +1601,8 @@ def node_install(a):
     if backend.exists():
         # 边缘节点的域名通常仍指向当前活动节点，不能因为 DNS 尚未切换就阻止预配置。
         # Caddy/Nginx 会先落配置；控制器切换 DNS 后再完成最终 TLS 验证。
-        subprocess.run([str(backend),'--engine',state['engine'],'--domain',state['domain'],'--upstream',state['source'],'--skip-dns-check','--skip-verify'],check=False)
+        setup_result=subprocess.run([str(backend),'--engine',state['engine'],'--domain',state['domain'],'--upstream',state['source'],'--skip-dns-check','--skip-verify'],check=False)
+        if setup_result.returncode != 0: print('提醒：边缘反代预配置未完成；节点已注册但会保持不健康，请先修复 '+state['engine']+' 配置后重试。')
     else: print('提醒：未找到安装后端，请先用同一个 emby-proxy 脚本完成本机反代配置。')
     Path('/etc/systemd/system/emby-proxy-node.service').write_text('[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/emby-proxy controller node --state /etc/emby-proxy/multiline-node.json\n')
     Path('/etc/systemd/system/emby-proxy-node.timer').write_text('[Unit]\n[Timer]\nOnBootSec=20s\nOnUnitActiveSec=30s\nPersistent=true\n[Install]\nWantedBy=timers.target\n'); subprocess.run(['systemctl','daemon-reload'],check=False); subprocess.run(['systemctl','enable','--now','emby-proxy-node.timer'],check=False); node_once(type('A',(),{'state':'/etc/emby-proxy/multiline-node.json'})()); print('边缘节点注册成功：'+a.node_id)
@@ -1609,7 +1610,8 @@ def node_once(a):
     st=json.loads(Path(a.state).read_text()); used=0
     try: used=int(''.join(Path(st.get('used_file','')).read_text().split()) or 0)
     except (OSError,ValueError): pass
-    healthy=any(subprocess.run(['systemctl','is-active','--quiet',svc],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0 for svc in ('caddy','nginx'))
+    service=st.get('engine','caddy')
+    healthy=service in ('caddy','nginx') and subprocess.run(['systemctl','is-active','--quiet',service],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
     result=post_json(st['controller']+'/heartbeat',{'node_id':st['node_id'],'used_bytes':used,'healthy':healthy,'public_ip':st.get('public_ip'),'event':'edge_heartbeat','version':'single-script-0.1'},st['node_token']); print(json.dumps(result,ensure_ascii=False))
 def main():
     p=argparse.ArgumentParser(prog='emby-proxy controller'); sub=p.add_subparsers(dest='cmd',required=True)
