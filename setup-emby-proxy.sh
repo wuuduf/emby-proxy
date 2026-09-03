@@ -860,7 +860,7 @@ apt_install_prerequisites() {
   apt-get update -qq
   apt-get install -y --no-install-recommends \
     debian-keyring debian-archive-keyring apt-transport-https \
-    ca-certificates curl gnupg dnsutils iproute2 jq util-linux >/dev/null
+    ca-certificates curl gnupg dnsutils iproute2 jq util-linux python3 >/dev/null
   ok "基础依赖已就绪。"
 }
 
