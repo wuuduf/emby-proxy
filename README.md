@@ -183,9 +183,9 @@ sudo ep controller init --state /etc/emby-proxy/controller.json \
   --domain emby.example.com --source https://origin.example.com \
   --zone-id <ZONE_ID> --record-id <RECORD_ID> --token-file /etc/emby-proxy/cf.token
 
-# 为每台边缘 VPS 生成一次性注册命令；priority 数字越大越优先，quota 为字节数，0 表示不限额
+# 为每台边缘 VPS 生成一次性注册命令；省略 --node-id 时按公网 IP 自动生成
 sudo ep controller issue --state /etc/emby-proxy/controller.json \
-  --controller-url https://control.example.com:19090 --node-id edge-a \
+  --controller-url https://control.example.com:19090 \
   --name 香港线路 --priority 100 --quota-bytes 1099511627776 --public-ip <EDGE_A_IP>
 
 # 主控循环每 30 秒检查健康节点并同步 DNS（安装为 systemd 服务）
@@ -331,7 +331,7 @@ sudo ufw allow 443/tcp
 参数含义：
 
 - `priority` 越大越优先，例如 `100` 优先于 `50`；
-- 节点 ID 不需要手填，脚本会根据公网 IPv4 自动生成，例如 `edge-64-49-28-81`；如果重复会自动追加序号；
+- 节点 ID 不需要手填，菜单和 CLI 在省略 `--node-id` 时会根据公网 IPv4 自动生成，例如 `edge-64-49-28-81`；如果重复会自动追加序号；
 - 配额直接输入数值和单位，支持 `B`、`KB`、`MB`、`GB`、`TB`，例如 `1 TB` 会转换为 `1099511627776` 字节；
 - 配额数值为 `0` 表示不限额；
 - 自动生成的节点 ID 在同一个主控入口中唯一，一台 VPS 只注册一个节点；

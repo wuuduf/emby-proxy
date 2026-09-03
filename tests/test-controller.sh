@@ -44,6 +44,12 @@ assert len(tokens) == 8, f'expected 8 enrollment tokens, got {len(tokens)}'
 assert set(tokens) == {f'edge-{i}' for i in range(1, 9)}, tokens
 PY
 
+# CLI 也允许省略 --node-id，按公网 IPv4 生成可读且唯一的节点 ID。
+AUTO_STATE="$TMP_DIR/auto-issue.json"
+run_cli init --state "$AUTO_STATE" --domain auto.example.com --source https://origin.example.com --engine caddy >/dev/null
+auto_output="$(run_cli issue --state "$AUTO_STATE" --controller-url http://127.0.0.1:19090 --name auto --priority 1 --quota-bytes 0 --public-ip 192.0.2.99)"
+grep -F -- '--node-id edge-192-0-2-99' <<<"$auto_output" >/dev/null || fail "CLI 省略 node-id 时未自动生成"
+
 kill "$PID" 2>/dev/null || true
 PID=""
 printf 'PASS: controller state locking preserves concurrent enrollment tokens\n'

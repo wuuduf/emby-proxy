@@ -1448,7 +1448,7 @@ service_menu() {
 controller_cli() {
   command -v python3 >/dev/null 2>&1 || die "多线路功能需要 python3。"
   python3 - "$@" <<'PY'
-import argparse, copy, hashlib, json, os, secrets, shlex, subprocess, sys, threading, time
+import argparse, copy, hashlib, json, os, re, secrets, shlex, subprocess, sys, threading, time
 import urllib.error, urllib.request
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1577,11 +1577,20 @@ def init_state(a):
     if a.zone_id and a.record_id and a.token_file: state['dns']={'provider':'cloudflare','zone_id':a.zone_id,'record_id':a.record_id,'token_file':a.token_file,'ttl':60}
     with state_lock(a.state): atomic_write(a.state,state)
     print('已创建多线路入口：'+a.state)
+def auto_node_id(state, public_ip):
+    base='edge-'+re.sub(r'[^A-Za-z0-9]+','-',str(public_ip).strip()).strip('-').lower()
+    base=base or 'edge-node'
+    candidate=base; suffix=2
+    while candidate in state.get('nodes',{}) or candidate in state.get('enroll_tokens',{}):
+        candidate='%s-%s' % (base,suffix); suffix+=1
+    return candidate
 def issue(a):
     path=Path(a.state)
     with state_lock(path):
-        state=json.loads(path.read_text()); token=secrets.token_urlsafe(24); state.setdefault('enroll_tokens',{})[a.node_id]=token; atomic_write(path,state)
-    values=['sudo','ep','controller','node-install','--controller-url',a.controller_url.rstrip('/'),'--entry-id',state['entry_id'],'--node-id',a.node_id,'--name',a.name,'--priority',str(a.priority),'--quota-bytes',str(a.quota_bytes)]
+        state=json.loads(path.read_text()); state.setdefault('enroll_tokens',{}); state.setdefault('nodes',{})
+        node_id=(a.node_id or '').strip() or auto_node_id(state,a.public_ip)
+        token=secrets.token_urlsafe(24); state['enroll_tokens'][node_id]=token; atomic_write(path,state)
+    values=['sudo','ep','controller','node-install','--controller-url',a.controller_url.rstrip('/'),'--entry-id',state['entry_id'],'--node-id',node_id,'--name',a.name,'--priority',str(a.priority),'--quota-bytes',str(a.quota_bytes)]
     if a.public_ip: values += ['--public-ip',a.public_ip]
     values += ['--enroll-token',token]
     # 边缘 VPS 可以是全新机器或旧版管理器；命令先确保当前管理器具备 node-install，再注册。
@@ -1634,7 +1643,7 @@ def node_once(a):
 def main():
     p=argparse.ArgumentParser(prog='emby-proxy controller'); sub=p.add_subparsers(dest='cmd',required=True)
     x=sub.add_parser('init'); x.add_argument('--state',required=True); x.add_argument('--entry-id',default=''); x.add_argument('--domain',required=True); x.add_argument('--source',required=True); x.add_argument('--engine',default='caddy'); x.add_argument('--zone-id'); x.add_argument('--record-id'); x.add_argument('--token-file'); x.set_defaults(fn=init_state)
-    x=sub.add_parser('issue'); x.add_argument('--state',required=True); x.add_argument('--controller-url',required=True); x.add_argument('--node-id',required=True); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',required=True); x.set_defaults(fn=issue)
+    x=sub.add_parser('issue'); x.add_argument('--state',required=True); x.add_argument('--controller-url',required=True); x.add_argument('--node-id',default=''); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',required=True); x.set_defaults(fn=issue)
     x=sub.add_parser('serve'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=serve)
     x=sub.add_parser('master-install'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=master_install)
     x=sub.add_parser('node-install'); x.add_argument('--controller-url',required=True); x.add_argument('--entry-id',required=True); x.add_argument('--node-id',required=True); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',required=True); x.add_argument('--enroll-token',required=True); x.set_defaults(fn=node_install)
