@@ -1618,8 +1618,10 @@ def node_install(a):
         setup_result=subprocess.run([str(backend),'--engine',state['engine'],'--domain',state['domain'],'--upstream',state['source'],'--skip-dns-check','--skip-verify'],check=False)
         if setup_result.returncode != 0: print('提醒：边缘反代预配置未完成；节点已注册但会保持不健康，请先修复 '+state['engine']+' 配置后重试。')
     else: print('提醒：未找到安装后端，请先用同一个 emby-proxy 脚本完成本机反代配置。')
-    Path('/etc/systemd/system/emby-proxy-node.service').write_text('[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/emby-proxy controller node --state /etc/emby-proxy/multiline-node.json\n')
-    Path('/etc/systemd/system/emby-proxy-node.timer').write_text('[Unit]\n[Timer]\nOnBootSec=20s\nOnUnitActiveSec=30s\nPersistent=true\n[Install]\nWantedBy=timers.target\n'); subprocess.run(['systemctl','daemon-reload'],check=False); subprocess.run(['systemctl','enable','--now','emby-proxy-node.timer'],check=False); node_once(type('A',(),{'state':'/etc/emby-proxy/multiline-node.json'})()); print('边缘节点注册成功：'+a.node_id)
+    Path('/etc/systemd/system/emby-proxy-node.service').write_text('[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nTimeoutStartSec=25s\nExecStart=/usr/local/sbin/emby-proxy controller node --state /etc/emby-proxy/multiline-node.json\n')
+    # 使用 OnUnitInactiveSec：oneshot 服务结束后重新计时，避免部分 systemd/虚拟化环境
+    # 将 OnUnitActiveSec 错算成数天或 infinity，导致心跳停止。
+    Path('/etc/systemd/system/emby-proxy-node.timer').write_text('[Unit]\n[Timer]\nOnBootSec=20s\nOnUnitInactiveSec=30s\nAccuracySec=1s\nPersistent=true\n[Install]\nWantedBy=timers.target\n'); subprocess.run(['systemctl','daemon-reload'],check=False); subprocess.run(['systemctl','enable','--now','emby-proxy-node.timer'],check=False); node_once(type('A',(),{'state':'/etc/emby-proxy/multiline-node.json'})()); print('边缘节点注册成功：'+a.node_id)
 def node_once(a):
     st=json.loads(Path(a.state).read_text()); used=0
     try: used=int(''.join(Path(st.get('used_file','')).read_text().split()) or 0)
