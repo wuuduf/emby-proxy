@@ -9,7 +9,7 @@ readonly SCRIPT_SOURCE_URL="${EMBY_PROXY_SCRIPT_URL:-https://raw.githubuserconte
 # `bash <(curl -fsSL URL)` 的入口是 /dev/fd/*。该 fd 会随着 bash 解析脚本
 # 逐步前移，不能在后面直接复制来执行 sudo 重入或安装后端，因此先落到稳定
 # 的临时文件。普通本地执行仍然使用原始脚本路径，不增加额外网络请求。
-SCRIPT_ORIGIN="${BASH_SOURCE[0]}"
+SCRIPT_ORIGIN="${BASH_SOURCE[0]:-$0}"
 SCRIPT_PATH="$(readlink -f "$SCRIPT_ORIGIN" 2>/dev/null || printf '%s' "$SCRIPT_ORIGIN")"
 SCRIPT_TEMP_PATH="${EMBY_PROXY_TEMP_SCRIPT:-}"
 if [[ "$SCRIPT_ORIGIN" == /dev/fd/* || "$SCRIPT_ORIGIN" == /proc/*/fd/* || ! -f "$SCRIPT_PATH" ]]; then
