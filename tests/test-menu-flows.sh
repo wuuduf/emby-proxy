@@ -97,7 +97,7 @@ TRACE="$TMP_DIR/controller.trace" EMBY_PROXY_CONTROLLER_STATE="$TMP_DIR/controll
 EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" \
 bash -c '
   set --; source "$MANAGER_UNDER_TEST"
-  controller_cli() { printf "controller %s\n" "$*" >>"$TRACE"; }
+  controller_cli() { printf "controller %s\n" "$*" >>"$TRACE"; [[ "$1" != status ]] || cat "$EMBY_PROXY_CONTROLLER_STATE"; }
   systemctl() { printf "systemctl %s\n" "$*" >>"$TRACE"; return 0; }
   controller_menu
 ' <<'INPUT' >/dev/null
@@ -119,11 +119,6 @@ bash -c '
   controller_cli() { printf "controller %s\n" "$*" >>"$TRACE"; }
   controller_init_menu
 ' <<'INPUT' >/dev/null
-
-test.example.com
-https://origin.example.com
-caddy
-n
 test.example.com
 https://origin.example.com
 caddy
