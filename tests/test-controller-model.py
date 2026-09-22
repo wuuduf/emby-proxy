@@ -101,6 +101,18 @@ class ControllerTests(unittest.TestCase):
         with patch.object(self.controller, "update_dns", return_value={"ok": True}):
             self.assertEqual(self.controller.reconcile()["active_node"], "edge-a")
 
+    def test_no_healthy_candidate_keeps_actual_active_node(self):
+        nodes = self.nodes()
+        self.controller.state["active_node"] = "edge-a"
+        nodes["edge-a"]["healthy"] = False
+        nodes["edge-b"]["healthy"] = False
+        self.controller.save()
+        with patch.object(self.controller, "update_dns") as dns:
+            result = self.controller.reconcile()
+        self.assertIsNone(result["selected_node"])
+        self.assertEqual(result["active_node"], "edge-a")
+        dns.assert_not_called()
+
     def test_issue_remembers_controller_url_under_state_lock(self):
         args = SimpleNamespace(state=str(self.path), node_id='', public_ip='192.0.2.10',
             controller_url='https://control.example.com/', name='fixture-edge', priority=100, quota_bytes=0)
@@ -109,13 +121,28 @@ class ControllerTests(unittest.TestCase):
         saved = json.loads(self.path.read_text())
         self.assertEqual(saved['controller_url'], 'https://control.example.com')
         self.assertIn('edge-192-0-2-10', saved['enroll_tokens'])
+        backups = list(self.path.parent.glob('state.json.bak-*'))
+        self.assertEqual(len(backups), 1)
+        self.assertNotIn('edge-192-0-2-10', json.loads(backups[0].read_text()).get('enroll_tokens', {}))
+
+    def test_source_validation_rejects_path_and_revoke_removes_node(self):
+        bad = SimpleNamespace(state=str(self.path), entry_id='', domain='test.example.com',
+                              source='https://origin.example.com/path', engine='caddy',
+                              zone_id=None, record_id=None, token_file=None, force=False)
+        with self.assertRaises(RuntimeError):
+            ns['init_state'](bad)
+        code, result = self.controller.enroll(dict(entry_id=self.state['entry_id'], node_id='edge-a', enroll_token='fixture-token'))
+        self.assertEqual(code, 200)
+        self.assertEqual(self.controller.revoke({'node_id': 'edge-a'}, result['node_token'])[0], 200)
+        self.assertNotIn('edge-a', self.controller.state['nodes'])
 
     def test_master_install_checks_restart_and_failure(self):
         args = SimpleNamespace(state=str(self.path), listen='127.0.0.1:19090', reconcile_interval=30)
         for fail in (False, True):
             output = io.StringIO()
             error = ns['subprocess'].CalledProcessError(1, 'systemctl')
-            with patch.dict(ns, Path=Mock()), patch.object(ns['os'], 'geteuid', return_value=0), \
+            with patch.dict(ns, {'write_unit': Mock(return_value=None), 'restore_file': Mock()}), \
+                 patch.object(ns['os'], 'geteuid', return_value=0), \
                  patch.object(ns['subprocess'], 'run', side_effect=error if fail else None) as run, \
                  redirect_stdout(output):
                 if fail:

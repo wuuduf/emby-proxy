@@ -1502,6 +1502,53 @@ def atomic_write(path, data):
     # 临时文件受 umask 影响，替换前显式锁为 root/用户私有，避免 0644 泄漏。
     os.chmod(tmp, 0o600)
     tmp.replace(path)
+def backup_file(path):
+    """Create a private, timestamped backup before an operator-level mutation."""
+    path = Path(path)
+    if not path.exists(): return None
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    backup = path.with_name(path.name + '.bak-' + stamp)
+    suffix = 1
+    while backup.exists():
+        backup = path.with_name(path.name + '.bak-' + stamp + '-%s' % suffix)
+        suffix += 1
+    shutil.copy2(path, backup)
+    os.chmod(backup, 0o600)
+    return backup
+def restore_file(path, backup):
+    path = Path(path)
+    if backup:
+        shutil.copy2(backup, path)
+        os.chmod(path, 0o600 if path.suffix == '.json' else 0o644)
+    else:
+        path.unlink(missing_ok=True)
+def write_unit(path, content):
+    """Atomically install a systemd unit and return its previous-file backup."""
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    backup = backup_file(path)
+    tmp = path.with_name('.' + path.name + '.tmp-' + secrets.token_hex(6))
+    try:
+        tmp.write_text(content)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    return backup
+def validate_endpoint(value, allow_http=True, label='地址'):
+    value = str(value).strip()
+    if any(c.isspace() or ord(c) < 32 for c in value):
+        raise RuntimeError('%s不能包含空白或控制字符。' % label)
+    try: parsed = urlparse(value)
+    except ValueError as e: raise RuntimeError('%s格式无效：%s' % (label, e))
+    schemes = ('http', 'https') if allow_http else ('https',)
+    if (parsed.scheme not in schemes or not parsed.hostname or parsed.username or
+            parsed.password or parsed.query or parsed.fragment or
+            parsed.path not in ('', '/')):
+        raise RuntimeError('%s必须只包含协议、主机名和端口，不能带路径、查询、片段或账号信息。' % label)
+    try: parsed.port
+    except ValueError: raise RuntimeError('%s端口无效。' % label)
+    return value.rstrip('/')
 @contextmanager
 def state_lock(path):
     """Serialize CLI updates and the long-running master service."""
@@ -1559,6 +1606,17 @@ class Controller:
             node.update(healthy=bool(b.get('healthy',False)), used_bytes=used, status='healthy' if b.get('healthy') else 'unhealthy', last_seen=now(), version=b.get('version',node.get('version','unknown')), last_event=b.get('event','heartbeat'))
             if b.get('public_ip'): node['public_ip'] = str(b['public_ip'])
             selected = self.select(); self.save(); return 200, {'selected_node':selected, 'accepted_used_bytes':used}
+    def revoke(self, b, token):
+        with self.lock, state_lock(self.path):
+            self.reload()
+            node_id = str(b.get('node_id',''))
+            node = self.state['nodes'].get(node_id)
+            if not node or node.get('token_hash') != digest(token): return 403, {'error':'invalid_node_token'}
+            self.state['nodes'].pop(node_id, None)
+            self.state['enroll_tokens'].pop(node_id, None)
+            if self.state.get('active_node') == node_id: self.state['active_node'] = None
+            self.save()
+            return 200, {'revoked_node':node_id}
     def select(self):
         out=[]
         for nid,n in self.state['nodes'].items():
@@ -1570,7 +1628,10 @@ class Controller:
             self.reload()
             selected=self.select(); previous=self.state.get('active_node'); changed=selected != previous; dns_result=None
             if selected and changed: dns_result=self.update_dns(selected)
-            if not (isinstance(dns_result,dict) and dns_result.get('ok') is False): self.state['active_node']=selected
+            # 没有健康候选时没有 DNS 写入，保留实际活动节点指针，避免面板显示
+            # “未切换”而 Cloudflare 仍指向旧节点。下次节点恢复后继续重试选路。
+            if selected is not None and not (isinstance(dns_result,dict) and dns_result.get('ok') is False):
+                self.state['active_node']=selected
             self.state['last_reconcile']=now(); self.state['last_dns_result']=dns_result; self.save()
             return {'selected_node':selected,'active_node':self.state.get('active_node'),'previous_node':previous,'changed':changed,'dns':dns_result}
     def update_dns(self, nid):
@@ -1609,6 +1670,7 @@ class Handler(BaseHTTPRequestHandler):
             path=urlparse(self.path).path; b=self.body()
             if path == '/enroll': code,result=self.server.controller.enroll(b)
             elif path == '/heartbeat': code,result=self.server.controller.heartbeat(b,self.headers.get('Authorization','').removeprefix('Bearer ').strip())
+            elif path == '/revoke': code,result=self.server.controller.revoke(b,self.headers.get('Authorization','').removeprefix('Bearer ').strip())
             else: code,result=404,{'error':'not_found'}
         except (ValueError, KeyError, json.JSONDecodeError) as e: code,result=400,{'error':'bad_request:'+str(e)}
         self.reply(code,result)
@@ -1619,6 +1681,8 @@ class Server(ThreadingHTTPServer):
 def init_state(a):
     domain=a.domain.strip().lower().rstrip('.')
     entry_id=(a.entry_id.strip() if a.entry_id else '') or ('domain-'+domain)
+    source=validate_endpoint(a.source, allow_http=True, label='源站 URL')
+    if a.engine not in ('caddy','nginx'): raise RuntimeError('引擎只能是 caddy 或 nginx。')
     path=Path(a.state)
     if path.exists():
         if not getattr(a, 'force', False):
@@ -1630,7 +1694,7 @@ def init_state(a):
             suffix += 1
         backup.write_bytes(path.read_bytes())
         os.chmod(backup, 0o600)
-    state={'schema_version':1,'entry_id':entry_id,'domain':domain,'source':a.source,'engine':a.engine,'active_node':None,'enroll_tokens':{},'nodes':{}}
+    state={'schema_version':1,'entry_id':entry_id,'domain':domain,'source':source,'engine':a.engine,'active_node':None,'enroll_tokens':{},'nodes':{}}
     if a.zone_id and a.record_id and a.token_file: state['dns']={'provider':'cloudflare','zone_id':a.zone_id,'record_id':a.record_id,'token_file':a.token_file,'ttl':60}
     with state_lock(a.state): atomic_write(a.state,state)
     print('已创建多线路入口：'+a.state)
@@ -1643,11 +1707,16 @@ def auto_node_id(state, public_ip):
     return candidate
 def issue(a):
     path=Path(a.state)
+    controller_url=validate_endpoint(a.controller_url, allow_http=True, label='主控 URL')
     with state_lock(path):
         state=json.loads(path.read_text()); state.setdefault('enroll_tokens',{}); state.setdefault('nodes',{})
         node_id=(a.node_id or '').strip() or auto_node_id(state,a.public_ip)
-        token=secrets.token_urlsafe(24); state['enroll_tokens'][node_id]={'token':token,'issued_at':now()}; state['controller_url']=a.controller_url.rstrip('/'); atomic_write(path,state)
-    values=['sudo','ep','controller','node-install','--controller-url',a.controller_url.rstrip('/'),'--entry-id',state['entry_id'],'--node-id',node_id,'--name',a.name,'--priority',str(a.priority),'--quota-bytes',str(a.quota_bytes)]
+        token=secrets.token_urlsafe(24)
+        state['enroll_tokens'][node_id]={'token':token,'issued_at':now()}
+        state['controller_url']=controller_url
+        backup_file(path)
+        atomic_write(path,state)
+    values=['sudo','ep','controller','node-install','--controller-url',controller_url,'--entry-id',state['entry_id'],'--node-id',node_id,'--name',a.name,'--priority',str(a.priority),'--quota-bytes',str(a.quota_bytes)]
     if a.public_ip: values += ['--public-ip',a.public_ip]
     values += ['--enroll-token',token]
     # 边缘 VPS 可以是全新机器或旧版管理器；命令先确保当前管理器具备 node-install，再注册。
@@ -1656,10 +1725,24 @@ def issue(a):
     command=' '.join(shlex.quote(str(v)) for v in values)
     print("(command -v ep >/dev/null 2>&1 && sudo ep controller --help 2>&1 | grep -q node-install) || (curl -fsSL %s | sudo bash -s -- --manager-only); %s" % (shlex.quote(bootstrap_url), command))
     print("提示：注册码只能使用一次，签发后 15 分钟失效。")
+def validate_interval(value):
+    try: interval=int(value)
+    except (TypeError, ValueError): raise RuntimeError('主控检查间隔必须是整数。')
+    if not 1 <= interval <= 86400: raise RuntimeError('主控检查间隔必须在 1-86400 秒之间。')
+    return interval
+def validate_listen(value):
+    value=str(value)
+    if any(c in value for c in '\r\n') or ':' not in value:
+        raise RuntimeError('监听地址必须是 host:port，不能包含换行。')
+    host,port=value.rsplit(':',1)
+    if not re.fullmatch(r'[A-Za-z0-9_.:\-\[\]]+', host) or not port.isdigit() or not 0 <= int(port) <= 65535:
+        raise RuntimeError('监听端口必须在 0-65535 之间。')
+    return value
 def serve(a):
-    host,port=a.listen.rsplit(':',1); c=Controller(a.state); s=Server((host,int(port)),c); print('多线路主控监听 '+a.listen,flush=True); stop=threading.Event()
+    listen=validate_listen(a.listen); interval=validate_interval(a.reconcile_interval)
+    host,port=listen.rsplit(':',1); c=Controller(a.state); s=Server((host,int(port)),c); print('多线路主控监听 '+listen,flush=True); stop=threading.Event()
     def loop():
-        while not stop.wait(a.reconcile_interval):
+        while not stop.wait(interval):
             try: print(json.dumps(c.reconcile(),ensure_ascii=False),flush=True)
             except Exception as e: print('[controller] reconcile failed: '+str(e),flush=True)
     threading.Thread(target=loop,daemon=True).start()
@@ -1667,38 +1750,64 @@ def serve(a):
     except KeyboardInterrupt: stop.set()
 def master_install(a):
     if os.geteuid() != 0: raise SystemExit('master-install 需要 root 或 sudo')
-    unit='''[Unit]\nDescription=emby-proxy multiline master\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nExecStart=/usr/local/sbin/emby-proxy controller serve --state %s --listen %s --reconcile-interval %s\nRestart=on-failure\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\n''' % (a.state,a.listen,a.reconcile_interval)
-    Path('/etc/systemd/system/emby-proxy-master.service').write_text(unit)
+    listen=validate_listen(a.listen); interval=validate_interval(a.reconcile_interval)
+    unit='''[Unit]\nDescription=emby-proxy multiline master\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nExecStart=/usr/local/sbin/emby-proxy controller serve --state %s --listen %s --reconcile-interval %s\nRestart=on-failure\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\n''' % (a.state,listen,interval)
+    unit_path=Path('/etc/systemd/system/emby-proxy-master.service'); backup=write_unit(unit_path,unit)
     # 已运行的服务也必须载入新监听参数；任一步失败不能显示“已启动”。
-    for command in (['systemctl','daemon-reload'], ['systemctl','enable','emby-proxy-master.service'], ['systemctl','restart','emby-proxy-master.service'], ['systemctl','is-active','--quiet','emby-proxy-master.service']):
-        subprocess.run(command,check=True)
+    try:
+        for command in (['systemctl','daemon-reload'], ['systemctl','enable','emby-proxy-master.service'], ['systemctl','restart','emby-proxy-master.service'], ['systemctl','is-active','--quiet','emby-proxy-master.service']):
+            subprocess.run(command,check=True)
+    except Exception:
+        restore_file(unit_path, backup)
+        subprocess.run(['systemctl','daemon-reload'],check=False)
+        raise
     print('主控服务已启动：emby-proxy-master.service')
 def node_install(a):
     if os.geteuid() != 0: raise SystemExit('node-install 需要 root 或 sudo')
+    controller_url=validate_endpoint(a.controller_url, allow_http=True, label='主控 URL')
     node_file=Path('/etc/emby-proxy/multiline-node.json')
     if node_file.exists():
         try: old=json.loads(node_file.read_text())
         except (OSError, ValueError): old={}
         if old.get('node_id') and (old.get('node_id') != a.node_id or old.get('controller','').rstrip('/') != a.controller_url.rstrip('/')):
             raise RuntimeError('本机已有边缘节点 %s；一台 VPS 只支持一个 node-id，请先卸载旧节点再注册。' % old.get('node_id'))
-    result=post_json(a.controller_url.rstrip('/')+'/enroll',{'entry_id':a.entry_id,'node_id':a.node_id,'name':a.name,'priority':a.priority,'quota_bytes':a.quota_bytes,'enroll_token':a.enroll_token,'public_ip':a.public_ip,'version':'single-script-0.1'})
-    base=Path('/var/lib/emby-proxy'); base.mkdir(parents=True,exist_ok=True); Path('/etc/emby-proxy').mkdir(parents=True,exist_ok=True); used=base/'used_bytes'; used.touch(exist_ok=True)
-    engine=result.get('engine','caddy'); domain=result['domain']
-    log_root='/var/log/caddy' if engine == 'caddy' else '/var/log/nginx'
-    access_log='%s/emby-proxy-%s-access.log' % (log_root, domain)
-    offset=Path('/var/lib/emby-proxy/usage.offset')
-    state={'controller':a.controller_url.rstrip('/'),'entry_id':a.entry_id,'node_id':a.node_id,'node_token':result['node_token'],'domain':domain,'source':result['source'],'engine':engine,'public_ip':a.public_ip,'used_file':str(used),'access_log':access_log,'usage_offset_file':str(offset)}; atomic_write('/etc/emby-proxy/multiline-node.json',state); os.chmod('/etc/emby-proxy/multiline-node.json',0o600)
-    backend=Path('/usr/local/lib/emby-proxy/setup-emby-proxy.sh')
-    if backend.exists():
+    result=None; registered=False; node_backup=None; unit_backups=[]
+    try:
+        result=post_json(controller_url+'/enroll',{'entry_id':a.entry_id,'node_id':a.node_id,'name':a.name,'priority':a.priority,'quota_bytes':a.quota_bytes,'enroll_token':a.enroll_token,'public_ip':a.public_ip,'version':'single-script-0.1'})
+        registered=True
+        base=Path('/var/lib/emby-proxy'); base.mkdir(parents=True,exist_ok=True); Path('/etc/emby-proxy').mkdir(parents=True,exist_ok=True); used=base/'used_bytes'; used.touch(exist_ok=True); os.chmod(used,0o600)
+        engine=result.get('engine','caddy'); domain=result['domain']
+        log_root='/var/log/caddy' if engine == 'caddy' else '/var/log/nginx'
+        access_log='%s/emby-proxy-%s-access.log' % (log_root, domain)
+        offset=Path('/var/lib/emby-proxy/usage.offset')
+        state={'controller':controller_url,'entry_id':a.entry_id,'node_id':a.node_id,'node_token':result['node_token'],'domain':domain,'source':result['source'],'engine':engine,'public_ip':a.public_ip,'used_file':str(used),'access_log':access_log,'usage_offset_file':str(offset)}
+        backend=Path('/usr/local/lib/emby-proxy/setup-emby-proxy.sh')
+        if not backend.exists(): raise RuntimeError('未找到安装后端，请先用同一个 emby-proxy 脚本完成本机反代配置。')
         # 边缘节点的域名通常仍指向当前活动节点，不能因为 DNS 尚未切换就阻止预配置。
         # Caddy/Nginx 会先落配置；控制器切换 DNS 后再完成最终 TLS 验证。
         setup_result=subprocess.run([str(backend),'--engine',state['engine'],'--domain',state['domain'],'--upstream',state['source'],'--skip-dns-check','--skip-verify'],check=False)
-        if setup_result.returncode != 0: print('提醒：边缘反代预配置未完成；节点已注册但会保持不健康，请先修复 '+state['engine']+' 配置后重试。')
-    else: print('提醒：未找到安装后端，请先用同一个 emby-proxy 脚本完成本机反代配置。')
-    Path('/etc/systemd/system/emby-proxy-node.service').write_text('[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nTimeoutStartSec=25s\nExecStart=/usr/local/sbin/emby-proxy controller node --state /etc/emby-proxy/multiline-node.json\n')
-    # 使用 OnUnitInactiveSec：oneshot 服务结束后重新计时，避免部分 systemd/虚拟化环境
-    # 将 OnUnitActiveSec 错算成数天或 infinity，导致心跳停止。
-    Path('/etc/systemd/system/emby-proxy-node.timer').write_text('[Unit]\n[Timer]\nOnBootSec=20s\nOnUnitInactiveSec=30s\nAccuracySec=1s\nPersistent=true\n[Install]\nWantedBy=timers.target\n'); subprocess.run(['systemctl','daemon-reload'],check=False); subprocess.run(['systemctl','enable','emby-proxy-node.timer'],check=False); subprocess.run(['systemctl','restart','emby-proxy-node.timer'],check=False); node_once(type('A',(),{'state':'/etc/emby-proxy/multiline-node.json'})()); print('边缘节点注册成功：'+a.node_id)
+        if setup_result.returncode != 0: raise RuntimeError('边缘反代预配置失败，请先修复本机 '+state['engine']+' 配置。')
+        node_backup=backup_file(node_file); atomic_write(node_file,state); os.chmod(node_file,0o600)
+        service_unit='[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nTimeoutStartSec=25s\nExecStart=/usr/local/sbin/emby-proxy controller node --state /etc/emby-proxy/multiline-node.json\n'
+        timer_unit='[Unit]\n[Timer]\nOnBootSec=20s\nOnUnitInactiveSec=30s\nAccuracySec=1s\nPersistent=true\n[Install]\nWantedBy=timers.target\n'
+        unit_backups.append((Path('/etc/systemd/system/emby-proxy-node.service'), write_unit('/etc/systemd/system/emby-proxy-node.service',service_unit)))
+        unit_backups.append((Path('/etc/systemd/system/emby-proxy-node.timer'), write_unit('/etc/systemd/system/emby-proxy-node.timer',timer_unit)))
+        # 使用 OnUnitInactiveSec：oneshot 服务结束后重新计时，避免部分 systemd/虚拟化环境
+        # 将 OnUnitActiveSec 错算成数天或 infinity，导致心跳停止。
+        for command in (['systemctl','daemon-reload'], ['systemctl','enable','emby-proxy-node.timer'], ['systemctl','restart','emby-proxy-node.timer']):
+            subprocess.run(command,check=True)
+        node_once(type('A',(),{'state':str(node_file)})())
+    except Exception:
+        for path,backup in reversed(unit_backups):
+            restore_file(path,backup)
+        if unit_backups: subprocess.run(['systemctl','daemon-reload'],check=False)
+        if node_backup: restore_file(node_file,node_backup)
+        else: node_file.unlink(missing_ok=True)
+        if registered and result and result.get('node_token'):
+            try: post_json(controller_url+'/revoke',{'node_id':a.node_id},result['node_token'])
+            except Exception as revoke_error: print('提醒：注册回滚失败，请在主控删除节点 %s：%s' % (a.node_id,revoke_error),file=sys.stderr)
+        raise
+    print('边缘节点注册成功：'+a.node_id)
 def local_entry_health(st):
     """Verify this VPS serves its own HTTPS health route, not just a live daemon."""
     domain=str(st.get('domain','')).strip().lower().rstrip('.')
@@ -1852,12 +1961,13 @@ try:
     u = urlsplit(sys.argv[1])
     valid = (u.scheme in ('http', 'https') and bool(u.hostname) and
              not u.username and not u.password and not u.fragment and
+             not u.query and u.path in ('', '/') and
              not any(c.isspace() or ord(c) < 32 for c in sys.argv[1]) and
              (u.port is None or 1 <= u.port <= 65535))
 except ValueError:
     valid = False
 if not valid:
-    print('请输入有效的 http:// 或 https:// 地址（不带账号密码）。', file=sys.stderr)
+    print('请输入有效的 http:// 或 https:// 地址（只含主机和端口，不带路径、查询或账号密码）。', file=sys.stderr)
     sys.exit(1)
 PY
 }
@@ -2034,7 +2144,7 @@ controller_status_menu() {
       (if ($n.quota_bytes // 0) == 0 then "不限额" else ($n.quota_bytes | size) end)),
     (if (.nodes // {} | length) == 0 then "还没有节点。选 3 生成注册命令，在边缘 VPS 上执行。" else empty end)
   ' <<<"$status" || return 1
-  printf '\n心跳正常不等于媒体可播放；当前用量来自节点计数文件，自动流量采集尚未闭环。\n'
+  printf '\n心跳正常不等于媒体可播放；当前用量来自节点托管 JSON 访问日志的累计响应字节。\n'
 }
 
 controller_reconcile_menu() {

@@ -15,6 +15,26 @@ cleanup() {
 trap cleanup EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
+# 受限开发沙箱可能禁止回环监听；在 CI/VPS 上仍执行完整真实 HTTP 回环测试。
+if python3 - <<'PY'
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(('127.0.0.1', 0))
+except PermissionError:
+    sys.exit(77)
+finally:
+    s.close()
+PY
+then
+  :
+else
+  status=$?
+  [[ "$status" == 77 ]] || exit "$status"
+  printf 'SKIP: 当前沙箱禁止回环监听，跳过真实控制器 HTTP 测试\n'
+  exit 0
+fi
+
 run_cli() {
   EMBY_PROXY_MANAGER_LIB_ONLY=1 SCRIPT_UNDER_TEST="$ROOT_DIR/emby-proxy" \
     bash -c 'source "$SCRIPT_UNDER_TEST"; controller_cli "$@"' bash "$@"

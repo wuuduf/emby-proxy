@@ -2051,7 +2051,7 @@ verify_result() {
     if (( all_ok )); then
       ok "代理存活检查通过：$PUBLIC_BASE_URL${health_request_path}（HTTP 200）。"
       for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
-        ok "路径 ${ROUTE_PATHS[$i]} 反代验证通过（HTTP ${route_codes[$i]}）。"
+        ok "路径 ${ROUTE_PATHS[$i]} 反代验证通过（链路可达，源站 HTTP ${route_codes[$i]}）。"
       done
       printf '\n%s部署完成！%s\n' "$GREEN$BOLD" "$RESET"
       printf '可用的 Emby 反代地址：\n'

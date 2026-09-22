@@ -157,6 +157,7 @@ grep -Fx '  https://summary.example.com/' "$TMP_DIR/verify-summary.out" >/dev/nu
 grep -Fx '  https://summary.example.com/a/' "$TMP_DIR/verify-summary.out" >/dev/null || fail "子路径成功地址格式错误"
 assert_not_contains "$TMP_DIR/verify-summary.out" 'https://summary.example.com//'
 assert_contains "$TMP_DIR/verify-summary.out" '请求日志： /var/log/caddy/emby-proxy-summary.example.com-access.log'
+assert_contains "$TMP_DIR/verify-summary.out" '反代验证通过（链路可达，源站 HTTP 403）'
 assert_not_contains "$TMP_DIR/verify-summary.err" 'command not found'
 
 # 旧版无域名托管标记在更新旧域名时应迁移，新域名不能把它删除。
