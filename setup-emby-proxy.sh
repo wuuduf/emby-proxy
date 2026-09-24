@@ -4,12 +4,12 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_SOURCE_URL="${EMBY_PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/main/setup-emby-proxy.sh}"
+readonly SCRIPT_SOURCE_URL="${EMBY_PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/refs/heads/codex/multiline-lab/setup-emby-proxy.sh}"
 
 # `bash <(curl -fsSL URL)` 的入口是 /dev/fd/*。该 fd 会随着 bash 解析脚本
 # 逐步前移，不能在后面直接复制来执行 sudo 重入或安装后端，因此先落到稳定
 # 的临时文件。普通本地执行仍然使用原始脚本路径，不增加额外网络请求。
-SCRIPT_ORIGIN="${BASH_SOURCE[0]}"
+SCRIPT_ORIGIN="${BASH_SOURCE[0]:-$0}"
 SCRIPT_PATH="$(readlink -f "$SCRIPT_ORIGIN" 2>/dev/null || printf '%s' "$SCRIPT_ORIGIN")"
 SCRIPT_TEMP_PATH="${EMBY_PROXY_TEMP_SCRIPT:-}"
 if [[ "$SCRIPT_ORIGIN" == /dev/fd/* || "$SCRIPT_ORIGIN" == /proc/*/fd/* || ! -f "$SCRIPT_PATH" ]]; then
@@ -46,7 +46,7 @@ readonly NGINX_LEGACY_CONFIG="/etc/nginx/conf.d/emby-proxy-managed.conf"
 readonly NGINX_ACME_ROOT="/var/www/emby-proxy-acme"
 readonly NGINX_HASH_CONFIG="${EMBY_PROXY_NGINX_HASH_CONFIG:-/etc/nginx/conf.d/00-emby-proxy-hash.conf}"
 readonly HEALTH_PATH="/_emby_proxy_health"
-readonly MANAGER_COMMAND_URL="${EMBY_PROXY_MANAGER_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/main/emby-proxy}"
+readonly MANAGER_COMMAND_URL="${EMBY_PROXY_MANAGER_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/refs/heads/codex/multiline-lab/emby-proxy}"
 readonly MANAGER_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly MANAGER_LIBEXEC="${EMBY_PROXY_LIBEXEC:-/usr/local/lib/emby-proxy}"
 readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
@@ -56,6 +56,8 @@ PROXY_ENGINE=""
 MANAGER_ONLY=0
 BOOTSTRAP_MENU=0
 ENTRY_WIZARD=0
+SKIP_DNS_CHECK=0
+SKIP_VERIFY=0
 ACCESS_SCHEME=""
 HTTPS_PORT=""
 DOMAIN_ENTRY_TYPE=""
@@ -137,6 +139,8 @@ usage() {
   -d, --domain DOMAIN       对外访问的反代域名（必须已解析到本 VPS）
       --https-port PORT     域名模式的 HTTPS 端口，默认 443；自定义范围 1024-65535
       --domain-mode MODE    域名入口：subdomain、port 或 path
+      --skip-dns-check      仅用于边缘节点预配置：暂不要求域名当前指向本 VPS
+      --skip-verify         仅用于边缘节点预配置：配置成功后不等待本机 HTTPS 验证
   -p, --path PATH           主源站的访问路径，默认 /；已有 Caddy 域名必须填写非根路径
   -u, --upstream ADDRESS    Emby 源站域名或 URL，可带端口
                             例如 origin.example.com、https://origin.example.com、http://1.2.3.4:8096
@@ -165,6 +169,10 @@ while (($#)); do
     --domain-mode)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       DOMAIN_ENTRY_TYPE="$2"; shift 2 ;;
+    --skip-dns-check)
+      SKIP_DNS_CHECK=1; shift ;;
+    --skip-verify)
+      SKIP_VERIFY=1; shift ;;
     -p|--path)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       PRIMARY_ROUTE_INPUT="$2"; shift 2 ;;
@@ -852,7 +860,7 @@ apt_install_prerequisites() {
   apt-get update -qq
   apt-get install -y --no-install-recommends \
     debian-keyring debian-archive-keyring apt-transport-https \
-    ca-certificates curl gnupg dnsutils iproute2 jq util-linux >/dev/null
+    ca-certificates curl gnupg dnsutils iproute2 jq util-linux python3 >/dev/null
   ok "基础依赖已就绪。"
 }
 
@@ -881,7 +889,7 @@ install_manager_shortcut() {
 }
 
 install_manager_command() {
-  local install_mode="${1:-fallback}" source_candidate temp manager_source=""
+  local install_mode="${1:-fallback}" source_candidate temp manager_source="" component component_source component_url component_target component_temp
   temp="$(mktemp /tmp/emby-proxy-manager.XXXXXX)"
   source_candidate="$(dirname -- "$SCRIPT_PATH")/emby-proxy"
   if [[ -f "$source_candidate" ]]; then
@@ -1066,6 +1074,10 @@ check_dns() {
 }
 
 prepare_access_target() {
+  if (( SKIP_DNS_CHECK )); then
+    warn "已跳过 DNS 指向检查（仅用于边缘节点预配置）；切换流量前必须让域名解析到本节点并确认 TLS。"
+    return 0
+  fi
   check_dns
 }
 
@@ -2039,7 +2051,7 @@ verify_result() {
     if (( all_ok )); then
       ok "代理存活检查通过：$PUBLIC_BASE_URL${health_request_path}（HTTP 200）。"
       for ((i=0; i<${#ROUTE_PATHS[@]}; i++)); do
-        ok "路径 ${ROUTE_PATHS[$i]} 反代验证通过（HTTP ${route_codes[$i]}）。"
+        ok "路径 ${ROUTE_PATHS[$i]} 反代验证通过（链路可达，源站 HTTP ${route_codes[$i]}）。"
       done
       printf '\n%s部署完成！%s\n' "$GREEN$BOLD" "$RESET"
       printf '可用的 Emby 反代地址：\n'
@@ -2106,7 +2118,8 @@ main() {
   fi
   if (( MANAGER_ONLY )); then
     apt_install_prerequisites
-    install_manager_command
+    # manager-only 同时承担“安装/升级管理器”职责；旧版管理器不能挡住实验分支更新。
+    install_manager_command current || die "管理命令安装失败，请检查 GitHub 网络连接后重试。"
     [[ -x "$MANAGER_BIN" ]] || die "管理命令安装失败，请检查 GitHub 网络连接后重试。"
     release_operation_lock
     "$MANAGER_BIN" import || warn "管理命令已安装，但旧配置自动导入未完成；稍后运行 sudo emby-proxy import 重试。"
@@ -2131,7 +2144,11 @@ main() {
   else
     apply_nginx_config
   fi
-  verify_result
+  if (( SKIP_VERIFY )); then
+    warn "已跳过本机 HTTPS 验证（仅用于边缘节点预配置）；域名切换到本节点后请运行 ep diagnose。"
+  else
+    verify_result
+  fi
   persist_site_state
 }
 

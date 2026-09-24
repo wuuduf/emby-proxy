@@ -10,19 +10,28 @@ readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
 readonly CADDYFILE="${EMBY_PROXY_CADDYFILE:-/etc/caddy/Caddyfile}"
 readonly NGINX_CONF_DIR="${EMBY_PROXY_NGINX_CONF_DIR:-/etc/nginx/conf.d}"
+readonly NGINX_LEGACY_CONFIG="${EMBY_PROXY_NGINX_LEGACY_CONFIG:-/etc/nginx/conf.d/emby-proxy-managed.conf}"
+readonly NGINX_HASH_CONFIG="${EMBY_PROXY_NGINX_HASH_CONFIG:-/etc/nginx/conf.d/00-emby-proxy-hash.conf}"
+readonly NGINX_ACME_ROOT="${EMBY_PROXY_NGINX_ACME_ROOT:-/var/www/emby-proxy-acme}"
 readonly CADDY_LOG_DIR="${EMBY_PROXY_CADDY_LOG_DIR:-/var/log/caddy}"
 readonly NGINX_LOG_DIR="${EMBY_PROXY_NGINX_LOG_DIR:-/var/log/nginx}"
 readonly OS_RELEASE_FILE="${EMBY_PROXY_OS_RELEASE_FILE:-/etc/os-release}"
 readonly HEALTH_PATH="/_emby_proxy_health"
 readonly INSTALLED_BACKEND="${EMBY_PROXY_INSTALLED_BACKEND:-/usr/local/lib/emby-proxy/setup-emby-proxy.sh}"
+readonly MANAGER_LIBEXEC="${EMBY_PROXY_LIBEXEC:-/usr/local/lib/emby-proxy}"
 readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
+# 早期版本曾把管理命令直接装到 /usr/local/bin/emby-proxy；仅在内容带有
+# 本项目标识时清理，避免误删同名的第三方程序。
+readonly LEGACY_MANAGER_BIN="${EMBY_PROXY_LEGACY_MANAGER_BIN:-/usr/local/bin/emby-proxy}"
 readonly SHORT_BIN="${EMBY_PROXY_SHORT_BIN:-/usr/local/bin/ep}"
-readonly UPDATE_BASE_URL="${EMBY_PROXY_UPDATE_BASE_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/main}"
+readonly UPDATE_BASE_URL="${EMBY_PROXY_UPDATE_BASE_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/refs/heads/codex/multiline-lab}"
 LOCK_FD=""
 DOCTOR_OK=0
 DOCTOR_WARN=0
 DOCTOR_ERROR=0
 MENU_ACTION_STATUS=0
+UNINSTALL_COMPLETED=0
+UPDATE_CHANGED=0
 
 if [[ -t 1 ]]; then
   RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; CYAN=$'\033[36m'; MAGENTA=$'\033[35m'
@@ -57,7 +66,9 @@ ui_header() {
 ui_section() { printf '\n%s%s%s%s\n' "$BOLD" "$BLUE" "$1" "$RESET"; }
 ui_item() {
   local key="$1" label="$2" hint="${3:-}"
-  printf '  %s%2s%s  %-24s %s%s%s\n' "$CYAN" "$key" "$RESET" "$label" "$DIM" "$hint" "$RESET"
+  printf '  %s%2s%s  %s' "$CYAN" "$key" "$RESET" "$label"
+  [[ -z "$hint" ]] || printf '  %s· %s%s' "$DIM" "$hint" "$RESET"
+  printf '\n'
 }
 
 ui_prompt() {
@@ -108,6 +119,8 @@ Emby Reverse Proxy Manager $VERSION
   sudo emby-proxy backup restore <备份ID> 安全恢复备份
   sudo emby-proxy service status          查看或管理 Web 服务
   sudo emby-proxy update [--check]        检查或安装管理器更新
+  sudo emby-proxy uninstall [--yes]       干净卸载脚本（保留 Caddy/Nginx 和证书）
+  sudo emby-proxy controller ...         多线路控制器（实验版）
   emby-proxy version
 
 日志模式：
@@ -226,13 +239,33 @@ service_line() {
   printf '%-8s %-8s %s' "$service" "$state" "$version"
 }
 
+service_brief() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf '未安装'
+  elif systemctl is-active --quiet "$1" 2>/dev/null; then
+    printf '运行中'
+  else
+    printf '未运行'
+  fi
+}
+
 print_status() {
   local view="${1:-full}" count caddy_count nginx_count
   ensure_state_dirs
   count="$(site_count)"
   caddy_count="$(find "$SITES_DIR" -type f -name 'domain-*.json' -exec jq -r 'select(.engine=="caddy") | 1' {} \; 2>/dev/null | wc -l | tr -d ' ')"
   nginx_count="$(find "$SITES_DIR" -type f -name 'domain-*.json' -exec jq -r 'select(.engine=="nginx") | 1' {} \; 2>/dev/null | wc -l | tr -d ' ')"
-  [[ "$view" == "compact" ]] || printf '%sEmby Reverse Proxy Manager%s  %s\n\n' "$BOLD" "$RESET" "$VERSION"
+  if [[ "$view" == "compact" ]]; then
+    printf '\n  本机 HTTPS 入口 %s 个  ·  Caddy %s / Nginx %s\n' "$count" "$caddy_count" "$nginx_count"
+    printf '  服务：Caddy %s · Nginx %s\n' "$(service_brief caddy)" "$(service_brief nginx)"
+    if (( count == 0 )); then
+      printf '  下一步：选 3 新增反代入口；多台 VPS 选 11。\n'
+    else
+      printf '  查看入口选 1，修改源站选 4，排查问题选 5。\n'
+    fi
+    return 0
+  fi
+  printf '%sEmby Reverse Proxy Manager%s  %s\n\n' "$BOLD" "$RESET" "$VERSION"
   printf '  %s\n' "$(service_line caddy caddy)"
   printf '  %s\n' "$(service_line nginx nginx)"
   printf '\n  托管入口：%s（域名 HTTPS）\n' "$count"
@@ -1068,15 +1101,164 @@ ensure_short_command() {
   return 0
 }
 
+uninstall_archive() {
+  local backup_root="$1" timestamp="$2" archive="$backup_root/emby-proxy-uninstall-$timestamp.tar.gz" sha items=() file
+  install_managed_dir 0750 "$backup_root"
+  # 只打包脚本明确管理的路径；不会把整台机器或 Caddy/Nginx 证书带走。
+  for file in "$STATE_HOME" "$CADDYFILE" "$NGINX_LEGACY_CONFIG" "$NGINX_HASH_CONFIG" \
+    "$NGINX_ACME_ROOT" "$MANAGER_BIN" "$LEGACY_MANAGER_BIN" "$SHORT_BIN" "$INSTALLED_BACKEND" "$MANAGER_LIBEXEC" \
+    /etc/systemd/system/emby-proxy-master.service /etc/systemd/system/emby-proxy-node.service \
+    /etc/systemd/system/emby-proxy-node.timer; do
+    [[ -e "$file" || -L "$file" ]] && items+=("$file")
+  done
+  while IFS= read -r file; do items+=("$file"); done < <(find "$CADDY_LOG_DIR" "$NGINX_LOG_DIR" -maxdepth 1 -type f -name 'emby-proxy-*-access.log' -print 2>/dev/null || true)
+  if ((${#items[@]} == 0)); then
+    tar -czf "$archive" --files-from /dev/null
+  else
+    tar -czf "$archive" "${items[@]}"
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha="$(sha256sum "$archive" | awk '{print $1}')"
+  else
+    sha="$(shasum -a 256 "$archive" | awk '{print $1}')"
+  fi
+  printf '%s  %s\n' "$sha" "$(basename "$archive")" >"$archive.sha256"
+  printf '%s' "$archive"
+}
+
+uninstall_remove_caddy_markers() {
+  local target="${1:-$CADDYFILE}" begin end begins ends temp saved
+  [[ -f "$target" ]] || return 0
+  begin="$(grep -Ec '^# BEGIN MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE):' "$target" 2>/dev/null || true)"
+  end="$(grep -Ec '^# END MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE):' "$target" 2>/dev/null || true)"
+  (( begin == 0 && end == 0 )) && return 0
+  if (( begin != end )); then
+    warn "Caddyfile 中脚本标记不完整，保留原文件：$target"
+    return 0
+  fi
+  temp="$(mktemp /tmp/emby-proxy-uninstall-caddy.XXXXXX)"
+  awk '/^# BEGIN MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE):/{skip=1;next} /^# END MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE):/{if(skip){skip=0;next}} !skip{print}' "$target" >"$temp"
+  saved="$(mktemp /tmp/emby-proxy-uninstall-caddy-old.XXXXXX)"; cp -a "$target" "$saved"
+  cat "$temp" >"$target"; rm -f "$temp"
+  if command -v caddy >/dev/null 2>&1 && ! caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1; then
+    cp -a "$saved" "$target"; rm -f "$saved"
+    warn "Caddy 清理后配置验证失败，已恢复：$target"
+    return 0
+  fi
+  rm -f "$saved"
+  systemctl reload caddy >/dev/null 2>&1 || warn "Caddy 已清理，但 reload 失败，请手动检查服务。"
+}
+
+uninstall_remove_nginx_owned_file() {
+  local target="$1" marker="$2" saved
+  [[ -f "$target" ]] || return 0
+  grep -F "$marker" "$target" >/dev/null 2>&1 || return 0
+  saved="$(mktemp /tmp/emby-proxy-uninstall-nginx.XXXXXX)"; cp -a "$target" "$saved"; rm -f "$target"
+  if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+    cp -a "$saved" "$target"; rm -f "$saved"
+    warn "Nginx 清理后配置验证失败，已恢复：$target"
+    return 0
+  fi
+  rm -f "$saved"
+  systemctl reload nginx >/dev/null 2>&1 || warn "Nginx 已清理，但 reload 失败，请手动检查服务。"
+}
+
+uninstall_manager() {
+  local option="${1:-}" answer backup_root timestamp archive file id
+  local -a ids=()
+  UNINSTALL_COMPLETED=0
+  [[ -z "$option" || "$option" == "--yes" ]] || die "用法：emby-proxy uninstall [--yes]"
+  if [[ "$option" != "--yes" ]]; then
+    printf '\n这会删除 emby-proxy 管理器、脚本托管入口、主控/边缘服务和管理索引。\n'
+    printf 'Caddy/Nginx 程序、其他站点配置和证书不会删除。\n'
+    printf '删除前会生成可校验备份；输入 REMOVE EMBY-PROXY 确认：'; read -r answer
+    [[ "$answer" == "REMOVE EMBY-PROXY" ]] || { warn "已取消卸载。"; return 0; }
+  fi
+  backup_root="${EMBY_PROXY_UNINSTALL_BACKUP_DIR:-/var/backups}"
+  timestamp="$(date -u +%Y%m%d-%H%M%S)"
+  archive="$(uninstall_archive "$backup_root" "$timestamp")"
+  ok "卸载前备份已创建：$archive"
+  ok "SHA256：$archive.sha256"
+
+  # 先导入旧版索引，再逐个调用已有的严格删除逻辑；缺失标记时会停止而不碰未知配置。
+  if command -v jq >/dev/null 2>&1; then
+    ensure_state_dirs
+    import_existing >/dev/null 2>&1 || true
+    while IFS= read -r file; do
+      id="$(jq -r '.id // empty' "$file" 2>/dev/null || true)"
+      [[ -n "$id" ]] && ids+=("$id")
+    done < <(find "$SITES_DIR" -maxdepth 1 -type f -name 'domain-*.json' -print 2>/dev/null | sort)
+    if ((${#ids[@]} > 0)); then
+      for id in "${ids[@]}"; do
+        [[ -f "$(state_file "$id")" ]] || continue
+        delete_site "$id" <<<"y"
+      done
+    fi
+  else
+    warn "未找到 jq，跳过入口索引清理；配置备份仍已生成。"
+  fi
+
+  uninstall_remove_caddy_markers
+  if [[ -d "$(dirname "$CADDYFILE")" ]]; then
+    while IFS= read -r file; do
+      [[ "$file" == "$CADDYFILE" ]] || uninstall_remove_caddy_markers "$file"
+    done < <(find "$(dirname "$CADDYFILE")" -maxdepth 1 -type f \( -name '*.caddy' -o -name '*.conf' \) -print 2>/dev/null | sort)
+  fi
+  uninstall_remove_nginx_owned_file "$NGINX_LEGACY_CONFIG" "MANAGED EMBY"
+  uninstall_remove_nginx_owned_file "$NGINX_HASH_CONFIG" "MANAGED EMBY NGINX HASH CAPACITY"
+  if [[ -d "$NGINX_CONF_DIR" ]]; then
+    while IFS= read -r file; do
+      uninstall_remove_nginx_owned_file "$file" "MANAGED EMBY SITE"
+    done < <(find "$NGINX_CONF_DIR" -maxdepth 1 -type f -name 'emby-proxy-*.conf' -print 2>/dev/null | sort)
+    while IFS= read -r file; do
+      uninstall_remove_nginx_owned_file "$file" "MANAGED EMBY ACME"
+    done < <(find "$NGINX_CONF_DIR" -maxdepth 1 -type f -name 'emby-proxy-acme-*.conf' -print 2>/dev/null | sort)
+  fi
+  if [[ "$NGINX_ACME_ROOT" == */emby-proxy-acme && -d "$NGINX_ACME_ROOT" ]] && ! find "$NGINX_ACME_ROOT" -type f -print -quit 2>/dev/null | grep -q .; then
+    rm -rf -- "$NGINX_ACME_ROOT"
+  fi
+  for file in /etc/systemd/system/emby-proxy-master.service /etc/systemd/system/emby-proxy-node.service /etc/systemd/system/emby-proxy-node.timer; do
+    systemctl disable --now "$(basename "$file")" >/dev/null 2>&1 || true
+    rm -f -- "$file"
+  done
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  find "$CADDY_LOG_DIR" "$NGINX_LOG_DIR" -maxdepth 1 -type f -name 'emby-proxy-*-access.log' -delete 2>/dev/null || true
+  if [[ -d "$STATE_HOME" && "$STATE_HOME" != "/" && "$STATE_HOME" != "/etc" && "$STATE_HOME" != "/var" && \
+    ( "$STATE_HOME" == */emby-proxy* || ( -d "$STATE_HOME/sites.d" && -d "$STATE_HOME/backups" ) ) ]]; then
+    rm -rf -- "$STATE_HOME"
+  elif [[ -d "$STATE_HOME" ]]; then
+    warn "自定义管理目录未满足安全路径检查，已保留：$STATE_HOME"
+  fi
+  rm -f -- "$INSTALLED_BACKEND" "$MANAGER_BIN"
+  if [[ "$LEGACY_MANAGER_BIN" != "$MANAGER_BIN" && -f "$LEGACY_MANAGER_BIN" ]] &&
+     grep -Fq 'Emby 反向代理管理命令' "$LEGACY_MANAGER_BIN" 2>/dev/null; then
+    rm -f -- "$LEGACY_MANAGER_BIN"
+  fi
+  if [[ -L "$SHORT_BIN" ]] && [[ "$(readlink "$SHORT_BIN" 2>/dev/null || true)" == "$MANAGER_BIN" ]]; then rm -f -- "$SHORT_BIN"; fi
+  if [[ -d "$MANAGER_LIBEXEC" && "$MANAGER_LIBEXEC" == */emby-proxy ]]; then rm -rf -- "$MANAGER_LIBEXEC"; fi
+  UNINSTALL_COMPLETED=1
+  ok "emby-proxy 已完全卸载。Caddy/Nginx 及其证书保持不变。"
+  info "如需恢复，请保留备份并使用 tar -xzf 查看：$archive"
+}
+
 installed_manager_version() {
   [[ -x "$MANAGER_BIN" ]] || { printf '%s' "$VERSION"; return; }
   "$MANAGER_BIN" version 2>/dev/null | awk 'NR==1 {print $2}'
 }
 
+file_sha256() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  else
+    shasum -a 256 "$file" | awk '{print $1}'
+  fi
+}
+
 restart_updated_manager() {
   local previous_version="$1" installed_version
   installed_version="$(installed_manager_version)"
-  [[ -n "$installed_version" && "$installed_version" != "$previous_version" ]] || return 0
+  (( UPDATE_CHANGED == 1 )) || [[ -n "$installed_version" && "$installed_version" != "$previous_version" ]] || return 0
   if [[ -t 0 && -t 1 ]]; then
     info "更新完成，正在自动重新启动管理面板……"
     exec "$MANAGER_BIN"
@@ -1085,7 +1267,9 @@ restart_updated_manager() {
 }
 
 self_update() {
-  local option="${1:-}" temp latest_version answer backup_dir timestamp manager_backup="" backend_backup="" nonce manager_url backend_url checksums_url
+  local option="${1:-}" temp latest_version answer backup_dir timestamp manager_backup="" backend_backup="" nonce manager_url backend_url checksums_url update_file
+  local remote_manager_sha remote_backend_sha current_manager_sha="" current_backend_sha=""
+  UPDATE_CHANGED=0
   [[ -z "$option" || "$option" == "--check" || "$option" == "--force" ]] || die "用法：emby-proxy update [--check|--force]"
   temp="$(mktemp -d /tmp/emby-proxy-update.XXXXXX)"
   nonce="$(date +%s%N)"
@@ -1102,16 +1286,28 @@ self_update() {
   curl -fsSL -H 'Cache-Control: no-cache' --connect-timeout 8 --max-time 30 "$backend_url" -o "$temp/setup-emby-proxy.sh" || die "下载安装后端失败。"
   curl -fsSL -H 'Cache-Control: no-cache' --connect-timeout 8 --max-time 30 "$checksums_url" -o "$temp/checksums.txt" || die "下载校验文件失败。"
   verify_update_checksums "$temp"
-  bash -n "$temp/emby-proxy" "$temp/setup-emby-proxy.sh" || die "更新文件语法验证失败。"
+  for update_file in "$temp/emby-proxy" "$temp/setup-emby-proxy.sh"; do
+    bash -n "$update_file" || die "更新文件语法验证失败：$(basename "$update_file")。"
+  done
   latest_version="$(sed -n 's/^readonly VERSION="\([^"]*\)"/\1/p' "$temp/emby-proxy" | head -n1)"
   [[ -n "$latest_version" ]] || die "无法识别更新版本。"
+  remote_manager_sha="$(file_sha256 "$temp/emby-proxy")"
+  remote_backend_sha="$(file_sha256 "$temp/setup-emby-proxy.sh")"
+  [[ -f "$MANAGER_BIN" ]] && current_manager_sha="$(file_sha256 "$MANAGER_BIN")"
+  [[ -f "$INSTALLED_BACKEND" ]] && current_backend_sha="$(file_sha256 "$INSTALLED_BACKEND")"
+  [[ -n "$current_manager_sha" && "$current_manager_sha" == "$remote_manager_sha" && \
+    -n "$current_backend_sha" && "$current_backend_sha" == "$remote_backend_sha" ]] || UPDATE_CHANGED=1
   printf '当前版本：%s\n远端版本：%s\n' "$VERSION" "$latest_version"
   if [[ "$option" == "--check" ]]; then
-    [[ "$latest_version" == "$VERSION" ]] && ok "当前已是最新版本。" || info "发现可更新版本：$latest_version"
+    if [[ "$UPDATE_CHANGED" == 0 && "$latest_version" == "$VERSION" ]]; then
+      ok "当前已是最新版本。"
+    else
+      info "发现可更新内容：$latest_version（版本或文件校验值发生变化）"
+    fi
     rm -rf "$temp"
     return
   fi
-  if [[ "$latest_version" == "$VERSION" && "$option" != "--force" ]]; then ok "当前已是最新版本。"; rm -rf "$temp"; return; fi
+  if [[ "$UPDATE_CHANGED" == 0 && "$latest_version" == "$VERSION" && "$option" != "--force" ]]; then ok "当前已是最新版本。"; rm -rf "$temp"; return; fi
   if [[ "$option" != "--force" ]]; then
     printf '确认更新管理命令和安装后端？[y/N]：'; read -r answer; [[ "$answer" =~ ^[Yy]$ ]] || die "已取消。"
   fi
@@ -1133,11 +1329,18 @@ self_update() {
 }
 
 menu_update() {
-  local previous_version="$VERSION"
-  if ( self_update ); then
+  local previous_version="$VERSION" result_file
+  UPDATE_CHANGED=0
+  result_file="$(mktemp)" || { warn "无法创建更新状态文件，已返回当前菜单。"; return 0; }
+  # self_update 内部的 die 只能终止本次更新；用私有临时文件把成功标记传回父进程。
+  # 不能只比较版本号：实验分支可能在同一版本号下发布内容变更。
+  if ( self_update && printf '%s\n' "$UPDATE_CHANGED" >"$result_file" ); then
+    IFS= read -r UPDATE_CHANGED <"$result_file" || UPDATE_CHANGED=0
+    rm -f -- "$result_file"
     restart_updated_manager "$previous_version"
     ui_pause
   else
+    rm -f -- "$result_file"
     warn "更新未完成，已返回当前菜单。"
     ui_pause
   fi
@@ -1177,7 +1380,7 @@ manage_site_menu() {
     ui_item 6 "查看 24h 流量统计" "流量 / 错误 / 慢请求"
     ui_item 7 "删除整个入口" "危险操作，会先确认"
     ui_item 0 "返回上一级" ""
-    ui_prompt; read -r choice
+    ui_prompt; IFS= read -r choice || return 0
     case "$choice" in
       1) menu_run route_upsert add "$id" ;;
       2) menu_run route_upsert set "$id" ;;
@@ -1210,7 +1413,7 @@ logs_stats_menu() {
     ui_item 6 "最近 24 小时" "请求数与输出流量"
     ui_item 7 "最近 7 天" "长期趋势"
     ui_item 0 "返回上一级" ""
-    ui_prompt; read -r choice
+    ui_prompt; IFS= read -r choice || return 0
     case "$choice" in
       1) menu_run view_logs "$id" --recent ;;
       2) menu_run view_logs "$id" --follow ;;
@@ -1234,7 +1437,7 @@ backup_menu() {
     ui_item 3 "安全恢复备份" "验证配置后 Reload"
     ui_item 4 "清理旧备份" "默认保留最近 20 个"
     ui_item 0 "返回上一级" ""
-    ui_prompt; read -r choice
+    ui_prompt; IFS= read -r choice || return 0
     case "$choice" in
       1) menu_run backup_list ;;
       2) ui_prompt "请输入备份 ID"; read -r id; menu_run backup_show "$id" ;;
@@ -1256,7 +1459,7 @@ service_menu() {
     ui_item 4 "查看服务日志" "最近 100 行"
     ui_item 5 "验证完整配置" "不修改服务"
     ui_item 0 "返回上一级" ""
-    ui_prompt; read -r choice
+    ui_prompt; IFS= read -r choice || return 0
     case "$choice" in
       1) menu_run service_control status ;;
       2|3|4)
@@ -1267,6 +1470,837 @@ service_menu() {
           4) menu_run service_control logs "$engine" ;;
         esac ;;
       5) menu_run config_test ;;
+      0|q|Q) return ;;
+      *) warn "请输入有效序号。" ;;
+    esac
+  done
+}
+
+controller_cli() {
+  command -v python3 >/dev/null 2>&1 || die "多线路功能需要 python3。"
+  python3 - "$@" <<'PY'
+import argparse, copy, hashlib, ipaddress, json, os, re, secrets, shlex, shutil, subprocess, sys, threading, time
+import urllib.error, urllib.request
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Linux is the supported runtime
+    fcntl = None
+
+ENROLL_TTL = 15 * 60
+def now(): return int(time.time())
+def digest(v): return hashlib.sha256(v.encode()).hexdigest()
+def atomic_write(path, data):
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
+    # 控制器状态包含 Cloudflare token 的路径、节点令牌哈希和待用注册码。
+    # 临时文件受 umask 影响，替换前显式锁为 root/用户私有，避免 0644 泄漏。
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+def backup_file(path):
+    """Create a private, timestamped backup before an operator-level mutation."""
+    path = Path(path)
+    if not path.exists(): return None
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    backup = path.with_name(path.name + '.bak-' + stamp)
+    suffix = 1
+    while backup.exists():
+        backup = path.with_name(path.name + '.bak-' + stamp + '-%s' % suffix)
+        suffix += 1
+    shutil.copy2(path, backup)
+    os.chmod(backup, 0o600)
+    return backup
+def restore_file(path, backup):
+    path = Path(path)
+    if backup:
+        shutil.copy2(backup, path)
+        os.chmod(path, 0o600 if path.suffix == '.json' else 0o644)
+    else:
+        path.unlink(missing_ok=True)
+def write_unit(path, content):
+    """Atomically install a systemd unit and return its previous-file backup."""
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    backup = backup_file(path)
+    tmp = path.with_name('.' + path.name + '.tmp-' + secrets.token_hex(6))
+    try:
+        tmp.write_text(content)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    return backup
+def validate_endpoint(value, allow_http=True, label='地址'):
+    value = str(value).strip()
+    if any(c.isspace() or ord(c) < 32 for c in value):
+        raise RuntimeError('%s不能包含空白或控制字符。' % label)
+    try: parsed = urlparse(value)
+    except ValueError as e: raise RuntimeError('%s格式无效：%s' % (label, e))
+    schemes = ('http', 'https') if allow_http else ('https',)
+    if (parsed.scheme not in schemes or not parsed.hostname or parsed.username or
+            parsed.password or parsed.query or parsed.fragment or
+            parsed.path not in ('', '/')):
+        raise RuntimeError('%s必须只包含协议、主机名和端口，不能带路径、查询、片段或账号信息。' % label)
+    try: parsed.port
+    except ValueError: raise RuntimeError('%s端口无效。' % label)
+    return value.rstrip('/')
+@contextmanager
+def state_lock(path):
+    """Serialize CLI updates and the long-running master service."""
+    lock_path = Path(str(path) + '.lock'); lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if fcntl is not None: fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        if fcntl is not None: fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+def post_json(url, payload, token=''):
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type':'application/json'}, method='POST')
+    if token: req.add_header('Authorization', 'Bearer ' + token)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r: return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try: detail=json.loads(e.read().decode()).get('error','')
+        except Exception: detail=''
+        raise RuntimeError('主控返回 HTTP %s%s' % (e.code, ': '+detail if detail else ''))
+    except urllib.error.URLError as e:
+        raise RuntimeError('无法连接主控：%s' % e.reason)
+
+class Controller:
+    def __init__(self, path):
+        self.path = Path(path); self.lock = threading.RLock(); self.state = {}
+        self.reload()
+    def reload(self):
+        self.state = json.loads(self.path.read_text())
+        self.state.setdefault('schema_version', 1); self.state.setdefault('enroll_tokens', {}); self.state.setdefault('nodes', {}); self.state.setdefault('active_node', None)
+    def save(self): atomic_write(self.path, self.state)
+    def enroll(self, b):
+        with self.lock, state_lock(self.path):
+            self.reload()
+            if b.get('entry_id') != self.state['entry_id']: return 404, {'error':'unknown_entry'}
+            node, reg = str(b.get('node_id','')), str(b.get('enroll_token',''))
+            pending=self.state['enroll_tokens'].get(node)
+            expected=pending.get('token') if isinstance(pending,dict) else pending
+            issued=pending.get('issued_at') if isinstance(pending,dict) else None
+            if issued is not None and now() - int(issued) > ENROLL_TTL:
+                self.state['enroll_tokens'].pop(node,None); self.save()
+                return 403, {'error':'invalid_or_expired_enroll_token'}
+            if not node or expected != reg: return 403, {'error':'invalid_or_expired_enroll_token'}
+            token = secrets.token_urlsafe(32); self.state['enroll_tokens'].pop(node, None)
+            item = {'name':b.get('name',node), 'priority':int(b.get('priority',0)), 'quota_bytes':int(b.get('quota_bytes',0)), 'used_bytes':0, 'healthy':False, 'status':'enrolled', 'last_seen':now(), 'version':b.get('version','unknown'), 'token_hash':digest(token)}
+            if b.get('public_ip'): item['public_ip'] = str(b['public_ip'])
+            self.state['nodes'][node] = item; self.save()
+            return 200, {'node_token':token, 'entry_id':self.state['entry_id'], 'domain':self.state['domain'], 'source':self.state['source'], 'engine':self.state.get('engine','caddy')}
+    def heartbeat(self, b, token):
+        with self.lock, state_lock(self.path):
+            self.reload()
+            node = self.state['nodes'].get(str(b.get('node_id','')))
+            if not node or node.get('token_hash') != digest(token): return 403, {'error':'invalid_node_token'}
+            used = max(int(node.get('used_bytes',0)), int(b.get('used_bytes',0)))
+            node.update(healthy=bool(b.get('healthy',False)), used_bytes=used, status='healthy' if b.get('healthy') else 'unhealthy', last_seen=now(), version=b.get('version',node.get('version','unknown')), last_event=b.get('event','heartbeat'))
+            if b.get('public_ip'): node['public_ip'] = str(b['public_ip'])
+            selected = self.select(); self.save(); return 200, {'selected_node':selected, 'accepted_used_bytes':used}
+    def revoke(self, b, token):
+        with self.lock, state_lock(self.path):
+            self.reload()
+            node_id = str(b.get('node_id',''))
+            node = self.state['nodes'].get(node_id)
+            if not node or node.get('token_hash') != digest(token): return 403, {'error':'invalid_node_token'}
+            self.state['nodes'].pop(node_id, None)
+            self.state['enroll_tokens'].pop(node_id, None)
+            if self.state.get('active_node') == node_id: self.state['active_node'] = None
+            self.save()
+            return 200, {'revoked_node':node_id}
+    def select(self):
+        out=[]
+        for nid,n in self.state['nodes'].items():
+            quota=int(n.get('quota_bytes',0)); online=now()-int(n.get('last_seen',0)) <= 90; within=quota <= 0 or int(n.get('used_bytes',0)) < quota
+            if n.get('healthy') and online and within: out.append((int(n.get('priority',0)), nid))
+        return max(out, default=(0,None))[1]
+    def reconcile(self):
+        with self.lock, state_lock(self.path):
+            self.reload()
+            selected=self.select(); previous=self.state.get('active_node'); changed=selected != previous; dns_result=None
+            if selected and changed: dns_result=self.update_dns(selected)
+            # 没有健康候选时没有 DNS 写入，保留实际活动节点指针，避免面板显示
+            # “未切换”而 Cloudflare 仍指向旧节点。下次节点恢复后继续重试选路。
+            if selected is not None and not (isinstance(dns_result,dict) and dns_result.get('ok') is False):
+                self.state['active_node']=selected
+            self.state['last_reconcile']=now(); self.state['last_dns_result']=dns_result; self.save()
+            return {'selected_node':selected,'active_node':self.state.get('active_node'),'previous_node':previous,'changed':changed,'dns':dns_result}
+    def update_dns(self, nid):
+        dns=self.state.get('dns') or {}; node=self.state['nodes'][nid]
+        if dns.get('provider') != 'cloudflare': return {'skipped':'dns provider not configured'}
+        if not node.get('public_ip'): return {'ok':False,'error':'selected node has no public_ip'}
+        try: token=Path(dns['token_file']).read_text().strip()
+        except OSError as e: return {'ok':False,'error':str(e)}
+        payload={'type':'A','name':self.state['domain'],'content':node['public_ip'],'ttl':int(dns.get('ttl',60)),'proxied':False}
+        req=urllib.request.Request('https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s' % (dns['zone_id'],dns['record_id']), data=json.dumps(payload).encode(), headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'}, method='PUT')
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r: result=json.loads(r.read())
+            return {'ok':True,'content':node['public_ip']} if result.get('success') else {'ok':False,'errors':result.get('errors',[])}
+        except (OSError, urllib.error.URLError) as e: return {'ok':False,'error':str(e)}
+    def public_status(self):
+        with self.lock, state_lock(self.path):
+            self.reload()
+            return {'entry_id':self.state.get('entry_id'), 'domain':self.state.get('domain')}
+    def private_status(self):
+        with self.lock, state_lock(self.path):
+            self.reload(); result=copy.deepcopy(self.state)
+        result.pop('enroll_tokens',None)
+        for n in result.get('nodes',{}).values(): n.pop('token_hash',None)
+        result['selected_node']=self.select(); return result
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args): print('[controller] '+(fmt % args), flush=True)
+    def reply(self, code, body):
+        raw=json.dumps(body,separators=(',',':')).encode(); self.send_response(code); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw)
+    def body(self): return json.loads(self.rfile.read(int(self.headers.get('Content-Length','0')) or 0) or b'{}')
+    def do_GET(self):
+        if urlparse(self.path).path == '/status': self.reply(200, self.server.controller.public_status())
+        else: self.reply(404, {'error':'not_found'})
+    def do_POST(self):
+        try:
+            path=urlparse(self.path).path; b=self.body()
+            if path == '/enroll': code,result=self.server.controller.enroll(b)
+            elif path == '/heartbeat': code,result=self.server.controller.heartbeat(b,self.headers.get('Authorization','').removeprefix('Bearer ').strip())
+            elif path == '/revoke': code,result=self.server.controller.revoke(b,self.headers.get('Authorization','').removeprefix('Bearer ').strip())
+            else: code,result=404,{'error':'not_found'}
+        except (ValueError, KeyError, json.JSONDecodeError) as e: code,result=400,{'error':'bad_request:'+str(e)}
+        self.reply(code,result)
+
+class Server(ThreadingHTTPServer):
+    def __init__(self, address, controller): super().__init__(address, Handler); self.controller=controller
+
+def init_state(a):
+    domain=a.domain.strip().lower().rstrip('.')
+    entry_id=(a.entry_id.strip() if a.entry_id else '') or ('domain-'+domain)
+    source=validate_endpoint(a.source, allow_http=True, label='源站 URL')
+    if a.engine not in ('caddy','nginx'): raise RuntimeError('引擎只能是 caddy 或 nginx。')
+    path=Path(a.state)
+    if path.exists():
+        if not getattr(a, 'force', False):
+            raise RuntimeError('主控状态已存在；为避免清空节点和注册码，请使用 --force 并先确认备份。')
+        backup=path.with_name(path.name + '.bak-' + time.strftime('%Y%m%d-%H%M%S'))
+        suffix=1
+        while backup.exists():
+            backup=path.with_name(path.name + '.bak-' + time.strftime('%Y%m%d-%H%M%S') + '-%s' % suffix)
+            suffix += 1
+        backup.write_bytes(path.read_bytes())
+        os.chmod(backup, 0o600)
+    state={'schema_version':1,'entry_id':entry_id,'domain':domain,'source':source,'engine':a.engine,'active_node':None,'enroll_tokens':{},'nodes':{}}
+    if a.zone_id and a.record_id and a.token_file: state['dns']={'provider':'cloudflare','zone_id':a.zone_id,'record_id':a.record_id,'token_file':a.token_file,'ttl':60}
+    with state_lock(a.state): atomic_write(a.state,state)
+    print('已创建多线路入口：'+a.state)
+def auto_node_id(state, public_ip):
+    base='edge-'+re.sub(r'[^A-Za-z0-9]+','-',str(public_ip).strip()).strip('-').lower()
+    base=base if base != 'edge-' else 'edge-node'
+    candidate=base; suffix=2
+    while candidate in state.get('nodes',{}) or candidate in state.get('enroll_tokens',{}):
+        candidate='%s-%s' % (base,suffix); suffix+=1
+    return candidate
+def issue(a):
+    path=Path(a.state)
+    controller_url=validate_endpoint(a.controller_url, allow_http=True, label='主控 URL')
+    with state_lock(path):
+        state=json.loads(path.read_text()); state.setdefault('enroll_tokens',{}); state.setdefault('nodes',{})
+        node_id=(a.node_id or '').strip() or auto_node_id(state,a.public_ip)
+        token=secrets.token_urlsafe(24)
+        state['enroll_tokens'][node_id]={'token':token,'issued_at':now()}
+        state['controller_url']=controller_url
+        backup_file(path)
+        atomic_write(path,state)
+    values=['sudo','ep','controller','node-install','--controller-url',controller_url,'--entry-id',state['entry_id'],'--node-id',node_id,'--name',a.name or node_id,'--priority',str(a.priority),'--quota-bytes',str(a.quota_bytes)]
+    if a.public_ip: values += ['--public-ip',a.public_ip]
+    values += ['--enroll-token',token]
+    # 边缘 VPS 可以是全新机器或旧版管理器；命令先确保当前管理器具备 node-install，再注册。
+    # 使用不可变安装脚本，避免 raw 分支缓存把旧版 setup 送到全新边缘机；setup 内部仍会拉取当前 manager。
+    bootstrap_url=os.environ.get('EMBY_PROXY_BOOTSTRAP_URL','https://raw.githubusercontent.com/wuuduf/emby-proxy/2b42b59/setup-emby-proxy.sh')
+    command=' '.join(shlex.quote(str(v)) for v in values)
+    print("(command -v ep >/dev/null 2>&1 && sudo ep controller node-install --help 2>&1 | grep -q auto-ip) || (curl -fsSL %s | sudo bash -s -- --manager-only) && %s" % (shlex.quote(bootstrap_url), command))
+    print("提示：注册码只能使用一次，签发后 15 分钟失效。")
+def validate_interval(value):
+    try: interval=int(value)
+    except (TypeError, ValueError): raise RuntimeError('主控检查间隔必须是整数。')
+    if not 1 <= interval <= 86400: raise RuntimeError('主控检查间隔必须在 1-86400 秒之间。')
+    return interval
+def validate_listen(value):
+    value=str(value)
+    if any(c in value for c in '\r\n') or ':' not in value:
+        raise RuntimeError('监听地址必须是 host:port，不能包含换行。')
+    host,port=value.rsplit(':',1)
+    if not re.fullmatch(r'[A-Za-z0-9_.:\-\[\]]+', host) or not port.isdigit() or not 0 <= int(port) <= 65535:
+        raise RuntimeError('监听端口必须在 0-65535 之间。')
+    return value
+def serve(a):
+    listen=validate_listen(a.listen); interval=validate_interval(a.reconcile_interval)
+    host,port=listen.rsplit(':',1); c=Controller(a.state); s=Server((host,int(port)),c); print('多线路主控监听 '+listen,flush=True); stop=threading.Event()
+    def loop():
+        while not stop.wait(interval):
+            try: print(json.dumps(c.reconcile(),ensure_ascii=False),flush=True)
+            except Exception as e: print('[controller] reconcile failed: '+str(e),flush=True)
+    threading.Thread(target=loop,daemon=True).start()
+    try: s.serve_forever()
+    except KeyboardInterrupt: stop.set()
+def master_install(a):
+    if os.geteuid() != 0: raise SystemExit('master-install 需要 root 或 sudo')
+    listen=validate_listen(a.listen); interval=validate_interval(a.reconcile_interval)
+    unit='''[Unit]\nDescription=emby-proxy multiline master\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nExecStart=/usr/local/sbin/emby-proxy controller serve --state %s --listen %s --reconcile-interval %s\nRestart=on-failure\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\n''' % (a.state,listen,interval)
+    unit_path=Path('/etc/systemd/system/emby-proxy-master.service'); backup=write_unit(unit_path,unit)
+    # 已运行的服务也必须载入新监听参数；任一步失败不能显示“已启动”。
+    try:
+        for command in (['systemctl','daemon-reload'], ['systemctl','enable','emby-proxy-master.service'], ['systemctl','restart','emby-proxy-master.service'], ['systemctl','is-active','--quiet','emby-proxy-master.service']):
+            subprocess.run(command,check=True)
+    except Exception:
+        restore_file(unit_path, backup)
+        subprocess.run(['systemctl','daemon-reload'],check=False)
+        raise
+    print('主控服务已启动：emby-proxy-master.service')
+def resolve_edge_ipv4(value):
+    """Run only on the edge, before consuming its single-use registration token."""
+    if not value:
+        try:
+            result=subprocess.run(['curl','-4','--noproxy','*','-fsS','--connect-timeout','4',
+                '--max-time','8','https://api.ipify.org'], capture_output=True, text=True,
+                check=True, timeout=10)
+            value=result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            raise RuntimeError('边缘公网 IPv4 自动检测失败；检查网络，或在原命令末尾加 --public-ip <边缘公网IPv4> 后重试，注册码未消耗。') from None
+    try:
+        ip=ipaddress.IPv4Address(value)
+        if not ip.is_global or ip.is_multicast:
+            raise ValueError('not a public unicast address')
+    except ValueError:
+        raise RuntimeError('边缘需要有效的公网 IPv4；请用 --public-ip 指定本机入口地址，注册码未消耗。') from None
+    return str(ip)
+
+def node_install(a):
+    if os.geteuid() != 0: raise SystemExit('node-install 需要 root 或 sudo')
+    controller_url=validate_endpoint(a.controller_url, allow_http=True, label='主控 URL')
+    a.public_ip=resolve_edge_ipv4(a.public_ip)
+    print('边缘公网 IPv4：'+a.public_ip)
+    node_file=Path('/etc/emby-proxy/multiline-node.json')
+    if node_file.exists():
+        try: old=json.loads(node_file.read_text())
+        except (OSError, ValueError): old={}
+        if old.get('node_id') and (old.get('node_id') != a.node_id or old.get('controller','').rstrip('/') != a.controller_url.rstrip('/')):
+            raise RuntimeError('本机已有边缘节点 %s；一台 VPS 只支持一个 node-id，请先卸载旧节点再注册。' % old.get('node_id'))
+    result=None; registered=False; node_backup=None; unit_backups=[]
+    try:
+        result=post_json(controller_url+'/enroll',{'entry_id':a.entry_id,'node_id':a.node_id,'name':a.name,'priority':a.priority,'quota_bytes':a.quota_bytes,'enroll_token':a.enroll_token,'public_ip':a.public_ip,'version':'single-script-0.1'})
+        registered=True
+        base=Path('/var/lib/emby-proxy'); base.mkdir(parents=True,exist_ok=True); Path('/etc/emby-proxy').mkdir(parents=True,exist_ok=True); used=base/'used_bytes'; used.touch(exist_ok=True); os.chmod(used,0o600)
+        engine=result.get('engine','caddy'); domain=result['domain']
+        log_root='/var/log/caddy' if engine == 'caddy' else '/var/log/nginx'
+        access_log='%s/emby-proxy-%s-access.log' % (log_root, domain)
+        offset=Path('/var/lib/emby-proxy/usage.offset')
+        state={'controller':controller_url,'entry_id':a.entry_id,'node_id':a.node_id,'node_token':result['node_token'],'domain':domain,'source':result['source'],'engine':engine,'public_ip':a.public_ip,'used_file':str(used),'access_log':access_log,'usage_offset_file':str(offset)}
+        backend=Path('/usr/local/lib/emby-proxy/setup-emby-proxy.sh')
+        if not backend.exists(): raise RuntimeError('未找到安装后端，请先用同一个 emby-proxy 脚本完成本机反代配置。')
+        # 边缘节点的域名通常仍指向当前活动节点，不能因为 DNS 尚未切换就阻止预配置。
+        # Caddy/Nginx 会先落配置；控制器切换 DNS 后再完成最终 TLS 验证。
+        setup_result=subprocess.run([str(backend),'--engine',state['engine'],'--domain',state['domain'],'--upstream',state['source'],'--skip-dns-check','--skip-verify'],check=False)
+        if setup_result.returncode != 0: raise RuntimeError('边缘反代预配置失败，请先修复本机 '+state['engine']+' 配置。')
+        node_backup=backup_file(node_file); atomic_write(node_file,state); os.chmod(node_file,0o600)
+        service_unit='[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nTimeoutStartSec=25s\nExecStart=/usr/local/sbin/emby-proxy controller node --state /etc/emby-proxy/multiline-node.json\n'
+        timer_unit='[Unit]\n[Timer]\nOnBootSec=20s\nOnUnitInactiveSec=30s\nAccuracySec=1s\nPersistent=true\n[Install]\nWantedBy=timers.target\n'
+        unit_backups.append((Path('/etc/systemd/system/emby-proxy-node.service'), write_unit('/etc/systemd/system/emby-proxy-node.service',service_unit)))
+        unit_backups.append((Path('/etc/systemd/system/emby-proxy-node.timer'), write_unit('/etc/systemd/system/emby-proxy-node.timer',timer_unit)))
+        # 使用 OnUnitInactiveSec：oneshot 服务结束后重新计时，避免部分 systemd/虚拟化环境
+        # 将 OnUnitActiveSec 错算成数天或 infinity，导致心跳停止。
+        for command in (['systemctl','daemon-reload'], ['systemctl','enable','emby-proxy-node.timer'], ['systemctl','restart','emby-proxy-node.timer']):
+            subprocess.run(command,check=True)
+        node_once(type('A',(),{'state':str(node_file)})())
+    except Exception:
+        for path,backup in reversed(unit_backups):
+            restore_file(path,backup)
+        if unit_backups: subprocess.run(['systemctl','daemon-reload'],check=False)
+        if node_backup: restore_file(node_file,node_backup)
+        else: node_file.unlink(missing_ok=True)
+        if registered and result and result.get('node_token'):
+            try: post_json(controller_url+'/revoke',{'node_id':a.node_id},result['node_token'])
+            except Exception as revoke_error: print('提醒：注册回滚失败，请在主控删除节点 %s：%s' % (a.node_id,revoke_error),file=sys.stderr)
+        raise
+    print('边缘节点注册成功：'+a.node_id)
+def local_entry_health(st):
+    """Verify this VPS serves its own HTTPS health route, not just a live daemon."""
+    domain=str(st.get('domain','')).strip().lower().rstrip('.')
+    if not domain or '/' in domain or ':' in domain or not shutil.which('curl'):
+        return False
+    url='https://%s/_emby_proxy_health' % domain
+    try:
+        result=subprocess.run([
+            'curl','--noproxy','*','-fsS','-o','/dev/null','--connect-timeout','3',
+            '--max-time','8','--resolve','%s:443:127.0.0.1' % domain,url
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+def _json_number(value):
+    try: return max(0, int(float(value)))
+    except (TypeError, ValueError): return 0
+def collect_usage(st):
+    """Accumulate response bytes from the managed JSON access log once per line."""
+    used_path=Path(st.get('used_file','/var/lib/emby-proxy/used_bytes'))
+    offset_path=Path(st.get('usage_offset_file',str(used_path)+'.offset'))
+    try: used=int(''.join(used_path.read_text().split()) or 0)
+    except (OSError, ValueError): used=0
+    log_path=Path(st.get('access_log',''))
+    if not log_path.is_file(): return max(0, used)
+    try:
+        info=log_path.stat(); marker='%s %s' % (info.st_ino, info.st_size)
+        old=offset_path.read_text().split()
+        inode=int(old[0]); offset=int(old[1])
+        if inode != info.st_ino or offset < 0 or offset > info.st_size: offset=0
+    except (OSError, ValueError, IndexError):
+        inode=info.st_ino; offset=0
+    added=0; position=offset
+    try:
+        with log_path.open('rb') as stream:
+            stream.seek(offset)
+            for raw in stream:
+                position += len(raw)
+                try: item=json.loads(raw.decode('utf-8'))
+                except (UnicodeDecodeError, json.JSONDecodeError): continue
+                req=item.get('request') if isinstance(item.get('request'),dict) else {}
+                path=str(item.get('path') or req.get('uri') or '').split('?',1)[0]
+                if path.rstrip('/') == '/_emby_proxy_health': continue
+                added += _json_number(item.get('bytes_sent', item.get('size', item.get('bytes', 0))))
+    except OSError:
+        return used
+    total=used + added
+    used_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp=used_path.with_suffix(used_path.suffix+'.tmp'); tmp.write_text(str(total)+'\n'); os.chmod(tmp,0o600); tmp.replace(used_path)
+    offset_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp=offset_path.with_suffix(offset_path.suffix+'.tmp'); tmp.write_text('%s %s\n' % (inode,position)); os.chmod(tmp,0o600); tmp.replace(offset_path)
+    return total
+def node_once(a):
+    st=json.loads(Path(a.state).read_text()); used=0
+    used=collect_usage(st)
+    service=st.get('engine','caddy')
+    service_ok=service in ('caddy','nginx') and subprocess.run(['systemctl','is-active','--quiet',service],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
+    healthy=service_ok and local_entry_health(st)
+    result=post_json(st['controller']+'/heartbeat',{'node_id':st['node_id'],'used_bytes':used,'healthy':healthy,'public_ip':st.get('public_ip'),'event':'edge_heartbeat','version':'single-script-0.1'},st['node_token']); print(json.dumps(result,ensure_ascii=False))
+def main():
+    p=argparse.ArgumentParser(prog='emby-proxy controller'); sub=p.add_subparsers(dest='cmd',required=True)
+    x=sub.add_parser('init'); x.add_argument('--state',required=True); x.add_argument('--entry-id',default=''); x.add_argument('--domain',required=True); x.add_argument('--source',required=True); x.add_argument('--engine',default='caddy'); x.add_argument('--zone-id'); x.add_argument('--record-id'); x.add_argument('--token-file'); x.add_argument('--force',action='store_true'); x.set_defaults(fn=init_state)
+    x=sub.add_parser('issue'); x.add_argument('--state',required=True); x.add_argument('--controller-url',required=True); x.add_argument('--node-id',default=''); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',default='',help='公网 IPv4；省略时在边缘检测 (auto-ip)'); x.set_defaults(fn=issue)
+    x=sub.add_parser('serve'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=serve)
+    x=sub.add_parser('master-install'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=master_install)
+    x=sub.add_parser('node-install'); x.add_argument('--controller-url',required=True); x.add_argument('--entry-id',required=True); x.add_argument('--node-id',required=True); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',default='',help='公网 IPv4；省略时在边缘检测 (auto-ip)'); x.add_argument('--enroll-token',required=True); x.set_defaults(fn=node_install)
+    x=sub.add_parser('node'); x.add_argument('--state',default='/etc/emby-proxy/multiline-node.json'); x.set_defaults(fn=node_once)
+    x=sub.add_parser('status'); x.add_argument('--state',required=True); x.set_defaults(fn=lambda a: print(json.dumps(Controller(a.state).private_status(),ensure_ascii=False,indent=2)))
+    x=sub.add_parser('reconcile'); x.add_argument('--state',required=True); x.set_defaults(fn=lambda a: print(json.dumps(Controller(a.state).reconcile(),ensure_ascii=False)))
+    a=p.parse_args()
+    try: a.fn(a)
+    except (RuntimeError, OSError, subprocess.CalledProcessError) as e:
+        print('错误：'+str(e), file=sys.stderr); raise SystemExit(1)
+if __name__ == '__main__': main()
+PY
+}
+
+controller_state_path() {
+  printf '%s' "${EMBY_PROXY_CONTROLLER_STATE:-$STATE_HOME/controller.json}"
+}
+
+controller_require_state() {
+  local state
+  state="$(controller_state_path)"
+  [[ -f "$state" ]] || { warn "还没有主控状态，请先选择 1 初始化主控入口。"; return 1; }
+  printf '%s' "$state"
+}
+
+controller_cf_curl() {
+  local token_file="$1" token
+  shift
+  token="$(cat "$token_file")"
+  curl -fsS --connect-timeout 8 --max-time 20 \
+    -H "Authorization: Bearer $token" -H 'Content-Type: application/json' "$@"
+}
+
+controller_cf_discover_ids() {
+  local token_file="$1" domain="$2" zones zone_id record_id records
+  zones="$(controller_cf_curl "$token_file" -G 'https://api.cloudflare.com/client/v4/zones' --data-urlencode 'per_page=1000')" || {
+    warn "Cloudflare Zone 查询失败，请检查 Token 权限和网络。"; return 1;
+  }
+  zone_id="$(jq -r --arg domain "$domain" '[((.result // [])[] as $z | select($domain == $z.name or ($domain|endswith("." + $z.name))) | $z)] | sort_by(.name|length) | last | .id // empty' <<<"$zones")"
+  [[ -n "$zone_id" ]] || { warn "没有找到 $domain 对应的 Cloudflare Zone。"; return 1; }
+  records="$(controller_cf_curl "$token_file" -G "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records" --data-urlencode 'type=A' --data-urlencode "name=$domain" --data-urlencode 'per_page=100')" || {
+    warn "Cloudflare DNS 记录查询失败，请检查 Token 是否有 Zone DNS Read/Edit 权限。"; return 1;
+  }
+  record_id="$(jq -r --arg domain "$domain" '[((.result // [])[]) | select(.type=="A" and .name==$domain)] | first.id // empty' <<<"$records")"
+  [[ -n "$record_id" ]] || {
+    warn "没有找到 $domain 的 A 记录，请先在 Cloudflare DNS 中创建一条 A 记录（建议灰云），再重试。"
+    return 1
+  }
+  printf '%s\t%s' "$zone_id" "$record_id"
+}
+
+# 字段级重试：q/EOF 取消当前向导；默认值和自动生成值不额外提问。
+ui_read_field() {
+  local target="$1" prompt="$2" default="${3:-}" validator="${4:-}" value
+  while true; do
+    printf '%s' "$prompt"
+    [[ -z "$default" ]] || printf ' [默认 %s]' "$default"
+    printf '：'
+    IFS= read -r value || { warn "输入结束，已取消当前向导。"; return 1; }
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    [[ ! "$value" =~ ^[qQ]$ ]] || { info "已取消，返回上一级。"; return 1; }
+    value="${value:-$default}"
+    if [[ -n "$validator" ]] && ! "$validator" "$value"; then continue; fi
+    printf -v "$target" '%s' "$value"
+    return 0
+  done
+}
+
+ui_valid_domain() {
+  local label
+  [[ ${#1} -le 253 && "$1" == *.* ]] || { warn "请填写域名，不带协议、端口或路径。"; return 1; }
+  local -a labels
+  IFS=. read -r -a labels <<<"$1"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -le 63 && "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || {
+      warn "域名格式无效，请重新输入，例如 emby.example.com。"; return 1;
+    }
+  done
+  [[ "$1" =~ \.[A-Za-z]{2,}$ ]] || { warn "请填写完整域名，例如 emby.example.com。"; return 1; }
+}
+
+ui_valid_url() {
+  python3 - "$1" <<'PY'
+import sys
+from urllib.parse import urlsplit
+try:
+    u = urlsplit(sys.argv[1])
+    valid = (u.scheme in ('http', 'https') and bool(u.hostname) and
+             not u.username and not u.password and not u.fragment and
+             not u.query and u.path in ('', '/') and
+             not any(c.isspace() or ord(c) < 32 for c in sys.argv[1]) and
+             (u.port is None or 1 <= u.port <= 65535))
+except ValueError:
+    valid = False
+if not valid:
+    print('请输入有效的 http:// 或 https:// 地址（只含主机和端口，不带路径、查询或账号密码）。', file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+ui_valid_source() {
+  local source="$1"
+  [[ "$source" == *://* ]] || source="https://$source"
+  ui_valid_url "$source"
+}
+
+ui_valid_yes_no() { [[ "$1" =~ ^[YyNn]$ ]] || { warn "请输入 y 或 n。"; return 1; }; }
+ui_valid_priority() { [[ "$1" =~ ^[0-9]{1,9}$ ]] || { warn "请填写 0–999999999 的整数，数字越大越优先。"; return 1; }; }
+ui_valid_ipv4() {
+  local octet
+  local -a octets
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { warn "IPv4 格式无效，请重新输入。"; return 1; }
+  IFS=. read -r -a octets <<<"$1"
+  for octet in "${octets[@]}"; do
+    [[ "$octet" == 0 || "$octet" != 0* ]] && (( 10#$octet <= 255 )) || {
+      warn "IPv4 每段须为 0–255，且不能有多余前导零。"; return 1;
+    }
+  done
+}
+
+controller_default_engine() {
+  # 复用正在运行的引擎；都未安装时才回到 Caddy。技术选择不再打断普通向导，
+  # 高级用户仍可通过 controller init --engine 显式指定。
+  if command -v caddy >/dev/null 2>&1 && systemctl is-active --quiet caddy 2>/dev/null; then
+    printf 'caddy'; return
+  fi
+  if command -v nginx >/dev/null 2>&1 && systemctl is-active --quiet nginx 2>/dev/null; then
+    printf 'nginx'; return
+  fi
+  command -v caddy >/dev/null 2>&1 && { printf 'caddy'; return; }
+  command -v nginx >/dev/null 2>&1 && { printf 'nginx'; return; }
+  printf 'caddy'
+}
+
+controller_init_menu() {
+  local state entry_id domain source engine zone_id record_id token_file answer cf_token discovered token_candidate force=0
+  state="$(controller_state_path)"
+  ui_section "1 / 3  配置主控入口"
+  printf '只配置一次域名和源站；入口 ID 自动生成。任一问题输入 q 取消。\n'
+  if [[ -f "$state" ]]; then
+    warn "入口已存在。重新初始化会清空节点和注册码；新增节点请选择 3。"
+    ui_read_field answer "仍要清空并重新配置？y/n" n ui_valid_yes_no || return 0
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+    force=1
+  fi
+  ui_read_field domain "对外域名（例如 emby.example.com）" "" ui_valid_domain || return 0
+  domain="$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')"
+  entry_id="domain-$domain"
+  ui_read_field source "Emby 源站（域名或 URL，可带端口）" "" ui_valid_source || return 0
+  [[ "$source" == *://* ]] || source="https://$source"
+  engine="$(jq -r '.engine // empty' "$state" 2>/dev/null || true)"
+  [[ "$engine" == caddy || "$engine" == nginx ]] || engine="$(controller_default_engine)"
+  info "边缘统一使用 ${engine}；如需指定其他引擎，请使用 CLI 的 --engine 参数。"
+  printf '\n自动切换 DNS 需要 Cloudflare；选 n 仅建立本地配置，不会自动切换。\n'
+  token_file="$STATE_HOME/cf.token"
+  local cf_default=n
+  [[ -s "$token_file" ]] && cf_default=y
+  ui_read_field answer "启用 Cloudflare A 记录切换？y/n" "$cf_default" ui_valid_yes_no || return 0
+  local -a args=(init --state "$state" --entry-id "$entry_id" --domain "$domain" --source "$source" --engine "$engine")
+  (( force == 1 )) && args+=(--force)
+  if [[ "$answer" =~ ^[Yy]$ ]]; then
+    if [[ -s "$token_file" ]]; then
+      info "检测到已有 Cloudflare Token，自动沿用本地 600 权限文件。"
+      chmod 600 "$token_file" || return 1
+      discovered="$(controller_cf_discover_ids "$token_file" "$domain")" || {
+        warn "已有 Token 无法查询 Cloudflare。删除 ${token_file} 后重试即可重新录入。"
+        return 1
+      }
+    else
+      printf 'Cloudflare API Token（输入隐藏，q 取消）：'
+      IFS= read -r -s cf_token || return 0; printf '\n'
+      [[ ! "$cf_token" =~ ^[qQ]$ ]] || return 0
+      [[ -n "$cf_token" ]] || { warn "API Token 不能为空。"; return 1; }
+      install_managed_dir 0750 "$(dirname "$token_file")" || return 1
+      token_candidate="$(mktemp "$STATE_HOME/.cf-token.XXXXXX")" || return 1
+      chmod 600 "$token_candidate"
+      printf '%s\n' "$cf_token" >"$token_candidate"; unset cf_token
+      if ! discovered="$(controller_cf_discover_ids "$token_candidate" "$domain")"; then
+        rm -f "$token_candidate"
+        return 1
+      fi
+      mv -f "$token_candidate" "$token_file" || { rm -f "$token_candidate"; return 1; }
+    fi
+    IFS=$'\t' read -r zone_id record_id <<<"$discovered"
+    info "已自动获取 zone_id=${zone_id}，record_id=${record_id}"
+    args+=(--zone-id "$zone_id" --record-id "$record_id" --token-file "$token_file")
+  fi
+  controller_cli "${args[@]}" || return 1
+  printf '\n入口：%s\n访问域名：https://%s\n下一步：选 2 启动主控服务，再选 3 添加边缘节点。\n' "$entry_id" "$domain"
+}
+
+controller_generate_node_id() {
+  local state="$1" public_ip="$2" base candidate suffix=2
+  base="edge-$(printf '%s' "$public_ip" | tr '.' '-')"
+  candidate="$base"
+  while jq -e --arg id "$candidate" '(.nodes[$id] != null) or (.enroll_tokens[$id] != null)' "$state" >/dev/null 2>&1; do
+    candidate="${base}-${suffix}"
+    ((suffix++))
+  done
+  printf '%s' "$candidate"
+}
+
+controller_parse_quota() {
+  python3 - "$1" "${2:-}" <<'PY'
+import re
+import sys
+from decimal import Decimal, InvalidOperation
+value, unit = sys.argv[1].strip(), sys.argv[2].upper()
+units = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4}
+if not unit:
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)?', value, re.I)
+    if not match:
+        raise SystemExit('请填写 500GB、1.5TB 或 0；纯数字按 GB 计算')
+    value, unit = match.group(1), (match.group(2) or 'GB').upper()
+if unit not in units:
+    raise SystemExit('单位必须是 B、KB、MB、GB 或 TB')
+try:
+    number = Decimal(value)
+except InvalidOperation:
+    raise SystemExit('配额数值必须是非负数字')
+if not number.is_finite() or number < 0 or number > Decimal(2**63-1) / units[unit]:
+    raise SystemExit('配额必须是非负数字，且不超过 2^63-1 字节')
+result = int(number * units[unit])
+if number > 0 and result == 0:
+    raise SystemExit('非零配额不能小于 1 字节')
+print(result)
+PY
+}
+
+ui_valid_listen() {
+  local port="${1##*:}"
+  [[ "$1" =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || {
+    warn "请填写 IPv4/主机名:端口，端口范围 1–65535。"; return 1;
+  }
+}
+ui_valid_interval() {
+  [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 86400 )) || {
+    warn "检查间隔须为 1–86400 秒的整数。"; return 1;
+  }
+}
+
+ui_valid_quota() { controller_parse_quota "$1" >/dev/null; }
+ui_valid_optional_ipv4() { [[ -z "$1" ]] || ui_valid_ipv4 "$1"; }
+
+controller_issue_menu() {
+  local state name priority quota quota_input public_ip controller_url saved_url status expected advanced
+  state="$(controller_require_state)" || return 1
+  ui_section "3 / 3  添加边缘节点"
+  printf '填写节点信息，生成命令后复制到对应 VPS 执行。输入 q 取消。\n'
+  printf '主控 URL 示例：https://control.example.com；必须先配置好 HTTPS 入口。\n'
+  saved_url="$(jq -r '.controller_url // empty' "$state")"
+  if [[ -n "$saved_url" ]]; then
+    controller_url="$saved_url"
+    info "沿用上次验证通过的主控 URL：${controller_url}（如失效会要求重新填写）"
+  else
+    ui_read_field controller_url "边缘能访问的主控 URL（不是播放域名）" "" ui_valid_url || return 0
+  fi
+  controller_url="${controller_url%/}"
+  info "正在检查主控连通性与入口身份……"
+  status="$(curl -fsS --connect-timeout 5 --max-time 10 "$controller_url/status" 2>/dev/null)" || {
+    if [[ -n "$saved_url" ]]; then
+      warn "已记忆的主控 URL 无法访问，请填写新的可达 URL。"
+      ui_read_field controller_url "边缘能访问的主控 URL（不是播放域名）" "" ui_valid_url || return 0
+      controller_url="${controller_url%/}"
+      status="$(curl -fsS --connect-timeout 5 --max-time 10 "$controller_url/status" 2>/dev/null)" || {
+        warn "无法访问主控。请先选择 2 启动服务；确认 HTTPS 入口及防火墙已配置。127.0.0.1 不能供其他 VPS 访问。"
+        return 1
+      }
+    else
+      warn "无法访问主控。请先选择 2 启动服务；确认 HTTPS 入口及防火墙已配置。127.0.0.1 不能供其他 VPS 访问。"
+      return 1
+    fi
+  }
+  expected="$(jq -r '.entry_id' "$state")"
+  jq -e --arg entry "$expected" '.entry_id == $entry' <<<"$status" >/dev/null 2>&1 || {
+    warn "主控响应无效或入口不匹配。请检查 URL 是否指向当前入口的控制器，而非播放网站。"; return 1;
+  }
+  public_ip=""
+  name=""
+  priority=100
+  quota_input=0
+  info "默认：名称和 ID 自动生成 · 优先级 100 · 配额不限额；公网 IP 在边缘 VPS 执行时检测。"
+  ui_read_field advanced "是否设置线路名称、优先级、配额或指定 IP？y/n" n ui_valid_yes_no || return 0
+  if [[ "$advanced" =~ ^[Yy]$ ]]; then
+    ui_read_field name "线路名称（留空自动生成）" "" || return 0
+    ui_read_field priority "优先级（数字越大越优先）" 100 ui_valid_priority || return 0
+    ui_read_field quota_input "配额（500GB / 1TB；纯数字为 GB，0 不限额）" 0 ui_valid_quota || return 0
+    ui_read_field public_ip "指定边缘公网 IPv4（留空在边缘自动检测）" "" ui_valid_optional_ipv4 || return 0
+  fi
+  quota="$(controller_parse_quota "$quota_input")" || return 1
+  printf '\n线路：%s · 优先级：%s · 配额：%s（%s bytes）\nIPv4：%s\n\n' "${name:-自动生成}" "$priority" "$quota_input" "$quota" "${public_ip:-在边缘 VPS 自动检测}"
+  local -a args=(issue --state "$state" --controller-url "$controller_url" --name "$name" --priority "$priority" --quota-bytes "$quota")
+  [[ -z "$public_ip" ]] || args+=(--public-ip "$public_ip")
+  controller_cli "${args[@]}" || return 1
+  printf '\n复制上面整条命令到边缘 VPS 执行（含一次性注册码，请勿公开）。\n完成后选 4 查看节点是否收到心跳；选 6 排查主控日志。\n'
+}
+
+controller_master_menu() {
+  local state unit_path
+  state="$(controller_require_state)" || return 1
+  ui_section "2 / 3  启动主控服务"
+  # 先看本项目固定的 unit 文件，避免 systemctl 不在运行时误以为是首次安装，
+  # 进而覆盖用户已经自定义的监听地址/检查间隔。
+  unit_path="/etc/systemd/system/emby-proxy-master.service"
+  [[ -f "$unit_path" ]] || unit_path="$(systemctl show --property=FragmentPath --value emby-proxy-master.service 2>/dev/null || true)"
+  if [[ -n "$unit_path" && -f "$unit_path" ]]; then
+    info "保留已有监听地址和检查间隔，只启动服务，不改写配置。需要修改请选择 7。"
+    systemctl start emby-proxy-master.service || return 1
+    systemctl is-active --quiet emby-proxy-master.service || return 1
+  else
+    info "首次启动使用安全默认值：127.0.0.1:19090 · 每 30 秒检查。"
+    controller_cli master-install --state "$state" --listen 127.0.0.1:19090 --reconcile-interval 30 || return 1
+  fi
+  systemctl --no-pager --full status emby-proxy-master.service || true
+  printf '\n下一步：确认主控 HTTPS 地址能被边缘访问，再选 3 添加边缘节点。\n'
+}
+
+controller_master_advanced_menu() {
+  local state listen interval answer
+  state="$(controller_require_state)" || return 1
+  ui_section "高级设置 · 主控服务参数"
+  warn "会重启主控，不重启 Web 服务。公网监听必须置于 HTTPS 或安全内网之后。"
+  ui_read_field listen "监听地址（host:port）" 127.0.0.1:19090 ui_valid_listen || return 0
+  ui_read_field interval "检查间隔（秒）" 30 ui_valid_interval || return 0
+  ui_read_field answer "应用以上参数并重启主控？y/n" n ui_valid_yes_no || return 0
+  [[ "$answer" =~ ^[Yy]$ ]] || return 0
+  controller_cli master-install --state "$state" --listen "$listen" --reconcile-interval "$interval"
+}
+
+controller_status_menu() {
+  local state status
+  state="$(controller_require_state)" || return 1
+  status="$(controller_cli status --state "$state")" || return 1
+  jq -r '
+    def size: if . >= 1099511627776 then ((. / 1099511627776 * 100 | floor) / 100 | tostring) + " TiB"
+      elif . >= 1073741824 then ((. / 1073741824 * 100 | floor) / 100 | tostring) + " GiB"
+      elif . >= 1048576 then ((. / 1048576 * 100 | floor) / 100 | tostring) + " MiB"
+      else (tostring) + " B" end;
+    "\n访问域名：https://\(.domain)\n固定源站：\(.source)\n当前记录节点：\(.active_node // "尚未切换")\n下一候选节点：\(.selected_node // "无可用节点")\n",
+    ((.nodes // {} | to_entries | sort_by(-(.value.priority // 0)))[] |
+      .value as $n |
+      "  \($n.name // .key) [\(.key)] · 优先级 \($n.priority // 0)",
+      "    状态：" + (if ((now | floor) - ($n.last_seen // 0)) > 90 then "心跳过期"
+        elif ($n.healthy != true) then "节点自报不健康"
+        elif (($n.quota_bytes // 0) > 0 and ($n.used_bytes // 0) >= $n.quota_bytes) then "配额已用完"
+        else "心跳正常" end) +
+      " · 用量：" + ($n.used_bytes // 0 | size) + " / " +
+      (if ($n.quota_bytes // 0) == 0 then "不限额" else ($n.quota_bytes | size) end)),
+    (if (.nodes // {} | length) == 0 then "还没有节点。选 3 生成注册命令，在边缘 VPS 上执行。" else empty end)
+  ' <<<"$status" || return 1
+  printf '\n心跳正常不等于媒体可播放；当前用量来自节点托管 JSON 访问日志的累计响应字节。\n'
+}
+
+controller_reconcile_menu() {
+  local state
+  state="$(controller_require_state)" || return 1
+  controller_cli reconcile --state "$state"
+}
+
+controller_logs_menu() {
+  systemctl --no-pager -n 100 status emby-proxy-master.service || true
+}
+
+controller_menu_summary() {
+  local state
+  state="$(controller_state_path)"
+  if [[ ! -f "$state" ]]; then
+    printf '\n  尚未配置主控。下一步：选 1，填写域名和源站。\n'
+    return 0
+  fi
+  if ! jq -er '
+    "\n  入口：" + .domain + " · 已注册 " + ((.nodes // {} | length) | tostring) + " 个节点",
+    "  当前记录节点：" + (.active_node // "尚未切换") + " · DNS 自动切换：" + (if .dns then "已配置" else "未启用" end)
+  ' "$state"; then
+    warn "状态文件无法读取，请先备份检查，不要直接重新初始化。"
+    return 0
+  fi
+  if systemctl is-active --quiet emby-proxy-master.service 2>/dev/null; then
+    printf '  主控服务运行中。添加节点选 3，查看心跳选 4。\n'
+  else
+    printf '  主控服务未运行。下一步：选 2 启动；异常时选 6。\n'
+  fi
+}
+
+controller_menu() {
+  local choice
+  while true; do
+    ui_header "多线路控制器 · 实验版" "配置入口 → 启动主控 → 接入节点"
+    controller_menu_summary
+    ui_section "首次配置 · 按顺序完成"
+    ui_item 1 "配置主控入口" "域名、固定源站、Cloudflare"
+    ui_item 2 "启动主控服务" "默认本机监听，每 30 秒检查"
+    ui_item 3 "添加边缘节点" "生成一条安装命令"
+    ui_section "日常管理"
+    ui_item 4 "节点状态与用量" "心跳、配额、当前节点"
+    ui_item 5 "立即同步 DNS" "优先级选路，不中转媒体"
+    ui_item 6 "服务状态与日志" "排查主控启动问题"
+    ui_item 7 "高级主控参数" "监听地址、检查间隔；通常无需修改"
+    printf '\n'
+    ui_item 0 "返回上一级" "q 也可返回"
+    ui_prompt; IFS= read -r choice || return 0
+    case "$choice" in
+      1) menu_run controller_init_menu ;;
+      2) menu_run controller_master_menu ;;
+      3) menu_run controller_issue_menu ;;
+      4) menu_run controller_status_menu ;;
+      5) menu_run controller_reconcile_menu ;;
+      6) menu_run controller_logs_menu ;;
+      7) menu_run controller_master_advanced_menu ;;
       0|q|Q) return ;;
       *) warn "请输入有效序号。" ;;
     esac
@@ -1292,11 +2326,15 @@ main_menu() {
     ui_item 6 "日志与流量统计" "媒体、错误、慢请求"
     ui_item 7 "备份、差异与恢复" "带 SHA256 校验"
     ui_item 8 "Web 服务管理" "安全 Reload / Restart"
-    ui_section "工具"
+    ui_section "扩展与工具"
     ui_item 9 "导入旧版配置" "只建立管理索引"
     ui_item 10 "检查/更新程序" "校验 SHA256 后更新"
+    ui_item 11 "多线路控制器" "主控、节点注册与优先级配额（实验版）"
+    ui_section "卸载（需要确认）"
+    ui_item 12 "完全卸载 emby-proxy" "删除脚本托管内容，保留 Caddy/Nginx 和证书"
+    printf '\n'
     ui_item 0 "退出面板" "也可以输入 q"
-    ui_prompt; read -r choice
+    ui_prompt; IFS= read -r choice || return 0
     case "$choice" in
       1) menu_run list_sites ;;
       2) if id="$(select_site_id)"; then menu_run show_site "$id"; else ui_pause; fi ;;
@@ -1308,6 +2346,8 @@ main_menu() {
       8) service_menu ;;
       9) menu_run import_existing ;;
       10) menu_update ;;
+      11) controller_menu ;;
+      12) uninstall_manager; if (( UNINSTALL_COMPLETED == 1 )); then exit 0; fi ;;
       0|q|Q) ui_clear; return ;;
       *) warn "请输入有效序号。" ;;
     esac
@@ -1321,6 +2361,10 @@ main() {
     -V|--version|version) printf 'emby-proxy %s\n' "$VERSION"; return ;;
   esac
   require_root "$@"
+  if [[ "$command" == "uninstall" ]]; then
+    uninstall_manager "${2:-}"
+    return
+  fi
   ensure_short_command || true
   require_jq; ensure_state_dirs; normalize_state_registry
   case "$command" in
@@ -1348,7 +2392,7 @@ main() {
     update)
       local previous_version="$VERSION"
       self_update "${2:-}"
-      restart_updated_manager "$previous_version"
+      [[ "${2:-}" == "--check" ]] || restart_updated_manager "$previous_version"
       ;;
     delete) [[ $# -ge 2 ]] || die "用法：emby-proxy delete <入口ID>"; delete_site "$2" ;;
     route)
@@ -1360,6 +2404,9 @@ main() {
         *) die "路径操作只能是 add、set 或 delete。" ;;
       esac ;;
     config) [[ "${2:-}" == "test" ]] || die "用法：emby-proxy config test"; config_test ;;
+    controller)
+      shift
+      controller_cli "$@" ;;
     *) die "未知命令：${command}。运行 emby-proxy --help 查看帮助。" ;;
   esac
 }

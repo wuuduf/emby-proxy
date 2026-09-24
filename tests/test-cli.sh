@@ -12,6 +12,7 @@ bash -n "$ROOT_DIR/emby-proxy" || fail "管理器语法检查失败"
 "$ROOT_DIR/setup-emby-proxy.sh" --help >"$TMP_DIR/setup-help"
 "$ROOT_DIR/emby-proxy" --help >"$TMP_DIR/manager-help"
 grep -F -- '--domain DOMAIN' "$TMP_DIR/setup-help" >/dev/null || fail "帮助缺少域名参数"
+grep -F -- 'uninstall [--yes]' "$TMP_DIR/manager-help" >/dev/null || fail "帮助缺少安全卸载命令"
 "$ROOT_DIR/emby-proxy" version | grep -F '3.3.0-menu' >/dev/null || fail "版本输出错误"
 
 # 非 root 且没有任何 --route 时，sudo 重执行参数不能因空数组 + nounset 崩溃。

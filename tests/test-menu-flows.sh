@@ -17,7 +17,7 @@ cat >"$TMP_DIR/selector/sites.d/domain-select.example.com.json" <<'JSON'
 JSON
 EMBY_PROXY_STATE_HOME="$TMP_DIR/selector" EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 \
 EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
-  set --; source "$MANAGER_UNDER_TEST"
+  source "$MANAGER_UNDER_TEST"
   selected="$(select_site_id)"
   [[ "$selected" == domain-select.example.com ]]
 ' <<<'1' 2>"$TMP_DIR/selector-menu.out" || fail "入口选择器返回值混入了菜单文本"
@@ -34,7 +34,7 @@ grep -F '已返回上一级菜单' "$TMP_DIR/selector-invalid.out" >/dev/null ||
 # 复现真实交互：主菜单选 2 后输入错误入口序号，必须回到主菜单而不是退出脚本。
 EMBY_PROXY_STATE_HOME="$TMP_DIR/selector" EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 \
 EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
-  set --; source "$MANAGER_UNDER_TEST"
+  source "$MANAGER_UNDER_TEST"
   print_status() { printf "status\n"; }
   main_menu
 ' <<'INPUT' >"$TMP_DIR/selector-return.out" 2>"$TMP_DIR/selector-return.err"
@@ -45,7 +45,7 @@ INPUT
 [[ "$(grep -c 'Emby 反向代理管理面板' "$TMP_DIR/selector-return.out")" -ge 2 ]] || fail "无效入口序号后没有回到主菜单"
 grep -F '已返回上一级菜单' "$TMP_DIR/selector-return.err" >/dev/null || fail "主菜单没有显示返回提示"
 
-# 主面板：无效输入应留在菜单；1-10 与 q 都必须正确分发。
+# 主面板：无效输入应留在菜单；1-12 与 q 都必须正确分发。
 TRACE="$TMP_DIR/main.trace"
 TRACE="$TRACE" EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 \
 EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
@@ -63,6 +63,8 @@ EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
   import_existing() { printf "import\n" >>"$TRACE"; }
   self_update() { printf "update\n" >>"$TRACE"; }
   restart_updated_manager() { printf "restart_manager\n" >>"$TRACE"; }
+  controller_menu() { printf "controller\n" >>"$TRACE"; }
+  uninstall_manager() { UNINSTALL_COMPLETED=0; printf "uninstall\n" >>"$TRACE"; }
   main_menu
 ' <<'INPUT' >"$TMP_DIR/main.out" 2>"$TMP_DIR/main.err"
 x
@@ -76,13 +78,69 @@ x
 8
 9
 10
+11
+12
 q
 INPUT
-for expected in list 'show domain-test.example.com' add 'manage domain-test.example.com' 'doctor all' logs backup service import update restart_manager; do
+for expected in list 'show domain-test.example.com' add 'manage domain-test.example.com' 'doctor all' logs backup service import update restart_manager controller uninstall; do
   assert_trace "$TRACE" "$expected"
 done
 grep -F '请输入有效序号' "$TMP_DIR/main.err" >/dev/null || fail "主菜单无效输入没有提示"
 grep -F '入口配置' "$TMP_DIR/main.out" >/dev/null || fail "主菜单缺少美化分组"
+
+# 多线路控制器子菜单：状态、DNS 同步和服务查看都必须能从菜单进入并返回。
+mkdir -p "$TMP_DIR/controller/sites.d" "$TMP_DIR/controller/backups"
+cat >"$TMP_DIR/controller/controller.json" <<'JSON'
+{"schema_version":1,"entry_id":"domain-test.example.com","domain":"test.example.com","source":"https://origin.example.com","engine":"caddy","nodes":{},"enroll_tokens":{},"active_node":null}
+JSON
+TRACE="$TMP_DIR/controller.trace" EMBY_PROXY_CONTROLLER_STATE="$TMP_DIR/controller/controller.json" \
+EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" \
+bash -c '
+  set --; source "$MANAGER_UNDER_TEST"
+  controller_cli() { printf "controller %s\n" "$*" >>"$TRACE"; [[ "$1" != status ]] || cat "$EMBY_PROXY_CONTROLLER_STATE"; }
+  systemctl() { printf "systemctl %s\n" "$*" >>"$TRACE"; return 0; }
+  controller_menu
+' <<'INPUT' >/dev/null
+x
+4
+5
+6
+0
+INPUT
+grep -Fx 'controller status' "$TMP_DIR/controller.trace" >/dev/null || fail "控制器菜单未进入状态查看"
+grep -Fx 'controller reconcile' "$TMP_DIR/controller.trace" >/dev/null || fail "控制器菜单未进入 DNS 同步"
+grep -Fx 'systemctl --no-pager' "$TMP_DIR/controller.trace" >/dev/null || fail "控制器菜单未进入服务查看"
+
+# 控制器初始化向导必须把用户输入完整传给底层 CLI。
+TRACE="$TMP_DIR/controller-wizard.trace" EMBY_PROXY_CONTROLLER_STATE="$TMP_DIR/controller/new.json" \
+EMBY_PROXY_NO_CLEAR=1 EMBY_PROXY_NO_PAUSE=1 EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" \
+bash -c '
+  set --; source "$MANAGER_UNDER_TEST"
+  controller_cli() { printf "controller %s\n" "$*" >>"$TRACE"; }
+  controller_init_menu
+' <<'INPUT' >/dev/null
+test.example.com
+https://origin.example.com
+n
+
+INPUT
+grep -Fx 'controller init' "$TMP_DIR/controller-wizard.trace" >/dev/null || fail "控制器初始化向导未调用 init"
+
+# 入口 ID 不再要求用户手填：CLI 省略 --entry-id 时按规范自动生成并统一小写。
+AUTO_STATE="$TMP_DIR/controller/auto.json"
+EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  source "$MANAGER_UNDER_TEST"
+  controller_cli init --state "$1" --domain EXAMPLE.COM --source https://origin.example.com --engine caddy
+' bash "$AUTO_STATE" >/dev/null
+[[ "$(jq -r .entry_id "$AUTO_STATE")" == "domain-example.com" ]] || fail "入口 ID 未按域名自动生成"
+
+# 节点 ID 由公网 IP 自动生成；重复 IP 会安全追加序号。配额支持人类可读单位。
+printf '%s\n' '{"nodes":{"edge-192-0-2-1":{}},"enroll_tokens":{}}' >"$TMP_DIR/controller/node.json"
+EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  source "$MANAGER_UNDER_TEST"
+  [[ "$(controller_generate_node_id "$1" 192.0.2.1)" == "edge-192-0-2-1-2" ]]
+  [[ "$(controller_parse_quota 1.5 GB)" == "1610612736" ]]
+' bash "$TMP_DIR/controller/node.json" || fail "节点 ID 或配额单位换算错误"
 
 # 入口管理子菜单：覆盖 1-6、返回、以及独立的删除入口分支。
 TRACE="$TMP_DIR/site.trace"
