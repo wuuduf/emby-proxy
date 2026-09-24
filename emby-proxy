@@ -1479,7 +1479,7 @@ service_menu() {
 controller_cli() {
   command -v python3 >/dev/null 2>&1 || die "多线路功能需要 python3。"
   python3 - "$@" <<'PY'
-import argparse, copy, hashlib, json, os, re, secrets, shlex, shutil, subprocess, sys, threading, time
+import argparse, copy, hashlib, ipaddress, json, os, re, secrets, shlex, shutil, subprocess, sys, threading, time
 import urllib.error, urllib.request
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1700,7 +1700,7 @@ def init_state(a):
     print('已创建多线路入口：'+a.state)
 def auto_node_id(state, public_ip):
     base='edge-'+re.sub(r'[^A-Za-z0-9]+','-',str(public_ip).strip()).strip('-').lower()
-    base=base or 'edge-node'
+    base=base if base != 'edge-' else 'edge-node'
     candidate=base; suffix=2
     while candidate in state.get('nodes',{}) or candidate in state.get('enroll_tokens',{}):
         candidate='%s-%s' % (base,suffix); suffix+=1
@@ -1716,14 +1716,14 @@ def issue(a):
         state['controller_url']=controller_url
         backup_file(path)
         atomic_write(path,state)
-    values=['sudo','ep','controller','node-install','--controller-url',controller_url,'--entry-id',state['entry_id'],'--node-id',node_id,'--name',a.name,'--priority',str(a.priority),'--quota-bytes',str(a.quota_bytes)]
+    values=['sudo','ep','controller','node-install','--controller-url',controller_url,'--entry-id',state['entry_id'],'--node-id',node_id,'--name',a.name or node_id,'--priority',str(a.priority),'--quota-bytes',str(a.quota_bytes)]
     if a.public_ip: values += ['--public-ip',a.public_ip]
     values += ['--enroll-token',token]
     # 边缘 VPS 可以是全新机器或旧版管理器；命令先确保当前管理器具备 node-install，再注册。
     # 使用不可变安装脚本，避免 raw 分支缓存把旧版 setup 送到全新边缘机；setup 内部仍会拉取当前 manager。
     bootstrap_url=os.environ.get('EMBY_PROXY_BOOTSTRAP_URL','https://raw.githubusercontent.com/wuuduf/emby-proxy/2b42b59/setup-emby-proxy.sh')
     command=' '.join(shlex.quote(str(v)) for v in values)
-    print("(command -v ep >/dev/null 2>&1 && sudo ep controller --help 2>&1 | grep -q node-install) || (curl -fsSL %s | sudo bash -s -- --manager-only); %s" % (shlex.quote(bootstrap_url), command))
+    print("(command -v ep >/dev/null 2>&1 && sudo ep controller node-install --help 2>&1 | grep -q auto-ip) || (curl -fsSL %s | sudo bash -s -- --manager-only) && %s" % (shlex.quote(bootstrap_url), command))
     print("提示：注册码只能使用一次，签发后 15 分钟失效。")
 def validate_interval(value):
     try: interval=int(value)
@@ -1762,9 +1762,29 @@ def master_install(a):
         subprocess.run(['systemctl','daemon-reload'],check=False)
         raise
     print('主控服务已启动：emby-proxy-master.service')
+def resolve_edge_ipv4(value):
+    """Run only on the edge, before consuming its single-use registration token."""
+    if not value:
+        try:
+            result=subprocess.run(['curl','-4','--noproxy','*','-fsS','--connect-timeout','4',
+                '--max-time','8','https://api.ipify.org'], capture_output=True, text=True,
+                check=True, timeout=10)
+            value=result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            raise RuntimeError('边缘公网 IPv4 自动检测失败；检查网络，或在原命令末尾加 --public-ip <边缘公网IPv4> 后重试，注册码未消耗。') from None
+    try:
+        ip=ipaddress.IPv4Address(value)
+        if not ip.is_global or ip.is_multicast:
+            raise ValueError('not a public unicast address')
+    except ValueError:
+        raise RuntimeError('边缘需要有效的公网 IPv4；请用 --public-ip 指定本机入口地址，注册码未消耗。') from None
+    return str(ip)
+
 def node_install(a):
     if os.geteuid() != 0: raise SystemExit('node-install 需要 root 或 sudo')
     controller_url=validate_endpoint(a.controller_url, allow_http=True, label='主控 URL')
+    a.public_ip=resolve_edge_ipv4(a.public_ip)
+    print('边缘公网 IPv4：'+a.public_ip)
     node_file=Path('/etc/emby-proxy/multiline-node.json')
     if node_file.exists():
         try: old=json.loads(node_file.read_text())
@@ -1870,10 +1890,10 @@ def node_once(a):
 def main():
     p=argparse.ArgumentParser(prog='emby-proxy controller'); sub=p.add_subparsers(dest='cmd',required=True)
     x=sub.add_parser('init'); x.add_argument('--state',required=True); x.add_argument('--entry-id',default=''); x.add_argument('--domain',required=True); x.add_argument('--source',required=True); x.add_argument('--engine',default='caddy'); x.add_argument('--zone-id'); x.add_argument('--record-id'); x.add_argument('--token-file'); x.add_argument('--force',action='store_true'); x.set_defaults(fn=init_state)
-    x=sub.add_parser('issue'); x.add_argument('--state',required=True); x.add_argument('--controller-url',required=True); x.add_argument('--node-id',default=''); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',required=True); x.set_defaults(fn=issue)
+    x=sub.add_parser('issue'); x.add_argument('--state',required=True); x.add_argument('--controller-url',required=True); x.add_argument('--node-id',default=''); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',default='',help='公网 IPv4；省略时在边缘检测 (auto-ip)'); x.set_defaults(fn=issue)
     x=sub.add_parser('serve'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=serve)
     x=sub.add_parser('master-install'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=master_install)
-    x=sub.add_parser('node-install'); x.add_argument('--controller-url',required=True); x.add_argument('--entry-id',required=True); x.add_argument('--node-id',required=True); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',required=True); x.add_argument('--enroll-token',required=True); x.set_defaults(fn=node_install)
+    x=sub.add_parser('node-install'); x.add_argument('--controller-url',required=True); x.add_argument('--entry-id',required=True); x.add_argument('--node-id',required=True); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',default='',help='公网 IPv4；省略时在边缘检测 (auto-ip)'); x.add_argument('--enroll-token',required=True); x.set_defaults(fn=node_install)
     x=sub.add_parser('node'); x.add_argument('--state',default='/etc/emby-proxy/multiline-node.json'); x.set_defaults(fn=node_once)
     x=sub.add_parser('status'); x.add_argument('--state',required=True); x.set_defaults(fn=lambda a: print(json.dumps(Controller(a.state).private_status(),ensure_ascii=False,indent=2)))
     x=sub.add_parser('reconcile'); x.add_argument('--state',required=True); x.set_defaults(fn=lambda a: print(json.dumps(Controller(a.state).reconcile(),ensure_ascii=False)))
@@ -1978,7 +1998,6 @@ ui_valid_source() {
   ui_valid_url "$source"
 }
 
-ui_valid_engine() { [[ "$1" == caddy || "$1" == nginx ]] || { warn "请输入 caddy 或 nginx。"; return 1; }; }
 ui_valid_yes_no() { [[ "$1" =~ ^[YyNn]$ ]] || { warn "请输入 y 或 n。"; return 1; }; }
 ui_valid_priority() { [[ "$1" =~ ^[0-9]{1,9}$ ]] || { warn "请填写 0–999999999 的整数，数字越大越优先。"; return 1; }; }
 ui_valid_ipv4() {
@@ -1993,8 +2012,22 @@ ui_valid_ipv4() {
   done
 }
 
+controller_default_engine() {
+  # 复用正在运行的引擎；都未安装时才回到 Caddy。技术选择不再打断普通向导，
+  # 高级用户仍可通过 controller init --engine 显式指定。
+  if command -v caddy >/dev/null 2>&1 && systemctl is-active --quiet caddy 2>/dev/null; then
+    printf 'caddy'; return
+  fi
+  if command -v nginx >/dev/null 2>&1 && systemctl is-active --quiet nginx 2>/dev/null; then
+    printf 'nginx'; return
+  fi
+  command -v caddy >/dev/null 2>&1 && { printf 'caddy'; return; }
+  command -v nginx >/dev/null 2>&1 && { printf 'nginx'; return; }
+  printf 'caddy'
+}
+
 controller_init_menu() {
-  local state entry_id domain source engine zone_id record_id token_file answer cf_token discovered force=0
+  local state entry_id domain source engine zone_id record_id token_file answer cf_token discovered token_candidate force=0
   state="$(controller_state_path)"
   ui_section "1 / 3  配置主控入口"
   printf '只配置一次域名和源站；入口 ID 自动生成。任一问题输入 q 取消。\n'
@@ -2009,21 +2042,41 @@ controller_init_menu() {
   entry_id="domain-$domain"
   ui_read_field source "Emby 源站（域名或 URL，可带端口）" "" ui_valid_source || return 0
   [[ "$source" == *://* ]] || source="https://$source"
-  ui_read_field engine "边缘反代引擎 caddy/nginx" caddy ui_valid_engine || return 0
+  engine="$(jq -r '.engine // empty' "$state" 2>/dev/null || true)"
+  [[ "$engine" == caddy || "$engine" == nginx ]] || engine="$(controller_default_engine)"
+  info "边缘统一使用 ${engine}；如需指定其他引擎，请使用 CLI 的 --engine 参数。"
   printf '\n自动切换 DNS 需要 Cloudflare；选 n 仅建立本地配置，不会自动切换。\n'
-  ui_read_field answer "启用 Cloudflare A 记录切换？y/n" n ui_valid_yes_no || return 0
+  token_file="$STATE_HOME/cf.token"
+  local cf_default=n
+  [[ -s "$token_file" ]] && cf_default=y
+  ui_read_field answer "启用 Cloudflare A 记录切换？y/n" "$cf_default" ui_valid_yes_no || return 0
   local -a args=(init --state "$state" --entry-id "$entry_id" --domain "$domain" --source "$source" --engine "$engine")
   (( force == 1 )) && args+=(--force)
   if [[ "$answer" =~ ^[Yy]$ ]]; then
-    token_file="$STATE_HOME/cf.token"
-    printf 'Cloudflare API Token（输入不回显，q 取消）：'; IFS= read -r -s cf_token || return 0; printf '\n'
-    [[ ! "$cf_token" =~ ^[qQ]$ ]] || return 0
-    [[ -n "$cf_token" ]] || { warn "API Token 不能为空。"; return 1; }
-    install_managed_dir 0750 "$(dirname "$token_file")"
-    umask 077; printf '%s\n' "$cf_token" >"$token_file"; chmod 600 "$token_file"; unset cf_token
-    discovered="$(controller_cf_discover_ids "$token_file" "$domain")" || return 1
+    if [[ -s "$token_file" ]]; then
+      info "检测到已有 Cloudflare Token，自动沿用本地 600 权限文件。"
+      chmod 600 "$token_file" || return 1
+      discovered="$(controller_cf_discover_ids "$token_file" "$domain")" || {
+        warn "已有 Token 无法查询 Cloudflare。删除 ${token_file} 后重试即可重新录入。"
+        return 1
+      }
+    else
+      printf 'Cloudflare API Token（输入隐藏，q 取消）：'
+      IFS= read -r -s cf_token || return 0; printf '\n'
+      [[ ! "$cf_token" =~ ^[qQ]$ ]] || return 0
+      [[ -n "$cf_token" ]] || { warn "API Token 不能为空。"; return 1; }
+      install_managed_dir 0750 "$(dirname "$token_file")" || return 1
+      token_candidate="$(mktemp "$STATE_HOME/.cf-token.XXXXXX")" || return 1
+      chmod 600 "$token_candidate"
+      printf '%s\n' "$cf_token" >"$token_candidate"; unset cf_token
+      if ! discovered="$(controller_cf_discover_ids "$token_candidate" "$domain")"; then
+        rm -f "$token_candidate"
+        return 1
+      fi
+      mv -f "$token_candidate" "$token_file" || { rm -f "$token_candidate"; return 1; }
+    fi
     IFS=$'\t' read -r zone_id record_id <<<"$discovered"
-    info "已自动获取 zone_id=$zone_id，record_id=$record_id"
+    info "已自动获取 zone_id=${zone_id}，record_id=${record_id}"
     args+=(--zone-id "$zone_id" --record-id "$record_id" --token-file "$token_file")
   fi
   controller_cli "${args[@]}" || return 1
@@ -2081,46 +2134,91 @@ ui_valid_interval() {
 }
 
 ui_valid_quota() { controller_parse_quota "$1" >/dev/null; }
+ui_valid_optional_ipv4() { [[ -z "$1" ]] || ui_valid_ipv4 "$1"; }
 
 controller_issue_menu() {
-  local state node_id name priority quota quota_input public_ip controller_url saved_url status expected
+  local state name priority quota quota_input public_ip controller_url saved_url status expected advanced
   state="$(controller_require_state)" || return 1
   ui_section "3 / 3  添加边缘节点"
   printf '填写节点信息，生成命令后复制到对应 VPS 执行。输入 q 取消。\n'
   printf '主控 URL 示例：https://control.example.com；必须先配置好 HTTPS 入口。\n'
   saved_url="$(jq -r '.controller_url // empty' "$state")"
-  ui_read_field controller_url "边缘能访问的主控 URL（不是播放域名）" "$saved_url" ui_valid_url || return 0
+  if [[ -n "$saved_url" ]]; then
+    controller_url="$saved_url"
+    info "沿用上次验证通过的主控 URL：${controller_url}（如失效会要求重新填写）"
+  else
+    ui_read_field controller_url "边缘能访问的主控 URL（不是播放域名）" "" ui_valid_url || return 0
+  fi
   controller_url="${controller_url%/}"
   info "正在检查主控连通性与入口身份……"
-  status="$(curl -fsS --connect-timeout 5 --max-time 10 "$controller_url/status")" || {
-    warn "无法访问主控。请先选择 2 启动服务；确认 HTTPS 入口及防火墙已配置。127.0.0.1 不能供其他 VPS 访问。"
-    return 1
+  status="$(curl -fsS --connect-timeout 5 --max-time 10 "$controller_url/status" 2>/dev/null)" || {
+    if [[ -n "$saved_url" ]]; then
+      warn "已记忆的主控 URL 无法访问，请填写新的可达 URL。"
+      ui_read_field controller_url "边缘能访问的主控 URL（不是播放域名）" "" ui_valid_url || return 0
+      controller_url="${controller_url%/}"
+      status="$(curl -fsS --connect-timeout 5 --max-time 10 "$controller_url/status" 2>/dev/null)" || {
+        warn "无法访问主控。请先选择 2 启动服务；确认 HTTPS 入口及防火墙已配置。127.0.0.1 不能供其他 VPS 访问。"
+        return 1
+      }
+    else
+      warn "无法访问主控。请先选择 2 启动服务；确认 HTTPS 入口及防火墙已配置。127.0.0.1 不能供其他 VPS 访问。"
+      return 1
+    fi
   }
   expected="$(jq -r '.entry_id' "$state")"
   jq -e --arg entry "$expected" '.entry_id == $entry' <<<"$status" >/dev/null 2>&1 || {
     warn "主控响应无效或入口不匹配。请检查 URL 是否指向当前入口的控制器，而非播放网站。"; return 1;
   }
-  ui_read_field public_ip "边缘公网 IPv4（用于 DNS 切换）" "" ui_valid_ipv4 || return 0
-  node_id="$(controller_generate_node_id "$state" "$public_ip")"
-  ui_read_field name "线路名称" "$node_id" || return 0
-  ui_read_field priority "优先级（数字越大越优先）" 100 ui_valid_priority || return 0
-  ui_read_field quota_input "配额（500GB / 1TB；纯数字为 GB，0 不限额）" 0 ui_valid_quota || return 0
+  public_ip=""
+  name=""
+  priority=100
+  quota_input=0
+  info "默认：名称和 ID 自动生成 · 优先级 100 · 配额不限额；公网 IP 在边缘 VPS 执行时检测。"
+  ui_read_field advanced "是否设置线路名称、优先级、配额或指定 IP？y/n" n ui_valid_yes_no || return 0
+  if [[ "$advanced" =~ ^[Yy]$ ]]; then
+    ui_read_field name "线路名称（留空自动生成）" "" || return 0
+    ui_read_field priority "优先级（数字越大越优先）" 100 ui_valid_priority || return 0
+    ui_read_field quota_input "配额（500GB / 1TB；纯数字为 GB，0 不限额）" 0 ui_valid_quota || return 0
+    ui_read_field public_ip "指定边缘公网 IPv4（留空在边缘自动检测）" "" ui_valid_optional_ipv4 || return 0
+  fi
   quota="$(controller_parse_quota "$quota_input")" || return 1
-  printf '\n节点：%s（%s）\nIPv4：%s · 优先级：%s · 配额：%s（%s bytes）\n\n' "$name" "$node_id" "$public_ip" "$priority" "$quota_input" "$quota"
-  controller_cli issue --state "$state" --controller-url "$controller_url" --node-id "$node_id" --name "$name" --priority "$priority" --quota-bytes "$quota" --public-ip "$public_ip" || return 1
+  printf '\n线路：%s · 优先级：%s · 配额：%s（%s bytes）\nIPv4：%s\n\n' "${name:-自动生成}" "$priority" "$quota_input" "$quota" "${public_ip:-在边缘 VPS 自动检测}"
+  local -a args=(issue --state "$state" --controller-url "$controller_url" --name "$name" --priority "$priority" --quota-bytes "$quota")
+  [[ -z "$public_ip" ]] || args+=(--public-ip "$public_ip")
+  controller_cli "${args[@]}" || return 1
   printf '\n复制上面整条命令到边缘 VPS 执行（含一次性注册码，请勿公开）。\n完成后选 4 查看节点是否收到心跳；选 6 排查主控日志。\n'
 }
 
 controller_master_menu() {
-  local state listen interval
+  local state unit_path
   state="$(controller_require_state)" || return 1
   ui_section "2 / 3  启动主控服务"
-  printf '默认仅本机监听，不会开放公网管理端口。\n边缘接入前，需将主控配置到可访问的 HTTPS 入口后。输入 q 取消。\n'
-  ui_read_field listen "监听地址（host:port）" 127.0.0.1:19090 ui_valid_listen || return 0
-  ui_read_field interval "检查间隔（秒）" 30 ui_valid_interval || return 0
-  controller_cli master-install --state "$state" --listen "$listen" --reconcile-interval "$interval" || return 1
+  # 先看本项目固定的 unit 文件，避免 systemctl 不在运行时误以为是首次安装，
+  # 进而覆盖用户已经自定义的监听地址/检查间隔。
+  unit_path="/etc/systemd/system/emby-proxy-master.service"
+  [[ -f "$unit_path" ]] || unit_path="$(systemctl show --property=FragmentPath --value emby-proxy-master.service 2>/dev/null || true)"
+  if [[ -n "$unit_path" && -f "$unit_path" ]]; then
+    info "保留已有监听地址和检查间隔，只启动服务，不改写配置。需要修改请选择 7。"
+    systemctl start emby-proxy-master.service || return 1
+    systemctl is-active --quiet emby-proxy-master.service || return 1
+  else
+    info "首次启动使用安全默认值：127.0.0.1:19090 · 每 30 秒检查。"
+    controller_cli master-install --state "$state" --listen 127.0.0.1:19090 --reconcile-interval 30 || return 1
+  fi
   systemctl --no-pager --full status emby-proxy-master.service || true
   printf '\n下一步：确认主控 HTTPS 地址能被边缘访问，再选 3 添加边缘节点。\n'
+}
+
+controller_master_advanced_menu() {
+  local state listen interval answer
+  state="$(controller_require_state)" || return 1
+  ui_section "高级设置 · 主控服务参数"
+  warn "会重启主控，不重启 Web 服务。公网监听必须置于 HTTPS 或安全内网之后。"
+  ui_read_field listen "监听地址（host:port）" 127.0.0.1:19090 ui_valid_listen || return 0
+  ui_read_field interval "检查间隔（秒）" 30 ui_valid_interval || return 0
+  ui_read_field answer "应用以上参数并重启主控？y/n" n ui_valid_yes_no || return 0
+  [[ "$answer" =~ ^[Yy]$ ]] || return 0
+  controller_cli master-install --state "$state" --listen "$listen" --reconcile-interval "$interval"
 }
 
 controller_status_menu() {
@@ -2191,6 +2289,7 @@ controller_menu() {
     ui_item 4 "节点状态与用量" "心跳、配额、当前节点"
     ui_item 5 "立即同步 DNS" "优先级选路，不中转媒体"
     ui_item 6 "服务状态与日志" "排查主控启动问题"
+    ui_item 7 "高级主控参数" "监听地址、检查间隔；通常无需修改"
     printf '\n'
     ui_item 0 "返回上一级" "q 也可返回"
     ui_prompt; IFS= read -r choice || return 0
@@ -2201,6 +2300,7 @@ controller_menu() {
       4) menu_run controller_status_menu ;;
       5) menu_run controller_reconcile_menu ;;
       6) menu_run controller_logs_menu ;;
+      7) menu_run controller_master_advanced_menu ;;
       0|q|Q) return ;;
       *) warn "请输入有效序号。" ;;
     esac

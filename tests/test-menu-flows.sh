@@ -121,8 +121,8 @@ bash -c '
 ' <<'INPUT' >/dev/null
 test.example.com
 https://origin.example.com
-caddy
 n
+
 INPUT
 grep -Fx 'controller init' "$TMP_DIR/controller-wizard.trace" >/dev/null || fail "控制器初始化向导未调用 init"
 

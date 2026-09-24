@@ -125,6 +125,45 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(len(backups), 1)
         self.assertNotIn('edge-192-0-2-10', json.loads(backups[0].read_text()).get('enroll_tokens', {}))
 
+    def test_issue_without_ip_generates_unique_ids_and_upgrade_guard(self):
+        args = SimpleNamespace(state=str(self.path), node_id='', public_ip='',
+            controller_url='https://control.example.com', name='', priority=100, quota_bytes=0)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            ns['issue'](args)
+            ns['issue'](args)
+        pending = json.loads(self.path.read_text())['enroll_tokens']
+        self.assertIn('edge-node', pending)
+        self.assertIn('edge-node-2', pending)
+        self.assertNotIn('--public-ip', out.getvalue())
+        self.assertIn('auto-ip', out.getvalue())
+        self.assertIn(') && sudo ep', out.getvalue())
+
+    def test_edge_ip_detection_is_bounded_and_tls_verified(self):
+        with patch.object(ns['subprocess'], 'run', return_value=SimpleNamespace(stdout='8.8.8.8\n')) as run:
+            self.assertEqual(ns['resolve_edge_ipv4'](''), '8.8.8.8')
+        command = run.call_args.args[0]
+        self.assertIn('-4', command)
+        self.assertIn('--noproxy', command)
+        self.assertNotIn('-k', command)
+        self.assertEqual(run.call_args.kwargs['timeout'], 10)
+
+    def test_manual_edge_ip_never_uses_network_and_validates(self):
+        with patch.object(ns['subprocess'], 'run') as run:
+            self.assertEqual(ns['resolve_edge_ipv4']('8.8.8.8'), '8.8.8.8')
+            for ip in ['127.0.0.1', '10.0.0.1', 'bad', '999.1.1.1', '::1']:
+                with self.assertRaises(RuntimeError):
+                    ns['resolve_edge_ipv4'](ip)
+            run.assert_not_called()
+
+    def test_edge_detection_failure_does_not_consume_registration(self):
+        args = SimpleNamespace(controller_url='https://control.example.com', public_ip='', node_id='edge-node')
+        with patch.object(ns['os'], 'geteuid', return_value=0), \
+             patch.dict(ns, resolve_edge_ipv4=Mock(side_effect=RuntimeError('detect failed')), post_json=Mock()) as _:
+            with self.assertRaisesRegex(RuntimeError, 'detect failed'):
+                ns['node_install'](args)
+            ns['post_json'].assert_not_called()
+
     def test_source_validation_rejects_path_and_revoke_removes_node(self):
         bad = SimpleNamespace(state=str(self.path), entry_id='', domain='test.example.com',
                               source='https://origin.example.com/path', engine='caddy',

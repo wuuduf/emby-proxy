@@ -31,7 +31,7 @@ class MenuUX(unittest.TestCase):
     def test_init_minimal_defaults_and_retry(self):
         self.state.unlink()
         r = self.run_menu('controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_init_menu',
-                          'bad domain\nTEST.EXAMPLE.COM\norigin.example.com:8443\n\nn\n')
+                          'bad domain\nTEST.EXAMPLE.COM\norigin.example.com:8443\nn\n\n')
         self.assertEqual(r.returncode, 0, r.stderr)
         for arg in ['domain-test.example.com', 'test.example.com', 'https://origin.example.com:8443', 'caddy']:
             self.assertIn('ARG:' + arg + '\n', r.stdout)
@@ -43,16 +43,44 @@ class MenuUX(unittest.TestCase):
         self.assertEqual(before, self.state.read_bytes())
         self.assertNotIn('Traceback', r.stderr)
 
-    def test_issue_defaults_quota_and_ip_retry(self):
+    def test_init_reuses_cloudflare_token_without_reprompt(self):
+        self.state.unlink()
+        (self.home / 'cf.token').write_text('fixture-token\n')
+        r = self.run_menu('controller_cf_discover_ids() { printf "zone-id\\trecord-id"; }; '
+                          'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_init_menu',
+                          'test.example.com\norigin.example.com\n\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('自动沿用本地 600 权限文件', r.stdout)
+        self.assertNotIn('API Token（输入隐藏', r.stdout)
+        self.assertIn('ARG:--token-file', r.stdout)
+        self.assertEqual((self.home / 'cf.token').stat().st_mode & 0o777, 0o600)
+
+    def test_issue_minimal_defaults_never_detects_controller_ip(self):
         self.data['controller_url'] = 'https://control.example.com'
         self.state.write_text(json.dumps(self.data))
-        r = self.run_menu('curl() { printf \'{"entry_id":"domain-test.example.com"}\'; }; '
-                          'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_issue_menu',
-                          '\n999.2.3.4\n192.0.2.10\n\n\nnope\n1.5TB\n')
+        r = self.run_menu('curl() { [[ "$*" == *"/status" ]] || return 99; '
+                          "printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
+                          'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_issue_menu', '\n\n')
         self.assertEqual(r.returncode, 0, r.stderr)
-        for arg in ['https://control.example.com', 'edge-192-0-2-10', '100', '1649267441664', '192.0.2.10']:
+        for arg in ['https://control.example.com', '100', '0']:
             self.assertIn('ARG:' + arg + '\n', r.stdout)
-        self.assertNotIn('配额单位 [', r.stdout)
+        self.assertNotIn('ARG:--public-ip', r.stdout)
+        self.assertNotIn('ARG:--node-id', r.stdout)
+        self.assertIn('边缘 VPS', r.stdout)
+
+    def test_issue_advanced_quota_and_ip_retry(self):
+        r = self.run_menu("curl() { printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
+                          'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_issue_menu',
+                          'https://control.example.com\ny\n香港线路\n50\nnope\n1.5TB\n999.2.3.4\n192.0.2.10\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for arg in ['香港线路', '50', '1649267441664', '192.0.2.10']:
+            self.assertIn('ARG:' + arg + '\n', r.stdout)
+
+    def test_issue_cancel_creates_no_token(self):
+        r = self.run_menu("curl() { printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
+                          'controller_cli() { echo SHOULD_NOT_ISSUE; }; controller_issue_menu',
+                          'https://control.example.com\nq\n')
+        self.assertNotIn('SHOULD_NOT_ISSUE', r.stdout)
 
     def test_wrong_controller_does_not_issue(self):
         r = self.run_menu('curl() { printf \'{"entry_id":"domain-other.example.com"}\'; }; '

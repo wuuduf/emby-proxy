@@ -22,8 +22,8 @@ setup-emby-proxy.sh（无参数）
 **多线路实验控制面**：
 ```text
 controller init → controller.json
-controller issue → 一次性注册命令
-node-install → POST /enroll → 节点配置/服务/定时器
+controller issue → 一次性注册命令（默认不携带边缘 IP）
+node-install → 边缘自动检测公网 IPv4 → POST /enroll → 节点配置/服务/定时器
 node → POST /heartbeat → 健康、用量、last_seen
 serve 的周期 reconcile → select → Cloudflare A 记录更新
 ```
