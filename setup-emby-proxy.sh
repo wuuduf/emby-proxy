@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_SOURCE_URL="${EMBY_PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/refs/heads/codex/multiline-lab/setup-emby-proxy.sh}"
+readonly SCRIPT_SOURCE_URL="${EMBY_PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/main/setup-emby-proxy.sh}"
 
 # `bash <(curl -fsSL URL)` 的入口是 /dev/fd/*。该 fd 会随着 bash 解析脚本
 # 逐步前移，不能在后面直接复制来执行 sudo 重入或安装后端，因此先落到稳定
@@ -46,7 +46,7 @@ readonly NGINX_LEGACY_CONFIG="/etc/nginx/conf.d/emby-proxy-managed.conf"
 readonly NGINX_ACME_ROOT="/var/www/emby-proxy-acme"
 readonly NGINX_HASH_CONFIG="${EMBY_PROXY_NGINX_HASH_CONFIG:-/etc/nginx/conf.d/00-emby-proxy-hash.conf}"
 readonly HEALTH_PATH="/_emby_proxy_health"
-readonly MANAGER_COMMAND_URL="${EMBY_PROXY_MANAGER_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/refs/heads/codex/multiline-lab/emby-proxy}"
+readonly MANAGER_COMMAND_URL="${EMBY_PROXY_MANAGER_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/main/emby-proxy}"
 readonly MANAGER_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
 readonly MANAGER_LIBEXEC="${EMBY_PROXY_LIBEXEC:-/usr/local/lib/emby-proxy}"
 readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
@@ -58,6 +58,7 @@ BOOTSTRAP_MENU=0
 ENTRY_WIZARD=0
 SKIP_DNS_CHECK=0
 SKIP_VERIFY=0
+TLS_DIRECTORY=""
 ACCESS_SCHEME=""
 HTTPS_PORT=""
 DOMAIN_ENTRY_TYPE=""
@@ -141,6 +142,7 @@ usage() {
       --domain-mode MODE    域名入口：subdomain、port 或 path
       --skip-dns-check      仅用于边缘节点预配置：暂不要求域名当前指向本 VPS
       --skip-verify         仅用于边缘节点预配置：配置成功后不等待本机 HTTPS 验证
+      --tls-directory DIR  使用已校验的外部证书目录（fullchain.pem / privkey.pem）
   -p, --path PATH           主源站的访问路径，默认 /；已有 Caddy 域名必须填写非根路径
   -u, --upstream ADDRESS    Emby 源站域名或 URL，可带端口
                             例如 origin.example.com、https://origin.example.com、http://1.2.3.4:8096
@@ -173,6 +175,9 @@ while (($#)); do
       SKIP_DNS_CHECK=1; shift ;;
     --skip-verify)
       SKIP_VERIFY=1; shift ;;
+    --tls-directory)
+      [[ $# -ge 2 && "$2" =~ ^/[A-Za-z0-9_./-]+$ && "$2" != *..* ]] || die "证书目录必须是安全的绝对路径。"
+      TLS_DIRECTORY="$2"; shift 2 ;;
     -p|--path)
       [[ $# -ge 2 ]] || die "$1 缺少参数。"
       PRIMARY_ROUTE_INPUT="$2"; shift 2 ;;
@@ -976,12 +981,13 @@ persist_site_state() {
     --arg id "$site_id" --arg engine "$PROXY_ENGINE" \
     --arg domain "$PROXY_DOMAIN" \
     --arg listen_port "$HTTPS_PORT" --arg public_url "$PUBLIC_BASE_URL" \
-    --arg entry_type "$DOMAIN_ENTRY_TYPE" \
+    --arg entry_type "$DOMAIN_ENTRY_TYPE" --arg tls_directory "$TLS_DIRECTORY" \
     --arg managed_kind "$managed_kind" --arg config_file "$config_file" \
     --arg created_at "$created_at" --arg updated_at "$now" --argjson routes "$routes_json" \
     '{schema_version:$schema_version,id:$id,engine:$engine,domain:$domain,
       listen_port:($listen_port|if .=="" then null else tonumber end),entry_type:$entry_type,public_url:$public_url,
-      managed_kind:$managed_kind,config_file:$config_file,created_at:$created_at,updated_at:$updated_at,routes:$routes}' \
+      managed_kind:$managed_kind,config_file:$config_file,created_at:$created_at,updated_at:$updated_at,routes:$routes}
+      + (if $tls_directory=="" then {} else {tls_directory:$tls_directory} end)' \
     >"$temp"
   if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
     install -d -o root -g root -m 0750 "$MANAGER_HOME/sites.d" "$MANAGER_HOME/backups"
@@ -1384,8 +1390,8 @@ server {
     if (\$ssl_server_name != $PROXY_DOMAIN) { return 421; }
     if (\$host != $PROXY_DOMAIN) { return 421; }
 
-    ssl_certificate /etc/letsencrypt/live/$PROXY_DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$PROXY_DOMAIN/privkey.pem;
+    ssl_certificate ${TLS_DIRECTORY:-/etc/letsencrypt/live/$PROXY_DOMAIN}/fullchain.pem;
+    ssl_certificate_key ${TLS_DIRECTORY:-/etc/letsencrypt/live/$PROXY_DOMAIN}/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_cache shared:EMBY_SSL_${NGINX_ID}:10m;
     ssl_session_timeout 1d;
@@ -1516,7 +1522,10 @@ apply_nginx_config() {
   timestamp="$(date +%Y%m%d-%H%M%S)"
   candidate="$(mktemp /tmp/emby-nginx.XXXXXX.conf)"
   acme_candidate="$(mktemp /tmp/emby-nginx-acme.XXXXXX.conf)"
-  cert_dir="/etc/letsencrypt/live/$PROXY_DOMAIN"
+  cert_dir="${TLS_DIRECTORY:-/etc/letsencrypt/live/$PROXY_DOMAIN}"
+  if [[ -n "$TLS_DIRECTORY" && ( ! -s "$cert_dir/fullchain.pem" || ! -s "$cert_dir/privkey.pem" ) ]]; then
+    die "集中证书不存在，请先同步证书，不会回退到 HTTP-01 申请。"
+  fi
   mkdir -p "$(dirname "$NGINX_CONFIG")" "$NGINX_ACME_ROOT/.well-known/acme-challenge"
   migrate_legacy_nginx_config
   check_nginx_domain_conflict
@@ -1815,6 +1824,7 @@ build_candidate_config() {
   {
     printf '\n%s\n' "$domain_begin"
     printf '%s {\n' "$site_address"
+    [[ -z "$TLS_DIRECTORY" ]] || printf '    tls %s/fullchain.pem %s/privkey.pem\n' "$TLS_DIRECTORY" "$TLS_DIRECTORY"
     cat <<EOF
     log {
         output file $CADDY_ACCESS_LOG {
@@ -2136,6 +2146,15 @@ main() {
     install_caddy
   else
     install_nginx
+  fi
+  if [[ -n "$TLS_DIRECTORY" ]]; then
+    [[ -s "$TLS_DIRECTORY/fullchain.pem" && -s "$TLS_DIRECTORY/privkey.pem" ]] || die "外部证书不完整，未修改站点。"
+    (( CADDY_ATTACH_EXISTING == 0 )) || die "集中证书不能接管手工 Caddy 站点；请使用独立托管域名。"
+    if [[ "$PROXY_ENGINE" == "caddy" ]]; then
+      chown root:caddy "$TLS_DIRECTORY/" "$TLS_DIRECTORY/fullchain.pem" "$TLS_DIRECTORY/privkey.pem"
+      chmod 0750 "$TLS_DIRECTORY/"
+      chmod 0640 "$TLS_DIRECTORY/fullchain.pem" "$TLS_DIRECTORY/privkey.pem"
+    fi
   fi
   show_plan
   configure_firewall

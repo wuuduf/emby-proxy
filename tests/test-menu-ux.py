@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -139,6 +140,24 @@ class MenuUX(unittest.TestCase):
         self.assertNotIn('SECRET', r.stdout)
         self.assertIn('GiB', r.stdout)
 
+    def test_controller_status_explains_recovery_and_unconfirmed_dns(self):
+        self.data.update(last_reconcile_reason='dns_unconfirmed', active_node='edge-old')
+        self.data['nodes'] = {
+            'edge-new': dict(healthy=False, status='recovering', success_streak=2, last_seen=int(time.time())),
+            'edge-old': dict(healthy=True, status='suspect', failure_streak=1, last_seen=int(time.time()))}
+        self.state.write_text(json.dumps(self.data))
+        r = self.run_menu('controller_status_menu')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for text in ('恢复观察中', '故障观察中', '尚未回读确认', 'DNS 未确认', '180 秒', '90 秒'):
+            self.assertIn(text, r.stdout)
+
+    def test_reconcile_error_returns_to_controller_menu(self):
+        r = self.run_menu('systemctl() { return 3; }; controller_cli() { return 1; }; '
+                          'controller_menu; echo RETURNED', '5\n0\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertGreaterEqual(r.stdout.count('多线路控制器'), 2)
+        self.assertIn('RETURNED', r.stdout)
+
     def test_quota_shorthand(self):
         r = self.run_menu('for q in 500 1.5TB 0 "2 gb"; do controller_parse_quota "$q"; done')
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -147,6 +166,18 @@ class MenuUX(unittest.TestCase):
             r = self.run_menu('controller_parse_quota "' + value + '"')
             self.assertNotEqual(r.returncode, 0)
             self.assertNotIn('Traceback', r.stderr)
+
+    def test_certificate_setup_cancel_does_not_touch_system(self):
+        r = self.run_menu('controller_cli() { echo SHOULD_NOT_RUN; }; controller_cert_menu', 'control.example.com\nn\n')
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertNotIn('SHOULD_NOT_RUN',r.stdout)
+
+    def test_certificate_setup_menu_calls_atomic_setup(self):
+        r = self.run_menu('controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_cert_menu', 'control.example.com\ny\n')
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertIn('ARG:cert-setup',r.stdout)
+        self.assertIn('ARG:--install-deps',r.stdout)
+        self.assertIn('0.0.0.0:19090',r.stderr)
 
 
 if __name__ == '__main__':

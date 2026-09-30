@@ -52,6 +52,8 @@ PY
 |---|---|---|
 | 静态 | `--quick` | Bash/Python 可解析，发布脚本与清单一致 |
 | 配置/菜单 | CLI、manager、menu、config-generation 测试 | 临时目录和 mock 中的分发、文本生成及失败处理 |
+| 集中证书 | `test-controller-certificates.py` | 临时证书真实 TLS、接口鉴权、DNS-01 编排替身、失败回滚；不是真实 CA/systemd 测试 |
+| 防抖与确认 | `test-controller-failover.py` | 恢复窗口、冷却、引擎冲突、Cloudflare 回读；无真实 systemd/DNS 修改 |
 | 状态机 | `test-controller-model.py` | 固定时钟下注册、配额、优先级、DNS 失败重试；禁止出网 |
 | 回环服务 | `test-controller.sh` | 真实 Python 服务与 CLI 并发写状态，监听 127.0.0.1 |
 | 实机验收 | 用户单独授权后执行 | 真正的 systemd、Caddy/Nginx、DNS、TLS 和媒体播放 |
@@ -59,6 +61,8 @@ PY
 `.github/workflows/check.yml` 配置 Ubuntu 22.04/24.04 与 macOS 验证。同一 `scripts/check.py` 本地与 CI 共用。
 新增工作流只有推送后才会在 GitHub 运行；本地通过不意味着远端 CI 已通过。
 目前不把 ShellCheck、实际 Caddy/Nginx 配置加载或公网播放称为本地自动门禁。
+
+完整测试步骤见 [测试与验收文档](TESTING.md)。
 
 ## 实机操作前后
 

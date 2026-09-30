@@ -253,3 +253,13 @@ if command -v caddy >/dev/null 2>&1; then
 fi
 
 printf 'PASS: domain HTTPS only, existing-site path attach, multi-domain isolation, ACME-only HTTP, XFF hardening, idempotent rewrites\n'
+
+# 集中证书仅改变本站点 TLS 来源，两种引擎不再要求业务 DNS 指向本机。
+set_domain certificates.example.com
+TLS_DIRECTORY='/etc/emby-proxy/edge-tls/current'
+write_nginx_https_config "$TMP_DIR/nginx-certificates.conf"
+assert_contains "$TMP_DIR/nginx-certificates.conf" "ssl_certificate $TLS_DIRECTORY/fullchain.pem;"
+assert_contains "$TMP_DIR/nginx-certificates.conf" "ssl_certificate_key $TLS_DIRECTORY/privkey.pem;"
+build_candidate_config "$TMP_DIR/Caddyfile.empty" "$TMP_DIR/Caddyfile.certificates"
+assert_contains "$TMP_DIR/Caddyfile.certificates" "tls $TLS_DIRECTORY/fullchain.pem $TLS_DIRECTORY/privkey.pem"
+TLS_DIRECTORY=''

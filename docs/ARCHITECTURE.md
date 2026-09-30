@@ -23,9 +23,9 @@ setup-emby-proxy.sh（无参数）
 ```text
 controller init → controller.json
 controller issue → 一次性注册命令（默认不携带边缘 IP）
-node-install → 边缘自动检测公网 IPv4 → POST /enroll → 节点配置/服务/定时器
+node-install → 边缘自动检测公网 IPv4 / 本机引擎预检 → POST /enroll → 节点配置/服务/定时器
 node → POST /heartbeat → 健康、用量、last_seen
-serve 的周期 reconcile → select → Cloudflare A 记录更新
+serve 的周期 reconcile → 带防抖/冷却的 select → Cloudflare A 记录写入 + API 回读确认
 ```
 控制器不承载媒体流量。这是按优先级选择单个活动节点的 DNS 切换，不是逐请求负载均衡。
 DNS 缓存与已有播放连接不会随 A 记录立即迁移。
@@ -39,7 +39,7 @@ DNS 缓存与已有播放连接不会随 A 记录立即迁移。
 | `emby-proxy`: `main`, `main_menu`, `menu_run` | CLI/菜单分发、操作失败隔离 | `test-menu-flows.sh` |
 | `self_update`, `menu_update`, `restart_updated_manager` | 下载、校验、安装、自动重新进入菜单 | `test-manager-stage2.sh`, `test-menu-update.sh` |
 | `route_upsert`, `delete_site`, 备份函数 | 索引重放、安全增删和恢复 | `test-manager.sh`, `test-manager-stage2.sh` |
-| `controller_cli` 内嵌 Python | 注册、心跳、选路、DNS 和 systemd | `test-controller.sh`, `test-controller-model.py` |
+| `controller_cli` 内嵌 Python | 注册、心跳、选路、DNS 和 systemd | `test-controller.sh`, `test-controller-model.py`, `test-controller-failover.py` |
 
 ## 状态与信任边界
 
@@ -60,3 +60,8 @@ DNS 缓存与已有播放连接不会随 A 记录立即迁移。
 边缘已形成基于 JSON 访问日志的累计读取和轮转处理，**仍没有账期重置、跨多日志文件补偿或“只统计媒体响应”的精细口径**。
 控制器状态文件使用 0600；已有状态的 `init` 必须显式 `--force`，并先保存带时间戳的备份。注册码使用后删除，且 15 分钟后失效。
 这些需要独立设计与回归，不应因为几个模拟切换测试通过就宣布生产可用。
+
+## 可选集中证书
+
+菜单 8 / controller cert-setup：复用 CF Token，通过 Certbot DNS-01 为入口和独立主控域名签发证书；控制器在自己的端口启用原生 TLS。/certificate 只接受真实 TLS 和本入口节点令牌，不信任 X-Forwarded-Proto，不允许 HTTP 重定向携带凭据。
+边缘注册后从主控下载所属入口证书，经校验再使用版本目录 + current 原子切换；两种引擎通过 tls_directory 加载同一接口。独立 cert-renew 和 cert-sync 定时器管理续期；普通单机入口不改变原证书管理方式。详见 CERTIFICATES.md。

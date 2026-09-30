@@ -136,7 +136,7 @@ class ControllerTests(unittest.TestCase):
         self.assertIn('edge-node', pending)
         self.assertIn('edge-node-2', pending)
         self.assertNotIn('--public-ip', out.getvalue())
-        self.assertIn('auto-ip', out.getvalue())
+        self.assertIn('engine-preflight', out.getvalue())
         self.assertIn(') && sudo ep', out.getvalue())
 
     def test_edge_ip_detection_is_bounded_and_tls_verified(self):

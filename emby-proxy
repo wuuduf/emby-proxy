@@ -6,6 +6,7 @@ IFS=$'\n\t'
 
 readonly VERSION="3.3.0-menu"
 readonly STATE_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
+readonly LEGACY_STATE_HOME="/var/lib/emby-proxy"
 readonly SITES_DIR="$STATE_HOME/sites.d"
 readonly BACKUPS_DIR="$STATE_HOME/backups"
 readonly CADDYFILE="${EMBY_PROXY_CADDYFILE:-/etc/caddy/Caddyfile}"
@@ -24,7 +25,7 @@ readonly MANAGER_BIN="${EMBY_PROXY_MANAGER_BIN:-/usr/local/sbin/emby-proxy}"
 # 本项目标识时清理，避免误删同名的第三方程序。
 readonly LEGACY_MANAGER_BIN="${EMBY_PROXY_LEGACY_MANAGER_BIN:-/usr/local/bin/emby-proxy}"
 readonly SHORT_BIN="${EMBY_PROXY_SHORT_BIN:-/usr/local/bin/ep}"
-readonly UPDATE_BASE_URL="${EMBY_PROXY_UPDATE_BASE_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/refs/heads/codex/multiline-lab}"
+readonly UPDATE_BASE_URL="${EMBY_PROXY_UPDATE_BASE_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/main}"
 LOCK_FD=""
 DOCTOR_OK=0
 DOCTOR_WARN=0
@@ -729,6 +730,9 @@ run_backend_for_state() {
   args+=(--engine "$engine")
   domain="$(jq -r '.domain' "$file")"; port="$(site_listen_port "$file")"
   args+=(--domain "$domain")
+  local tls_directory
+  tls_directory="$(jq -r '.tls_directory // empty' "$file")"
+  [[ -z "$tls_directory" ]] || args+=(--tls-directory "$tls_directory" --skip-dns-check)
   if [[ "$port" != "443" ]]; then
     args+=(--domain-mode port --https-port "$port")
   elif [[ "$(jq -r '.entry_type // empty' "$file")" == "path" || "$(jq '.routes|length' "$file")" -gt 1 || "$kind" == "caddy_attached" ]]; then
@@ -1105,18 +1109,22 @@ uninstall_archive() {
   local backup_root="$1" timestamp="$2" archive="$backup_root/emby-proxy-uninstall-$timestamp.tar.gz" sha items=() file
   install_managed_dir 0750 "$backup_root"
   # 只打包脚本明确管理的路径；不会把整台机器或 Caddy/Nginx 证书带走。
-  for file in "$STATE_HOME" "$CADDYFILE" "$NGINX_LEGACY_CONFIG" "$NGINX_HASH_CONFIG" \
+  for file in "$STATE_HOME" "$LEGACY_STATE_HOME" "$CADDYFILE" "$NGINX_LEGACY_CONFIG" "$NGINX_HASH_CONFIG" \
     "$NGINX_ACME_ROOT" "$MANAGER_BIN" "$LEGACY_MANAGER_BIN" "$SHORT_BIN" "$INSTALLED_BACKEND" "$MANAGER_LIBEXEC" \
     /etc/systemd/system/emby-proxy-master.service /etc/systemd/system/emby-proxy-node.service \
-    /etc/systemd/system/emby-proxy-node.timer; do
+    /etc/systemd/system/emby-proxy-node.timer \
+    /etc/systemd/system/emby-proxy-cert-renew.service /etc/systemd/system/emby-proxy-cert-renew.timer \
+    /etc/systemd/system/emby-proxy-cert-sync.service /etc/systemd/system/emby-proxy-cert-sync.timer; do
     [[ -e "$file" || -L "$file" ]] && items+=("$file")
   done
+  [[ ! -f /etc/emby-proxy-tls/.managed-emby-certificates ]] || items+=(/etc/emby-proxy-tls)
   while IFS= read -r file; do items+=("$file"); done < <(find "$CADDY_LOG_DIR" "$NGINX_LOG_DIR" -maxdepth 1 -type f -name 'emby-proxy-*-access.log' -print 2>/dev/null || true)
   if ((${#items[@]} == 0)); then
     tar -czf "$archive" --files-from /dev/null
   else
     tar -czf "$archive" "${items[@]}"
   fi
+  chmod 0600 "$archive"
   if command -v sha256sum >/dev/null 2>&1; then
     sha="$(sha256sum "$archive" | awk '{print $1}')"
   else
@@ -1164,7 +1172,7 @@ uninstall_remove_nginx_owned_file() {
 }
 
 uninstall_manager() {
-  local option="${1:-}" answer backup_root timestamp archive file id
+  local option="${1:-}" answer backup_root timestamp archive file id unknown
   local -a ids=()
   UNINSTALL_COMPLETED=0
   [[ -z "$option" || "$option" == "--yes" ]] || die "用法：emby-proxy uninstall [--yes]"
@@ -1221,6 +1229,15 @@ uninstall_manager() {
     systemctl disable --now "$(basename "$file")" >/dev/null 2>&1 || true
     rm -f -- "$file"
   done
+  for file in /etc/systemd/system/emby-proxy-cert-{renew,sync}.{timer,service}; do
+    if [[ -f "$file" ]] && grep -Fq '# MANAGED EMBY CERTIFICATE' "$file"; then
+      systemctl disable --now "$(basename "$file")" >/dev/null 2>&1 || true
+      rm -f -- "$file"
+    fi
+  done
+  if [[ ! -L /etc/emby-proxy-tls && -f /etc/emby-proxy-tls/.managed-emby-certificates ]]; then
+    rm -rf -- /etc/emby-proxy-tls
+  fi
   systemctl daemon-reload >/dev/null 2>&1 || true
   find "$CADDY_LOG_DIR" "$NGINX_LOG_DIR" -maxdepth 1 -type f -name 'emby-proxy-*-access.log' -delete 2>/dev/null || true
   if [[ -d "$STATE_HOME" && "$STATE_HOME" != "/" && "$STATE_HOME" != "/etc" && "$STATE_HOME" != "/var" && \
@@ -1228,6 +1245,22 @@ uninstall_manager() {
     rm -rf -- "$STATE_HOME"
   elif [[ -d "$STATE_HOME" ]]; then
     warn "自定义管理目录未满足安全路径检查，已保留：$STATE_HOME"
+  fi
+  # 早期版本把配额计数写入 /var/lib/emby-proxy。只删除该旧目录中
+  # 明确属于本项目的计数文件；发现其他内容时保留并给出提示。
+  if [[ -d "$LEGACY_STATE_HOME" && "$LEGACY_STATE_HOME" != "$STATE_HOME" ]]; then
+    unknown=0
+    while IFS= read -r file; do
+      case "$(basename "$file")" in
+        used_bytes|usage.offset) : ;;
+        *) unknown=1; break ;;
+      esac
+    done < <(find "$LEGACY_STATE_HOME" -mindepth 1 -maxdepth 1 -print 2>/dev/null)
+    if (( unknown == 0 )); then
+      rm -rf -- "$LEGACY_STATE_HOME"
+    else
+      warn "发现非脚本计数文件，保留旧目录以避免误删：$LEGACY_STATE_HOME"
+    fi
   fi
   rm -f -- "$INSTALLED_BACKEND" "$MANAGER_BIN"
   if [[ "$LEGACY_MANAGER_BIN" != "$MANAGER_BIN" && -f "$LEGACY_MANAGER_BIN" ]] &&
@@ -1479,7 +1512,7 @@ service_menu() {
 controller_cli() {
   command -v python3 >/dev/null 2>&1 || die "多线路功能需要 python3。"
   python3 - "$@" <<'PY'
-import argparse, copy, hashlib, ipaddress, json, os, re, secrets, shlex, shutil, subprocess, sys, threading, time
+import argparse, copy, grp, hashlib, ipaddress, json, os, re, secrets, shlex, shutil, ssl, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.request
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1492,6 +1525,11 @@ except ImportError:  # pragma: no cover - Linux is the supported runtime
     fcntl = None
 
 ENROLL_TTL = 15 * 60
+HEARTBEAT_TTL = 90
+FAILURE_THRESHOLD = 3
+RECOVERY_THRESHOLD = 3
+RECOVERY_SECONDS = 60
+SWITCH_COOLDOWN = 180
 def now(): return int(time.time())
 def digest(v): return hashlib.sha256(v.encode()).hexdigest()
 def atomic_write(path, data):
@@ -1560,17 +1598,211 @@ def state_lock(path):
     finally:
         if fcntl is not None: fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+class NoCredentialRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl): return None
+
 def post_json(url, payload, token=''):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type':'application/json'}, method='POST')
     if token: req.add_header('Authorization', 'Bearer ' + token)
     try:
-        with urllib.request.urlopen(req, timeout=20) as r: return json.loads(r.read())
+        with urllib.request.build_opener(NoCredentialRedirect).open(req, timeout=20) as r: return json.loads(r.read())
     except urllib.error.HTTPError as e:
         try: detail=json.loads(e.read().decode()).get('error','')
         except Exception: detail=''
         raise RuntimeError('主控返回 HTTP %s%s' % (e.code, ': '+detail if detail else ''))
     except urllib.error.URLError as e:
         raise RuntimeError('无法连接主控：%s' % e.reason)
+
+def certificate_info(pair, domain):
+    pair=Path(pair)
+    try:
+        ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(pair/'fullchain.pem'),str(pair/'privkey.pem'),password=lambda: b'')
+        info=ssl._ssl._test_decode_cert(str(pair/'fullchain.pem'))
+        names=[v for k,v in info.get('subjectAltName',[]) if k == 'DNS']
+        if names != [domain]: raise ValueError('certificate must cover only the configured domain')
+        expires=int(ssl.cert_time_to_seconds(info['notAfter']))
+        if expires-now() < 86400: raise ValueError('certificate expires within 24 hours')
+        subprocess.run(['openssl','verify','-purpose','sslserver','-verify_hostname',domain,
+            '-untrusted',str(pair/'fullchain.pem'),str(pair/'fullchain.pem')],
+            check=True,capture_output=True,timeout=15)
+        return {'expires_at':expires,'version':hashlib.sha256((pair/'fullchain.pem').read_bytes()).hexdigest()}
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
+        raise RuntimeError('证书校验失败：域名、私钥、有效期或信任链不符合要求。') from e
+
+def secure_certificate_request(st):
+    url=validate_endpoint(st['controller'],allow_http=False,label='证书主控地址')
+    req=urllib.request.Request(url+'/certificate', data=json.dumps({
+        'node_id':st['node_id'],'entry_id':st['entry_id']}).encode(),
+        headers={'Content-Type':'application/json','Authorization':'Bearer '+st['node_token']},method='POST')
+    try:
+        with urllib.request.build_opener(NoCredentialRedirect).open(req,timeout=20) as r:
+            raw=r.read(131073)
+        if len(raw)>131072: raise ValueError('response too large')
+        result=json.loads(raw)
+        if not isinstance(result,dict): raise ValueError('invalid response')
+        return result
+    except (OSError,ValueError) as e:
+        raise RuntimeError('证书领取失败；检查主控 HTTPS、节点授权与证书签发状态。') from e
+
+def install_certificate(st, bundle, reload=True):
+    domain=st['domain']; engine=st.get('engine','nginx')
+    if bundle.get('domain') != domain or engine not in ('caddy','nginx'):
+        raise RuntimeError('证书入口或引擎不匹配。')
+    root=Path(st['certificate_directory'])
+    if root.is_symlink() or (root.exists() and any(root.iterdir()) and not (root/'.managed-emby-certificates').is_file()):
+        raise RuntimeError('证书目录不是脚本托管目录，拒绝覆盖。')
+    root.mkdir(parents=True,exist_ok=True)
+    marker=root/'.managed-emby-certificates'; marker.touch(mode=0o600,exist_ok=True)
+    with state_lock(root/'sync'):
+        os.chmod(root,0o755)
+        candidate=Path(tempfile.mkdtemp(prefix='version-',dir=root)); os.chmod(candidate,0o700)
+        current=root/'current'; old=os.readlink(current) if current.is_symlink() else None
+        if (current.exists() and old is None) or (old and not current.resolve().is_relative_to(root.resolve())):
+            shutil.rmtree(candidate); raise RuntimeError('证书 current 不是托管链接，拒绝覆盖。')
+        switched=False
+        try:
+            for filename,field in (('fullchain.pem','certificate'),('privkey.pem','private_key')):
+                value=bundle.get(field)
+                if not isinstance(value,str) or len(value)>65536: raise RuntimeError('证书内容无效。')
+                path=candidate/filename; path.write_text(value); os.chmod(path,0o600)
+            info=certificate_info(candidate,domain)
+            if old and (current/'fullchain.pem').read_text() == bundle['certificate'] and (current/'privkey.pem').read_text() == bundle['private_key']:
+                atomic_write(root/'status.json',dict(info,last_sync=now(),status='ready'))
+                shutil.rmtree(candidate); return info['version']
+            if engine == 'caddy':
+                try: gid=grp.getgrnam('caddy').gr_gid
+                except KeyError: gid=None  # Backend grants access after installing Caddy on a fresh VPS.
+                if gid is not None:
+                    os.chown(candidate,0,gid); os.chmod(candidate,0o750)
+                    for path in candidate.iterdir(): os.chown(path,0,gid); os.chmod(path,0o640)
+            link=root/('.current-'+secrets.token_hex(6)); link.symlink_to(candidate.name)
+            os.replace(link,current); switched=True
+            if reload:
+                command=['nginx','-t'] if engine == 'nginx' else ['caddy','validate','--config','/etc/caddy/Caddyfile','--adapter','caddyfile']
+                subprocess.run(command,check=True,capture_output=True,timeout=20)
+                subprocess.run(['systemctl','reload',engine],check=True,capture_output=True,timeout=20)
+                if not local_entry_health(st): raise RuntimeError('新证书 HTTPS 检查失败。')
+            atomic_write(root/'status.json',dict(info,last_sync=now(),status='ready'))
+            return info['version']
+        except Exception:
+            if switched:
+                if old:
+                    link=root/('.rollback-'+secrets.token_hex(6)); link.symlink_to(old); os.replace(link,current)
+                    if reload:
+                        try: subprocess.run(['systemctl','reload',engine],check=True,capture_output=True,timeout=20)
+                        except (OSError,subprocess.SubprocessError):
+                            print('提醒：旧证书文件已恢复，但服务重载失败，请检查服务状态。',file=sys.stderr)
+                else: current.unlink(missing_ok=True)
+            shutil.rmtree(candidate,ignore_errors=True)
+            raise
+
+def node_cert_sync(a):
+    st=json.loads(Path(a.state).read_text())
+    if not st.get('certificate_directory'): raise RuntimeError('本节点尚未启用集中证书，请重新注册接入。')
+    try: version=install_certificate(st,secure_certificate_request(st))
+    except Exception:
+        path=Path(st['certificate_directory'])/'status.json'
+        try: status=json.loads(path.read_text())
+        except (OSError,ValueError): status={}
+        status.update(status='sync_failed',last_attempt=now()); atomic_write(path,status)
+        raise
+    print('证书已同步：'+version[:12])
+
+def install_certificate_timer(name, arguments, interval):
+    # State paths become systemd arguments, not shell fragments or specifiers.
+    if any(not re.fullmatch(r'[A-Za-z0-9_./:-]+',str(v)) for v in arguments):
+        raise RuntimeError('定时任务参数包含不支持的字符。')
+    command='/usr/local/sbin/emby-proxy controller '+' '.join(arguments)
+    units=[(Path('/etc/systemd/system/'+name+'.service'),
+        '# MANAGED EMBY CERTIFICATE\n[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nUMask=0077\nTimeoutStartSec=1200\nExecStart='+command+'\n'),
+        (Path('/etc/systemd/system/'+name+'.timer'),
+        '# MANAGED EMBY CERTIFICATE\n[Unit]\n[Timer]\nOnBootSec=2min\nOnUnitInactiveSec='+interval+'\nRandomizedDelaySec=60\n[Install]\nWantedBy=timers.target\n')]
+    backups=[]
+    try:
+        for path,content in units:
+            if path.exists() and '# MANAGED EMBY CERTIFICATE' not in path.read_text():
+                raise RuntimeError('同名证书单元不是脚本托管文件，拒绝覆盖。')
+        for path,content in units: backups.append((path,write_unit(path,content)))
+        subprocess.run(['systemctl','daemon-reload'],check=True)
+        subprocess.run(['systemctl','enable','--now',name+'.timer'],check=True)
+    except Exception:
+        for path,backup in reversed(backups): restore_file(path,backup)
+        subprocess.run(['systemctl','daemon-reload'],check=False)
+        raise
+
+def issue_certificates(state, config):
+    root=Path(config['directory']); root.mkdir(parents=True,exist_ok=True); os.chmod(root,0o700)
+    dns=state.get('dns') or {}
+    if dns.get('provider') != 'cloudflare': raise RuntimeError('请先配置 Cloudflare Token 和入口。')
+    token=Path(dns['token_file']).read_text().strip()
+    if not token or re.search(r'\s',token): raise RuntimeError('Cloudflare Token 格式无效。')
+    credentials=root/'cloudflare.ini'
+    # Never truncate an existing broadly-readable file before tightening permissions.
+    fd=os.open(credentials,os.O_WRONLY|os.O_CREAT,0o600)
+    with os.fdopen(fd,'w') as out:
+        os.fchmod(out.fileno(),0o600); out.truncate(0); out.write('dns_cloudflare_api_token = '+token+'\n')
+    for name,domain in (('entry',state['domain']),('control',config['control_domain'])):
+        command=['certbot','certonly','--dns-cloudflare','--dns-cloudflare-credentials',str(credentials),
+            '--dns-cloudflare-propagation-seconds','60','--config-dir',str(root/'acme'),
+            '--work-dir',str(root/'work'),'--logs-dir',str(root/'logs'),
+            '--cert-name',name,'-d',domain,'--non-interactive','--agree-tos',
+            '--register-unsafely-without-email','--keep-until-expiring']
+        try: subprocess.run(command,check=True,capture_output=True,timeout=540)
+        except (OSError,subprocess.SubprocessError):
+            raise RuntimeError('DNS-01 签发失败；旧证书保留。检查 Token 权限、CAA/DNS，日志：'+str(root/'logs')) from None
+        live=root/'acme'/'live'/name
+        install_certificate({'domain':domain,'engine':'nginx','certificate_directory':str(root/name)},
+            {'domain':domain,'certificate':(live/'fullchain.pem').read_text(),'private_key':(live/'privkey.pem').read_text()},reload=False)
+
+def cert_setup(a):
+    if os.geteuid() != 0: raise RuntimeError('证书配置需要 root 或 sudo。')
+    domain=str(a.control_domain).strip().lower().rstrip('.')
+    if not re.fullmatch(r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]*',domain):
+        raise RuntimeError('主控必须使用独立的有效域名。')
+    path=Path(a.state)
+    with state_lock(str(path)+'.cert-issue'):
+        state=json.loads(path.read_text())
+        if domain == state['domain']: raise RuntimeError('主控域名不能与业务入口相同。')
+        if state.get('certificates') and state['certificates']['control_domain'] != domain:
+            raise RuntimeError('已启用的主控域名不能直接替换，请先规划迁移。')
+        if getattr(a,'install_deps',False):
+            subprocess.run(['apt-get','update'],check=True)
+            subprocess.run(['apt-get','install','-y','certbot','python3-certbot-dns-cloudflare','openssl'],check=True)
+        if not shutil.which('certbot'): raise RuntimeError('缺少 Certbot；菜单确认安装，或加 --install-deps。')
+        config={'directory':str(path.resolve().parent/'certificates'),'control_domain':domain}
+        issue_certificates(state,config)
+        # Timer installation can fail; do not change the live controller protocol until it succeeds.
+        install_certificate_timer('emby-proxy-cert-renew',['cert-renew','--state',str(path.resolve())],'12h')
+        was_active=subprocess.run(['systemctl','is-active','--quiet','emby-proxy-master.service'],capture_output=True).returncode == 0
+        with state_lock(path):
+            latest=json.loads(path.read_text())
+            if any(latest.get(k) != state.get(k) for k in ('domain','entry_id','dns')):
+                raise RuntimeError('签发期间入口配置发生变化，请重新执行。')
+            backup_file(path); latest['certificates']=config
+            latest['controller_url']='https://'+domain+':19090'; atomic_write(path,latest)
+        try:
+            master_install(argparse.Namespace(state=str(path.resolve()),listen='0.0.0.0:19090',reconcile_interval=30))
+        except Exception:
+            with state_lock(path):
+                latest=json.loads(path.read_text())
+                for key in ('certificates','controller_url'):
+                    if key in state: latest[key]=state[key]
+                    else: latest.pop(key,None)
+                atomic_write(path,latest)
+            try:
+                subprocess.run(['systemctl','restart' if was_active else 'stop','emby-proxy-master.service'],check=True)
+            except (OSError,subprocess.SubprocessError): print('提醒：主控配置已恢复，但服务恢复失败，请检查 systemd。',file=sys.stderr)
+            raise
+    print('入口及主控证书已准备，主控 HTTPS 已启动。主控域名 A 记录须指向本机，放行 TCP 19090。')
+
+def cert_renew(a):
+    if os.geteuid() != 0: raise RuntimeError('证书续期需要 root 或 sudo。')
+    with state_lock(str(a.state)+'.cert-issue'):
+        state=json.loads(Path(a.state).read_text())
+        if not state.get('certificates'): raise RuntimeError('请先配置自动证书。')
+        issue_certificates(state,state['certificates'])
+    print('证书续期检查完成；边缘将在独立同步任务中领取。')
 
 class Controller:
     def __init__(self, path):
@@ -1580,9 +1812,11 @@ class Controller:
         self.state = json.loads(self.path.read_text())
         self.state.setdefault('schema_version', 1); self.state.setdefault('enroll_tokens', {}); self.state.setdefault('nodes', {}); self.state.setdefault('active_node', None)
     def save(self): atomic_write(self.path, self.state)
-    def enroll(self, b):
+    def enroll(self, b, secure=False):
         with self.lock, state_lock(self.path):
             self.reload()
+            if self.state.get('certificates') and not secure:
+                return 403, {'error':'managed_certificates_require_https_registration'}
             if b.get('entry_id') != self.state['entry_id']: return 404, {'error':'unknown_entry'}
             node, reg = str(b.get('node_id','')), str(b.get('enroll_token',''))
             pending=self.state['enroll_tokens'].get(node)
@@ -1592,18 +1826,42 @@ class Controller:
                 self.state['enroll_tokens'].pop(node,None); self.save()
                 return 403, {'error':'invalid_or_expired_enroll_token'}
             if not node or expected != reg: return 403, {'error':'invalid_or_expired_enroll_token'}
+            detected = b.get('detected_engine', '')
+            if detected and detected != self.state.get('engine','caddy'):
+                return 409, {'error':'engine_conflict: 边缘已有 %s，主控要求 %s；请使用引擎一致的节点，注册码未消耗。' % (detected, self.state.get('engine','caddy'))}
             token = secrets.token_urlsafe(32); self.state['enroll_tokens'].pop(node, None)
             item = {'name':b.get('name',node), 'priority':int(b.get('priority',0)), 'quota_bytes':int(b.get('quota_bytes',0)), 'used_bytes':0, 'healthy':False, 'status':'enrolled', 'last_seen':now(), 'version':b.get('version','unknown'), 'token_hash':digest(token)}
             if b.get('public_ip'): item['public_ip'] = str(b['public_ip'])
             self.state['nodes'][node] = item; self.save()
-            return 200, {'node_token':token, 'entry_id':self.state['entry_id'], 'domain':self.state['domain'], 'source':self.state['source'], 'engine':self.state.get('engine','caddy')}
+            return 200, {'node_token':token, 'entry_id':self.state['entry_id'], 'domain':self.state['domain'], 'source':self.state['source'], 'engine':self.state.get('engine','caddy'),'certificate_managed':bool(self.state.get('certificates'))}
     def heartbeat(self, b, token):
         with self.lock, state_lock(self.path):
             self.reload()
             node = self.state['nodes'].get(str(b.get('node_id','')))
             if not node or node.get('token_hash') != digest(token): return 403, {'error':'invalid_node_token'}
             used = max(int(node.get('used_bytes',0)), int(b.get('used_bytes',0)))
-            node.update(healthy=bool(b.get('healthy',False)), used_bytes=used, status='healthy' if b.get('healthy') else 'unhealthy', last_seen=now(), version=b.get('version',node.get('version','unknown')), last_event=b.get('event','heartbeat'))
+            stamp=now(); reported=b.get('healthy') is True
+            # 失联恢复不能继承失联前的成功计数；计数落盘，主控重启不绕过防抖。
+            if stamp-int(node.get('last_seen',0)) > HEARTBEAT_TTL:
+                node.update(healthy=False, success_streak=0, failure_streak=0)
+                node.pop('recovery_since',None)
+            if reported:
+                node['failure_streak']=0
+                node['success_streak']=int(node.get('success_streak',0))+1
+                if not node.get('healthy'):
+                    node.setdefault('recovery_since',stamp)
+                    if node['success_streak'] >= RECOVERY_THRESHOLD and stamp-node['recovery_since'] >= RECOVERY_SECONDS:
+                        node['healthy']=True
+                node['status']='healthy' if node.get('healthy') else 'recovering'
+            else:
+                node['success_streak']=0; node.pop('recovery_since',None)
+                node['failure_streak']=int(node.get('failure_streak',0))+1
+                if node['failure_streak'] >= FAILURE_THRESHOLD: node['healthy']=False
+                node['status']='suspect' if node.get('healthy') else 'unhealthy'
+            node.update(reported_healthy=reported, used_bytes=used, last_seen=stamp, version=b.get('version',node.get('version','unknown')), last_event=b.get('event','heartbeat'))
+            cert=b.get('certificate_status')
+            if isinstance(cert,dict):
+                node['certificate_status']={k:cert[k] for k in ('version','expires_at','status','last_sync') if k in cert}
             if b.get('public_ip'): node['public_ip'] = str(b['public_ip'])
             selected = self.select(); self.save(); return 200, {'selected_node':selected, 'accepted_used_bytes':used}
     def revoke(self, b, token):
@@ -1618,57 +1876,126 @@ class Controller:
             self.save()
             return 200, {'revoked_node':node_id}
     def select(self):
-        out=[]
+        out=[]; current=self.state.get('active_node')
         for nid,n in self.state['nodes'].items():
-            quota=int(n.get('quota_bytes',0)); online=now()-int(n.get('last_seen',0)) <= 90; within=quota <= 0 or int(n.get('used_bytes',0)) < quota
-            if n.get('healthy') and online and within: out.append((int(n.get('priority',0)), nid))
-        return max(out, default=(0,None))[1]
+            quota=int(n.get('quota_bytes',0)); online=now()-int(n.get('last_seen',0)) <= HEARTBEAT_TTL; within=quota <= 0 or int(n.get('used_bytes',0)) < quota
+            # 容忍活动节点的短暂失败，但不把正在失败的备用节点提升为活动节点。
+            if n.get('healthy') and online and within and (nid == current or n.get('status') != 'suspect'):
+                out.append((int(n.get('priority',0)), nid))
+        best=max(out, default=(0,None))
+        active=next((item for item in out if item[1] == current),None)
+        if active and (active[0] >= best[0] or now()-int(self.state.get('last_switch_at',0)) < SWITCH_COOLDOWN):
+            return current
+        return best[1]
     def reconcile(self):
         with self.lock, state_lock(self.path):
             self.reload()
             selected=self.select(); previous=self.state.get('active_node'); changed=selected != previous; dns_result=None
-            if selected and changed: dns_result=self.update_dns(selected)
-            # 没有健康候选时没有 DNS 写入，保留实际活动节点指针，避免面板显示
-            # “未切换”而 Cloudflare 仍指向旧节点。下次节点恢复后继续重试选路。
-            if selected is not None and not (isinstance(dns_result,dict) and dns_result.get('ok') is False):
-                self.state['active_node']=selected
-            self.state['last_reconcile']=now(); self.state['last_dns_result']=dns_result; self.save()
-            return {'selected_node':selected,'active_node':self.state.get('active_node'),'previous_node':previous,'changed':changed,'dns':dns_result}
+            ip=self.state['nodes'][selected].get('public_ip') if selected else None
+            needs_update=bool(selected and (changed or self.state.get('confirmed_dns_ip') != ip or self.state.get('dns_needs_confirmation')))
+            reason='no_eligible_nodes' if selected is None else 'unchanged'
+            if needs_update:
+                dns_result=self.update_dns(selected)
+                if dns_result.get('ok') is True:
+                    self.state['active_node']=selected; self.state['confirmed_dns_ip']=ip
+                    self.state['dns_needs_confirmation']=False
+                    self.state['dns_confirmed_at']=now()
+                    if changed: self.state['last_switch_at']=now()
+                    reason='dns_confirmed'
+                else:
+                    # PUT 可能已生效，仅 GET 失败。即使下轮选回旧节点，也必须重写确认。
+                    self.state['dns_needs_confirmation']=True
+                    reason='dns_unconfirmed'
+                self.state['last_dns_result']=dns_result
+            # active_node 只代表最近一次 API 回读确认的节点，不代表递归 DNS 缓存已刷新。
+            self.state['last_reconcile']=now(); self.state['last_reconcile_reason']=reason; self.save()
+            return {'selected_node':selected,'active_node':self.state.get('active_node'),'previous_node':previous,'changed':self.state.get('active_node') != previous,'reason':reason,'dns':dns_result}
     def update_dns(self, nid):
         dns=self.state.get('dns') or {}; node=self.state['nodes'][nid]
-        if dns.get('provider') != 'cloudflare': return {'skipped':'dns provider not configured'}
+        if dns.get('provider') != 'cloudflare': return {'ok':False,'skipped':'dns provider not configured'}
         if not node.get('public_ip'): return {'ok':False,'error':'selected node has no public_ip'}
+        if not all(dns.get(key) for key in ('zone_id','record_id','token_file')):
+            return {'ok':False,'error':'incomplete Cloudflare configuration'}
         try: token=Path(dns['token_file']).read_text().strip()
-        except OSError as e: return {'ok':False,'error':str(e)}
+        except (OSError, KeyError) as e: return {'ok':False,'error':str(e)}
+        if not token: return {'ok':False,'error':'empty Cloudflare token file'}
         payload={'type':'A','name':self.state['domain'],'content':node['public_ip'],'ttl':int(dns.get('ttl',60)),'proxied':False}
         req=urllib.request.Request('https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s' % (dns['zone_id'],dns['record_id']), data=json.dumps(payload).encode(), headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'}, method='PUT')
         try:
-            with urllib.request.urlopen(req, timeout=15) as r: result=json.loads(r.read())
-            return {'ok':True,'content':node['public_ip']} if result.get('success') else {'ok':False,'errors':result.get('errors',[])}
-        except (OSError, urllib.error.URLError) as e: return {'ok':False,'error':str(e)}
+            with urllib.request.urlopen(req, timeout=5) as r: result=json.loads(r.read())
+            if not isinstance(result,dict): return {'ok':False,'error':'invalid DNS update response'}
+            if not result.get('success'): return {'ok':False,'errors':result.get('errors',[])}
+            readback=urllib.request.Request(req.full_url, headers={'Authorization':'Bearer '+token}, method='GET')
+            with urllib.request.urlopen(readback, timeout=5) as r: verified=json.loads(r.read())
+            if not isinstance(verified,dict): return {'ok':False,'error':'invalid DNS read-back response'}
+            record=verified.get('result') or {}
+            if not (verified.get('success') and isinstance(record,dict) and record.get('type') == 'A' and
+                    record.get('name','').lower().rstrip('.') == self.state['domain'].lower().rstrip('.') and
+                    record.get('content') == node['public_ip'] and record.get('proxied') is False):
+                return {'ok':False,'error':'DNS read-back mismatch; retry on next reconcile'}
+            return {'ok':True,'content':node['public_ip'],'verified':True}
+        except (OSError, urllib.error.URLError, ValueError) as e: return {'ok':False,'error':str(e)}
     def public_status(self):
         with self.lock, state_lock(self.path):
             self.reload()
             return {'entry_id':self.state.get('entry_id'), 'domain':self.state.get('domain')}
+    def certificate(self, b, token, secure=False):
+        with self.lock, state_lock(self.path):
+            self.reload()
+            node=self.state['nodes'].get(str(b.get('node_id','')))
+            if not secure or not node or not secrets.compare_digest(node.get('token_hash',''),digest(token)) or b.get('entry_id') != self.state['entry_id']:
+                return 403, {'error':'certificate_requires_tls_and_node_auth'}
+            config=self.state.get('certificates')
+            if not config: return 409, {'error':'managed_certificates_not_enabled'}
+            try:
+                # Resolve once so a concurrent renewal cannot mix the certificate and key.
+                pair=(Path(config['directory'])/'entry'/'current').resolve(strict=True)
+                cert=(pair/'fullchain.pem').read_text(); key=(pair/'privkey.pem').read_text()
+                return 200, {'domain':self.state['domain'],'certificate':cert,'private_key':key,
+                    'version':hashlib.sha256(cert.encode()).hexdigest()}
+            except OSError:
+                return 503, {'error':'certificate_not_ready'}
     def private_status(self):
         with self.lock, state_lock(self.path):
-            self.reload(); result=copy.deepcopy(self.state)
+            self.reload(); result=copy.deepcopy(self.state); result['selected_node']=self.select()
         result.pop('enroll_tokens',None)
         for n in result.get('nodes',{}).values(): n.pop('token_hash',None)
-        result['selected_node']=self.select(); return result
+        if result.get('certificates'):
+            result['certificate_status']={}
+            for name in ('entry','control'):
+                try:
+                    status=json.loads((Path(result['certificates']['directory'])/name/'status.json').read_text())
+                except (OSError,ValueError): status={'status':'not_ready'}
+                result['certificate_status'][name]=status
+        return result
 
 class Handler(BaseHTTPRequestHandler):
+    def handle(self):
+        try: super().handle()
+        except (ssl.SSLError,TimeoutError,ConnectionError): self.close_connection=True
     def log_message(self, fmt, *args): print('[controller] '+(fmt % args), flush=True)
     def reply(self, code, body):
-        raw=json.dumps(body,separators=(',',':')).encode(); self.send_response(code); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw)
-    def body(self): return json.loads(self.rfile.read(int(self.headers.get('Content-Length','0')) or 0) or b'{}')
+        raw=json.dumps(body,separators=(',',':')).encode(); self.send_response(code); self.send_header('Cache-Control','no-store'); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw)
+    def body(self):
+        length=int(self.headers.get('Content-Length','0'))
+        if not 0 <= length <= 65536: raise ValueError('request_too_large')
+        self.connection.settimeout(15)
+        result=json.loads(self.rfile.read(length) or b'{}')
+        if not isinstance(result,dict): raise ValueError('expected_object')
+        return result
     def do_GET(self):
         if urlparse(self.path).path == '/status': self.reply(200, self.server.controller.public_status())
         else: self.reply(404, {'error':'not_found'})
     def do_POST(self):
         try:
             path=urlparse(self.path).path; b=self.body()
-            if path == '/enroll': code,result=self.server.controller.enroll(b)
+            secure=isinstance(getattr(self,'connection',None),ssl.SSLSocket)
+            if path == '/certificate':
+                code,result=self.server.controller.certificate(b,self.headers.get('Authorization','').removeprefix('Bearer ').strip(),secure=secure)
+            elif path == '/enroll':
+                if self.server.controller.state.get('certificates') and not secure:
+                    code,result=403,{'error':'managed_certificates_require_https_registration'}
+                else: code,result=self.server.controller.enroll(b,secure=secure)
             elif path == '/heartbeat': code,result=self.server.controller.heartbeat(b,self.headers.get('Authorization','').removeprefix('Bearer ').strip())
             elif path == '/revoke': code,result=self.server.controller.revoke(b,self.headers.get('Authorization','').removeprefix('Bearer ').strip())
             else: code,result=404,{'error':'not_found'}
@@ -1677,6 +2004,11 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(ThreadingHTTPServer):
     def __init__(self, address, controller): super().__init__(address, Handler); self.controller=controller
+    def get_request(self):
+        sock,address=super().get_request(); sock.settimeout(15)
+        context=getattr(self,'tls_context',None)
+        if context: sock=context.wrap_socket(sock,server_side=True,do_handshake_on_connect=False)
+        return sock,address
 
 def init_state(a):
     domain=a.domain.strip().lower().rstrip('.')
@@ -1710,6 +2042,10 @@ def issue(a):
     controller_url=validate_endpoint(a.controller_url, allow_http=True, label='主控 URL')
     with state_lock(path):
         state=json.loads(path.read_text()); state.setdefault('enroll_tokens',{}); state.setdefault('nodes',{})
+        if state.get('certificates'):
+            validate_endpoint(controller_url,allow_http=False,label='证书主控地址')
+            if urlparse(controller_url).hostname != state['certificates']['control_domain']:
+                raise RuntimeError('请使用已配置的主控 HTTPS 域名生成注册码。')
         node_id=(a.node_id or '').strip() or auto_node_id(state,a.public_ip)
         token=secrets.token_urlsafe(24)
         state['enroll_tokens'][node_id]={'token':token,'issued_at':now()}
@@ -1720,10 +2056,11 @@ def issue(a):
     if a.public_ip: values += ['--public-ip',a.public_ip]
     values += ['--enroll-token',token]
     # 边缘 VPS 可以是全新机器或旧版管理器；命令先确保当前管理器具备 node-install，再注册。
-    # 使用不可变安装脚本，避免 raw 分支缓存把旧版 setup 送到全新边缘机；setup 内部仍会拉取当前 manager。
-    bootstrap_url=os.environ.get('EMBY_PROXY_BOOTSTRAP_URL','https://raw.githubusercontent.com/wuuduf/emby-proxy/2b42b59/setup-emby-proxy.sh')
+    # 旧管理器必须升级到带引擎预检的协议，再使用本次注册码。
+    bootstrap_url=os.environ.get('EMBY_PROXY_BOOTSTRAP_URL','https://raw.githubusercontent.com/wuuduf/emby-proxy/main/setup-emby-proxy.sh')
     command=' '.join(shlex.quote(str(v)) for v in values)
-    print("(command -v ep >/dev/null 2>&1 && sudo ep controller node-install --help 2>&1 | grep -q auto-ip) || (curl -fsSL %s | sudo bash -s -- --manager-only) && %s" % (shlex.quote(bootstrap_url), command))
+    bootstrap='tmp=$(mktemp) && trap \'rm -f "$tmp"\' EXIT && curl -fsSL %s -o "$tmp" && sudo bash "$tmp" --manager-only && sudo ep controller node-install --help 2>&1 | grep -q engine-preflight' % shlex.quote(bootstrap_url)
+    print("(command -v ep >/dev/null 2>&1 && sudo ep controller node-install --help 2>&1 | grep -q engine-preflight-cert-v1) || (bash -c %s) && %s" % (shlex.quote(bootstrap.replace('grep -q engine-preflight','grep -q engine-preflight-cert-v1')), command))
     print("提示：注册码只能使用一次，签发后 15 分钟失效。")
 def validate_interval(value):
     try: interval=int(value)
@@ -1741,9 +2078,20 @@ def validate_listen(value):
 def serve(a):
     listen=validate_listen(a.listen); interval=validate_interval(a.reconcile_interval)
     host,port=listen.rsplit(':',1); c=Controller(a.state); s=Server((host,int(port)),c); print('多线路主控监听 '+listen,flush=True); stop=threading.Event()
+    tls_config=c.state.get('certificates')
+    def load_tls():
+        pair=(Path(tls_config['directory'])/'control'/'current').resolve(strict=True)
+        context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); context.minimum_version=ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(str(pair/'fullchain.pem'),str(pair/'privkey.pem'))
+        s.tls_context=context
+    if tls_config: load_tls()
     def loop():
         while not stop.wait(interval):
-            try: print(json.dumps(c.reconcile(),ensure_ascii=False),flush=True)
+            if tls_config:
+                try: load_tls()
+                except (OSError,ValueError): print('[controller] TLS reload failed; keeping previous context',flush=True)
+            try:
+                print(json.dumps(c.reconcile(),ensure_ascii=False),flush=True)
             except Exception as e: print('[controller] reconcile failed: '+str(e),flush=True)
     threading.Thread(target=loop,daemon=True).start()
     try: s.serve_forever()
@@ -1780,49 +2128,96 @@ def resolve_edge_ipv4(value):
         raise RuntimeError('边缘需要有效的公网 IPv4；请用 --public-ip 指定本机入口地址，注册码未消耗。') from None
     return str(ip)
 
+def detect_edge_engine():
+    """Read-only preflight: never install a competing engine on an existing VPS."""
+    installed=[engine for engine in ('caddy','nginx') if shutil.which(engine)]
+    active=[]
+    for engine in installed:
+        try:
+            result=subprocess.run(['systemctl','is-active','--quiet',engine],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            raise RuntimeError('无法检查本机 Web 服务状态；请先检查 systemd，注册码未消耗。') from None
+        if result.returncode == 0: active.append(engine)
+        elif result.returncode not in (3,4):
+            raise RuntimeError('无法确认 %s 的运行状态，注册码未消耗。' % engine)
+    choices=active or installed
+    if len(choices) > 1:
+        raise RuntimeError('本机同时检测到 Caddy / Nginx，无法安全自动选择；请先确认现有服务用途，注册码未消耗。')
+    return choices[0] if choices else ''
+
 def node_install(a):
     if os.geteuid() != 0: raise SystemExit('node-install 需要 root 或 sudo')
     controller_url=validate_endpoint(a.controller_url, allow_http=True, label='主控 URL')
     a.public_ip=resolve_edge_ipv4(a.public_ip)
+    detected_engine=detect_edge_engine()
     print('边缘公网 IPv4：'+a.public_ip)
+    print('本机引擎预检：'+(detected_engine or '未安装，将按主控配置安装'))
     node_file=Path('/etc/emby-proxy/multiline-node.json')
     if node_file.exists():
         try: old=json.loads(node_file.read_text())
         except (OSError, ValueError): old={}
         if old.get('node_id') and (old.get('node_id') != a.node_id or old.get('controller','').rstrip('/') != a.controller_url.rstrip('/')):
             raise RuntimeError('本机已有边缘节点 %s；一台 VPS 只支持一个 node-id，请先卸载旧节点再注册。' % old.get('node_id'))
-    result=None; registered=False; node_backup=None; unit_backups=[]
+    result=None; registered=False; node_backup=None; node_written=False; unit_backups=[]; certificate_before=None
     try:
-        result=post_json(controller_url+'/enroll',{'entry_id':a.entry_id,'node_id':a.node_id,'name':a.name,'priority':a.priority,'quota_bytes':a.quota_bytes,'enroll_token':a.enroll_token,'public_ip':a.public_ip,'version':'single-script-0.1'})
+        result=post_json(controller_url+'/enroll',{'entry_id':a.entry_id,'node_id':a.node_id,'name':a.name,'priority':a.priority,'quota_bytes':a.quota_bytes,'enroll_token':a.enroll_token,'public_ip':a.public_ip,'detected_engine':detected_engine,'version':'single-script-0.2'})
         registered=True
-        base=Path('/var/lib/emby-proxy'); base.mkdir(parents=True,exist_ok=True); Path('/etc/emby-proxy').mkdir(parents=True,exist_ok=True); used=base/'used_bytes'; used.touch(exist_ok=True); os.chmod(used,0o600)
         engine=result.get('engine','caddy'); domain=result['domain']
+        # 兼容旧主控：旧版可能忽略预检字段，仍必须在执行安装后端前阻止冲突。
+        if engine not in ('caddy','nginx') or (detected_engine and engine != detected_engine):
+            raise RuntimeError('主控引擎与本机不匹配，未执行反代安装；请升级主控并使用引擎一致的节点。')
+        base=Path('/var/lib/emby-proxy'); base.mkdir(parents=True,exist_ok=True); Path('/etc/emby-proxy').mkdir(parents=True,exist_ok=True); used=base/'used_bytes'; used.touch(exist_ok=True); os.chmod(used,0o600)
         log_root='/var/log/caddy' if engine == 'caddy' else '/var/log/nginx'
         access_log='%s/emby-proxy-%s-access.log' % (log_root, domain)
         offset=Path('/var/lib/emby-proxy/usage.offset')
         state={'controller':controller_url,'entry_id':a.entry_id,'node_id':a.node_id,'node_token':result['node_token'],'domain':domain,'source':result['source'],'engine':engine,'public_ip':a.public_ip,'used_file':str(used),'access_log':access_log,'usage_offset_file':str(offset)}
+        certificate_args=[]
+        if result.get('certificate_managed'):
+            state['certificate_directory']='/etc/emby-proxy-tls'
+            root=Path(state['certificate_directory']); current=root/'current'
+            previous_link=os.readlink(current) if current.is_symlink() else None
+            try: previous_status=json.loads((root/'status.json').read_text())
+            except (OSError,ValueError): previous_status=None
+            certificate_before=(root,previous_link,previous_status,engine)
+            install_certificate(state,secure_certificate_request(state),reload=False)
+            certificate_args=['--tls-directory',state['certificate_directory']+'/current']
         backend=Path('/usr/local/lib/emby-proxy/setup-emby-proxy.sh')
         if not backend.exists(): raise RuntimeError('未找到安装后端，请先用同一个 emby-proxy 脚本完成本机反代配置。')
         # 边缘节点的域名通常仍指向当前活动节点，不能因为 DNS 尚未切换就阻止预配置。
-        # Caddy/Nginx 会先落配置；控制器切换 DNS 后再完成最终 TLS 验证。
-        setup_result=subprocess.run([str(backend),'--engine',state['engine'],'--domain',state['domain'],'--upstream',state['source'],'--skip-dns-check','--skip-verify'],check=False)
+        # 只跳过安装阶段探测；参与选路前，心跳仍要求本机已有有效 HTTPS 证书。
+        setup_result=subprocess.run([str(backend),'--engine',state['engine'],'--domain',state['domain'],'--upstream',state['source'],'--skip-dns-check','--skip-verify']+certificate_args,check=False)
         if setup_result.returncode != 0: raise RuntimeError('边缘反代预配置失败，请先修复本机 '+state['engine']+' 配置。')
-        node_backup=backup_file(node_file); atomic_write(node_file,state); os.chmod(node_file,0o600)
+        node_backup=backup_file(node_file); atomic_write(node_file,state); node_written=True; os.chmod(node_file,0o600)
         service_unit='[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nTimeoutStartSec=25s\nExecStart=/usr/local/sbin/emby-proxy controller node --state /etc/emby-proxy/multiline-node.json\n'
-        timer_unit='[Unit]\n[Timer]\nOnBootSec=20s\nOnUnitInactiveSec=30s\nAccuracySec=1s\nPersistent=true\n[Install]\nWantedBy=timers.target\n'
+        # Some Debian/systemd combinations leave a oneshot timer with only
+        # OnUnitInactiveSec at infinity after the first trigger.  A calendar
+        # expression is deterministic for a 30-second heartbeat and keeps
+        # working after a service restart or a long VPS suspend/resume.
+        timer_unit='[Unit]\n[Timer]\nOnCalendar=*-*-* *:*:00,30\nAccuracySec=1s\nPersistent=true\n[Install]\nWantedBy=timers.target\n'
         unit_backups.append((Path('/etc/systemd/system/emby-proxy-node.service'), write_unit('/etc/systemd/system/emby-proxy-node.service',service_unit)))
         unit_backups.append((Path('/etc/systemd/system/emby-proxy-node.timer'), write_unit('/etc/systemd/system/emby-proxy-node.timer',timer_unit)))
-        # 使用 OnUnitInactiveSec：oneshot 服务结束后重新计时，避免部分 systemd/虚拟化环境
-        # 将 OnUnitActiveSec 错算成数天或 infinity，导致心跳停止。
+        # OnCalendar 不依赖 oneshot 服务的 active/inactive 状态，避免
+        # 部分 systemd/虚拟化环境将下一次触发错误地显示为 infinity。
         for command in (['systemctl','daemon-reload'], ['systemctl','enable','emby-proxy-node.timer'], ['systemctl','restart','emby-proxy-node.timer']):
             subprocess.run(command,check=True)
         node_once(type('A',(),{'state':str(node_file)})())
+        if certificate_args:
+            install_certificate_timer('emby-proxy-cert-sync',['node-cert-sync','--state',str(node_file)],'1h')
     except Exception:
+        if certificate_before:
+            root,old,metadata,engine=certificate_before
+            if old:
+                link=root/('.rollback-'+secrets.token_hex(6)); link.symlink_to(old); os.replace(link,root/'current')
+                if metadata: atomic_write(root/'status.json',metadata)
+                try: subprocess.run(['systemctl','reload',engine],check=True,capture_output=True,timeout=20)
+                except (OSError,subprocess.SubprocessError): print('提醒：旧证书已恢复，请检查 Web 服务是否正常。',file=sys.stderr)
+            # On a fresh node a successfully written backend may reference this pair.
+            # Keep the valid pair rather than leave a dangling TLS configuration.
         for path,backup in reversed(unit_backups):
             restore_file(path,backup)
         if unit_backups: subprocess.run(['systemctl','daemon-reload'],check=False)
-        if node_backup: restore_file(node_file,node_backup)
-        else: node_file.unlink(missing_ok=True)
+        if node_written: restore_file(node_file,node_backup)
         if registered and result and result.get('node_token'):
             try: post_json(controller_url+'/revoke',{'node_id':a.node_id},result['node_token'])
             except Exception as revoke_error: print('提醒：注册回滚失败，请在主控删除节点 %s：%s' % (a.node_id,revoke_error),file=sys.stderr)
@@ -1886,14 +2281,21 @@ def node_once(a):
     service=st.get('engine','caddy')
     service_ok=service in ('caddy','nginx') and subprocess.run(['systemctl','is-active','--quiet',service],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
     healthy=service_ok and local_entry_health(st)
-    result=post_json(st['controller']+'/heartbeat',{'node_id':st['node_id'],'used_bytes':used,'healthy':healthy,'public_ip':st.get('public_ip'),'event':'edge_heartbeat','version':'single-script-0.1'},st['node_token']); print(json.dumps(result,ensure_ascii=False))
+    cert_status={}
+    if st.get('certificate_directory'):
+        try: cert_status=json.loads((Path(st['certificate_directory'])/'status.json').read_text())
+        except (OSError,ValueError): cert_status={'status':'unknown'}
+    result=post_json(st['controller']+'/heartbeat',{'node_id':st['node_id'],'used_bytes':used,'healthy':healthy,'public_ip':st.get('public_ip'),'event':'edge_heartbeat','version':'single-script-0.2','certificate_status':cert_status},st['node_token']); print(json.dumps(result,ensure_ascii=False))
 def main():
     p=argparse.ArgumentParser(prog='emby-proxy controller'); sub=p.add_subparsers(dest='cmd',required=True)
+    x=sub.add_parser('cert-setup'); x.add_argument('--state',required=True); x.add_argument('--control-domain',required=True); x.add_argument('--install-deps',action='store_true'); x.set_defaults(fn=cert_setup)
+    x=sub.add_parser('cert-renew'); x.add_argument('--state',required=True); x.set_defaults(fn=cert_renew)
+    x=sub.add_parser('node-cert-sync'); x.add_argument('--state',default='/etc/emby-proxy/multiline-node.json'); x.set_defaults(fn=node_cert_sync)
     x=sub.add_parser('init'); x.add_argument('--state',required=True); x.add_argument('--entry-id',default=''); x.add_argument('--domain',required=True); x.add_argument('--source',required=True); x.add_argument('--engine',default='caddy'); x.add_argument('--zone-id'); x.add_argument('--record-id'); x.add_argument('--token-file'); x.add_argument('--force',action='store_true'); x.set_defaults(fn=init_state)
     x=sub.add_parser('issue'); x.add_argument('--state',required=True); x.add_argument('--controller-url',required=True); x.add_argument('--node-id',default=''); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',default='',help='公网 IPv4；省略时在边缘检测 (auto-ip)'); x.set_defaults(fn=issue)
     x=sub.add_parser('serve'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=serve)
     x=sub.add_parser('master-install'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=master_install)
-    x=sub.add_parser('node-install'); x.add_argument('--controller-url',required=True); x.add_argument('--entry-id',required=True); x.add_argument('--node-id',required=True); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',default='',help='公网 IPv4；省略时在边缘检测 (auto-ip)'); x.add_argument('--enroll-token',required=True); x.set_defaults(fn=node_install)
+    x=sub.add_parser('node-install', description='边缘安装：auto-ip / engine-preflight-cert-v1'); x.add_argument('--controller-url',required=True); x.add_argument('--entry-id',required=True); x.add_argument('--node-id',required=True); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',default='',help='公网 IPv4；省略时在边缘检测 (auto-ip)'); x.add_argument('--enroll-token',required=True); x.set_defaults(fn=node_install)
     x=sub.add_parser('node'); x.add_argument('--state',default='/etc/emby-proxy/multiline-node.json'); x.set_defaults(fn=node_once)
     x=sub.add_parser('status'); x.add_argument('--state',required=True); x.set_defaults(fn=lambda a: print(json.dumps(Controller(a.state).private_status(),ensure_ascii=False,indent=2)))
     x=sub.add_parser('reconcile'); x.add_argument('--state',required=True); x.set_defaults(fn=lambda a: print(json.dumps(Controller(a.state).reconcile(),ensure_ascii=False)))
@@ -2231,18 +2633,29 @@ controller_status_menu() {
       elif . >= 1048576 then ((. / 1048576 * 100 | floor) / 100 | tostring) + " MiB"
       else (tostring) + " B" end;
     "\n访问域名：https://\(.domain)\n固定源站：\(.source)\n当前记录节点：\(.active_node // "尚未切换")\n下一候选节点：\(.selected_node // "无可用节点")\n",
+    "DNS 状态：" + (if (.dns_confirmed_at // 0) == 0 then "尚未回读确认"
+      else "最近确认 IP " + (.confirmed_dns_ip // "未知") end),
+    "自动证书：" + (if .certificates then "已启用 · 主控 " + .certificates.control_domain else "未启用（选 8 配置）" end),
+    (if .last_reconcile_reason == "dns_unconfirmed" then "提醒：DNS 未确认，本轮不标记切换成功；下一轮重试。"
+      elif .selected_node == null then "提醒：无可用节点，保留原 DNS 记录不代表该节点可用。" else empty end),
     ((.nodes // {} | to_entries | sort_by(-(.value.priority // 0)))[] |
       .value as $n |
       "  \($n.name // .key) [\(.key)] · 优先级 \($n.priority // 0)",
       "    状态：" + (if ((now | floor) - ($n.last_seen // 0)) > 90 then "心跳过期"
-        elif ($n.healthy != true) then "节点自报不健康"
         elif (($n.quota_bytes // 0) > 0 and ($n.used_bytes // 0) >= $n.quota_bytes) then "配额已用完"
+        elif $n.status == "recovering" then "恢复观察中（成功 " + (($n.success_streak // 0) | tostring) + " 次）"
+        elif $n.status == "suspect" then "故障观察中（失败 " + (($n.failure_streak // 0) | tostring) + "/3 次）"
+        elif ($n.healthy != true) then "节点自报不健康"
         else "心跳正常" end) +
       " · 用量：" + ($n.used_bytes // 0 | size) + " / " +
       (if ($n.quota_bytes // 0) == 0 then "不限额" else ($n.quota_bytes | size) end)),
+    ((.nodes // {} | to_entries)[] | select(.value.certificate_status.expires_at? != null) |
+      "    证书 [\(.key)]：\(.value.certificate_status.status // "unknown") · 到期 \(.value.certificate_status.expires_at | todateiso8601)"),
     (if (.nodes // {} | length) == 0 then "还没有节点。选 3 生成注册命令，在边缘 VPS 上执行。" else empty end)
   ' <<<"$status" || return 1
   printf '\n心跳正常不等于媒体可播放；当前用量来自节点托管 JSON 访问日志的累计响应字节。\n'
+  printf '切换规则：连续失败 3 次；恢复需成功 3 次且持续 60 秒；健康节点间抢占冷却 180 秒。\n'
+  printf '失联超过 90 秒或配额耗尽不等待冷却；DNS 确认不代表客户端缓存已刷新。\n'
 }
 
 controller_reconcile_menu() {
@@ -2272,24 +2685,41 @@ controller_menu_summary() {
   if systemctl is-active --quiet emby-proxy-master.service 2>/dev/null; then
     printf '  主控服务运行中。添加节点选 3，查看心跳选 4。\n'
   else
-    printf '  主控服务未运行。下一步：选 2 启动；异常时选 6。\n'
+    printf '  主控服务未运行。推荐选 8 配置自动证书并启动 HTTPS；已有配置选 2，异常选 6。\n'
   fi
+}
+
+controller_cert_menu() {
+  local state domain answer
+  state="$(controller_require_state)" || return 1
+  ui_section "自动证书 · DNS-01 签发与 HTTPS 领取"
+  domain="$(jq -r '.certificates.control_domain // ("control." + .domain)' "$state")"
+  ui_read_field domain "独立主控域名（A 记录需提前指向主控 VPS）" "$domain" ui_valid_domain || return 0
+  warn "将安装 Certbot/Cloudflare 插件、申请证书，并把本项目主控改为 HTTPS 0.0.0.0:19090。"
+  info "不改业务 A 记录、不接管已有 80/443 服务。请放行 TCP 19090；已有 HTTP 节点需重新接入 HTTPS。"
+  info "证书私钥在同一入口节点间共享。续期每 12 小时检查，边缘每小时同步。"
+  ui_read_field answer "确认配置并启动主控？y/n" n ui_valid_yes_no || return 0
+  [[ "$answer" =~ ^[Yy]$ ]] || return 0
+  controller_cli cert-setup --state "$state" --control-domain "$domain" --install-deps || return 1
+  ok "主控 HTTPS 已启动：https://${domain}:19090；选 3 为边缘生成新安装命令。"
 }
 
 controller_menu() {
   local choice
   while true; do
-    ui_header "多线路控制器 · 实验版" "配置入口 → 启动主控 → 接入节点"
+    ui_header "多线路控制器 · 实验版" "1 配置入口 → 8 自动证书/HTTPS → 3 接入节点"
     controller_menu_summary
     ui_section "首次配置 · 按顺序完成"
     ui_item 1 "配置主控入口" "域名、固定源站、Cloudflare"
-    ui_item 2 "启动主控服务" "默认本机监听，每 30 秒检查"
+    ui_item 8 "配置自动证书" "主控 HTTPS、签发续期、边缘领取"
     ui_item 3 "添加边缘节点" "生成一条安装命令"
     ui_section "日常管理"
+    ui_item 2 "启动已有主控服务" "沿用已配置的服务；首次默认本机监听"
     ui_item 4 "节点状态与用量" "心跳、配额、当前节点"
     ui_item 5 "立即同步 DNS" "优先级选路，不中转媒体"
     ui_item 6 "服务状态与日志" "排查主控启动问题"
     ui_item 7 "高级主控参数" "监听地址、检查间隔；通常无需修改"
+    ui_item 9 "同步本机边缘证书" "立即领取最新版本，失败保留旧证书"
     printf '\n'
     ui_item 0 "返回上一级" "q 也可返回"
     ui_prompt; IFS= read -r choice || return 0
@@ -2301,6 +2731,8 @@ controller_menu() {
       5) menu_run controller_reconcile_menu ;;
       6) menu_run controller_logs_menu ;;
       7) menu_run controller_master_advanced_menu ;;
+      8) menu_run controller_cert_menu ;;
+      9) menu_run controller_cli node-cert-sync ;;
       0|q|Q) return ;;
       *) warn "请输入有效序号。" ;;
     esac
