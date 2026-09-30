@@ -2536,6 +2536,39 @@ ui_valid_interval() {
 }
 
 ui_valid_quota() { controller_parse_quota "$1" >/dev/null; }
+ui_valid_quota_unit() {
+  [[ "$1" =~ ^[0-5]$ ]] || { warn "请输入 0–5 选择单位，或输入 q 取消。"; return 1; }
+}
+
+controller_read_quota() {
+  local quota_target="$1" unit_choice quota_unit quantity quota_bytes
+  ui_section "配额单位"
+  printf '  1) B\n  2) KB\n  3) MB\n  4) GB\n  5) TB\n  0) 不限额\n'
+  printf '沿用二进制换算：1 GB = 1024³ 字节；输入 q 取消。\n'
+  ui_read_field unit_choice "请选择单位" 0 ui_valid_quota_unit || return 1
+  case "$unit_choice" in
+    0) printf -v "$quota_target" '%s' 0; info "最终配额：不限额"; return 0 ;;
+    1) quota_unit=B ;; 2) quota_unit=KB ;; 3) quota_unit=MB ;;
+    4) quota_unit=GB ;; 5) quota_unit=TB ;;
+  esac
+  while true; do
+    ui_read_field quantity "请输入配额数量（${quota_unit}，支持小数，0 不限额）" "" || return 1
+    if [[ ! "$quantity" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      warn "请填写非负数字（例如 500 或 1.5），无需再次输入单位。"
+      continue
+    fi
+    quota_bytes="$(controller_parse_quota "$quantity" "$quota_unit")" || continue
+    if [[ "$quota_bytes" == 0 ]]; then
+      printf -v "$quota_target" '%s' 0
+      info "最终配额：不限额"
+    else
+      printf -v "$quota_target" '%s' "${quantity}${quota_unit}"
+      info "最终配额：${quantity} ${quota_unit}（${quota_bytes} 字节）"
+    fi
+    return 0
+  done
+}
+
 ui_valid_optional_ipv4() { [[ -z "$1" ]] || ui_valid_ipv4 "$1"; }
 
 controller_issue_menu() {
@@ -2580,11 +2613,13 @@ controller_issue_menu() {
   if [[ "$advanced" =~ ^[Yy]$ ]]; then
     ui_read_field name "线路名称（留空自动生成）" "" || return 0
     ui_read_field priority "优先级（数字越大越优先）" 100 ui_valid_priority || return 0
-    ui_read_field quota_input "配额（500GB / 1TB；纯数字为 GB，0 不限额）" 0 ui_valid_quota || return 0
+    controller_read_quota quota_input || return 0
     ui_read_field public_ip "指定边缘公网 IPv4（留空在边缘自动检测）" "" ui_valid_optional_ipv4 || return 0
   fi
   quota="$(controller_parse_quota "$quota_input")" || return 1
-  printf '\n线路：%s · 优先级：%s · 配额：%s（%s bytes）\nIPv4：%s\n\n' "${name:-自动生成}" "$priority" "$quota_input" "$quota" "${public_ip:-在边缘 VPS 自动检测}"
+  local quota_display="$quota_input"
+  [[ "$quota" != 0 ]] || quota_display="不限额"
+  printf '\n线路：%s · 优先级：%s · 配额：%s（%s bytes）\nIPv4：%s\n\n' "${name:-自动生成}" "$priority" "$quota_display" "$quota" "${public_ip:-在边缘 VPS 自动检测}"
   local -a args=(issue --state "$state" --controller-url "$controller_url" --name "$name" --priority "$priority" --quota-bytes "$quota")
   [[ -z "$public_ip" ]] || args+=(--public-ip "$public_ip")
   controller_cli "${args[@]}" || return 1

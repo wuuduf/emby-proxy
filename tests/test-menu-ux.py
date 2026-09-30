@@ -72,10 +72,58 @@ class MenuUX(unittest.TestCase):
     def test_issue_advanced_quota_and_ip_retry(self):
         r = self.run_menu("curl() { printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
                           'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_issue_menu',
-                          'https://control.example.com\ny\n香港线路\n50\nnope\n1.5TB\n999.2.3.4\n192.0.2.10\n')
+                          'https://control.example.com\ny\n香港线路\n50\nnope\n5\ninvalid\n1.5\n999.2.3.4\n192.0.2.10\n')
         self.assertEqual(r.returncode, 0, r.stderr)
         for arg in ['香港线路', '50', '1649267441664', '192.0.2.10']:
             self.assertIn('ARG:' + arg + '\n', r.stdout)
+
+    def test_quota_unit_then_number(self):
+        for choice, unit, amount, expected in [
+            ('1', 'B', '500', 500), ('2', 'KB', '2', 2048),
+            ('3', 'MB', '2', 2097152), ('4', 'GB', '500', 536870912000),
+            ('5', 'TB', '1.5', 1649267441664),
+        ]:
+            with self.subTest(unit=unit):
+                r = self.run_menu('controller_read_quota result; controller_parse_quota "$result"',
+                                  f'{choice}\n{amount}\n')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(f'{amount} {unit}', r.stdout)
+                self.assertTrue(r.stdout.rstrip().endswith(str(expected)), r.stdout)
+
+    def test_quota_unlimited_skips_quantity(self):
+        for inputs in ['0\n', '\n']:
+            r = self.run_menu('controller_read_quota result; echo "RESULT:$result"', inputs)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('RESULT:0', r.stdout)
+            self.assertNotIn('请输入配额数量', r.stdout)
+
+    def test_quota_zero_quantity_is_unlimited(self):
+        r = self.run_menu('controller_read_quota result; echo "RESULT:$result"', '4\n0.0\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('RESULT:0', r.stdout)
+        self.assertIn('最终配额：不限额', r.stdout)
+
+    def test_issue_advanced_unlimited_still_reads_ip(self):
+        r = self.run_menu("curl() { printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
+                          'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_issue_menu',
+                          'https://control.example.com\ny\n线路\n100\n0\n192.0.2.10\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('ARG:--quota-bytes\nARG:0\n', r.stdout)
+        self.assertIn('ARG:--public-ip\nARG:192.0.2.10\n', r.stdout)
+
+    def test_quota_invalid_quantity_retries(self):
+        r = self.run_menu('controller_read_quota result; echo "RESULT:$result"',
+                          '1\n\n-1\nNaN\n1GB\n0.1\n9223372036854775808\n2\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('RESULT:2B', r.stdout)
+
+    def test_quota_cancel_does_not_issue_token(self):
+        for quota_input in ['q\n', '4\nq\n', '4\n', '']:
+            r = self.run_menu("curl() { printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
+                              'controller_cli() { echo SHOULD_NOT_ISSUE; }; controller_issue_menu',
+                              'https://control.example.com\ny\n线路\n100\n' + quota_input)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn('SHOULD_NOT_ISSUE', r.stdout)
 
     def test_issue_cancel_creates_no_token(self):
         r = self.run_menu("curl() { printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
