@@ -121,6 +121,7 @@ bash -c '
 ' <<'INPUT' >/dev/null
 test.example.com
 https://origin.example.com
+
 n
 
 INPUT

@@ -1517,7 +1517,7 @@ import urllib.error, urllib.request
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 try:
     import fcntl
@@ -1612,6 +1612,147 @@ def post_json(url, payload, token=''):
         raise RuntimeError('主控返回 HTTP %s%s' % (e.code, ': '+detail if detail else ''))
     except urllib.error.URLError as e:
         raise RuntimeError('无法连接主控：%s' % e.reason)
+
+DNSPOD_API = 'https://dnsapi.cn/'
+DNSPOD_LINES = ('默认', '电信', '联通', '移动')
+
+
+def dnspod_call(action, params, token):
+    """Legacy DNSPod Token API; no credentials in URLs, redirects or errors."""
+    if action not in ('Domain.List', 'Record.List', 'Record.Info', 'Record.Modify', 'Record.Create', 'Record.Remove'):
+        raise RuntimeError('不支持的 DNSPod 操作。')
+    token = str(token).strip()
+    if not re.fullmatch(r'[0-9]+,[A-Za-z0-9_-]+', token):
+        raise RuntimeError('请使用 DNSPod ID,Token，不是腾讯云 SecretId/SecretKey。')
+    form = {'login_token': token, 'format': 'json', 'lang': 'cn', 'error_on_empty': 'no'}
+    form.update(params)
+    req = urllib.request.Request(DNSPOD_API + action, data=urlencode(form).encode(),
+        headers={'Content-Type': 'application/x-www-form-urlencoded',
+                 'User-Agent': 'emby-proxy/1 (https://github.com/wuuduf/emby-proxy)'}, method='POST')
+    try:
+        with urllib.request.build_opener(NoCredentialRedirect).open(req, timeout=10) as response:
+            raw = response.read(1048577)
+        if len(raw) > 1048576: raise ValueError('oversize')
+        result = json.loads(raw)
+    except (OSError, ValueError):
+        raise RuntimeError('DNSPod API 请求失败；检查网络、凭据和 API 可用性。') from None
+    status = result.get('status') if isinstance(result, dict) else None
+    if not isinstance(status, dict) or str(status.get('code')) != '1':
+        # Do not reflect an untrusted response message which could contain tokens.
+        code = str(status.get('code', 'invalid')) if isinstance(status, dict) else 'invalid'
+        code = code if re.fullmatch(r'-?\d{1,6}', code) else 'invalid'
+        raise RuntimeError('DNSPod API 拒绝请求（code=%s）；检查 Token/权限/套餐，未确认的更改会重试。' % code)
+    return result
+
+
+def dnspod_pages(action, params, token, key):
+    items = []
+    for offset in range(0, 10000, 100):
+        page = dnspod_call(action, dict(params, offset=offset, length=100), token).get(key)
+        if not isinstance(page, list) or any(not isinstance(item, dict) for item in page):
+            raise RuntimeError('DNSPod 列表响应格式无效。')
+        items.extend(page)
+        if len(page) < 100: return items
+    raise RuntimeError('DNSPod 列表超出安全分页上限；未应用配置。')
+
+
+def dnspod_zone(domain, token):
+    # Longest hosted suffix handles both a delegated zone apex (@) and deep names.
+    domain = str(domain).lower().rstrip('.')
+    zones = dnspod_pages('Domain.List', {}, token, 'domains')
+    matches = [z for z in zones if z.get('status') == 'enable' and
+               (domain == z.get('name') or domain.endswith('.' + str(z.get('name', ''))))]
+    if not matches: raise RuntimeError('DNSPod 中没有匹配的托管域名；先在控制台添加并完成子域名验证。')
+    zone = max(matches, key=lambda z: len(z['name']))
+    host = '@' if domain == zone['name'] else domain[:-(len(zone['name']) + 1)]
+    nameservers = zone.get('grade_ns') or []
+    if (not str(zone.get('id', '')).isdigit() or not isinstance(nameservers, list) or not nameservers or
+            any(not re.fullmatch(r'[A-Za-z0-9.-]+', str(n)) for n in nameservers)):
+        raise RuntimeError('DNSPod 缺少域名 ID 或权威 NS 信息。')
+    return {'domain_id': str(zone['id']), 'zone': zone['name'], 'sub_domain': host,
+            'nameservers': sorted(str(n).lower().rstrip('.') for n in nameservers)}
+
+
+def dnspod_discovery(domain, token_file):
+    token = Path(token_file).read_text().strip()
+    config = dnspod_zone(domain, token)
+    records = dnspod_pages('Record.List', {'domain_id': config['domain_id'],
+        'sub_domain': config['sub_domain']}, token, 'records')
+    found = {}
+    for r in records:
+        if str(r.get('name', '')).lower().rstrip('.') != config['sub_domain']: continue
+        if r.get('type') in ('AAAA', 'CNAME'):
+            raise RuntimeError('入口存在 AAAA/CNAME，可能绕过本次 IPv4 线路策略；请先人工处理。')
+        if r.get('type') != 'A': continue
+        line = r.get('line')
+        if line not in DNSPOD_LINES or line in found:
+            raise RuntimeError('存在额外/重复的 A 记录线路；首版只接管 默认/电信/联通/移动 各一条。')
+        if str(r.get('enabled')) != '1' or r.get('weight') is not None or r.get('monitor_status'):
+            raise RuntimeError('线路记录须已启用、未设置权重、未启用其他 DNS 监控。')
+        if not str(r.get('id', '')).isdigit() or not str(r.get('line_id', '')) or not str(r.get('ttl', '')).isdigit():
+            raise RuntimeError('DNSPod 记录字段不完整。')
+        found[line] = {'record_id': str(r['id']), 'record_line_id': str(r['line_id']), 'ttl': int(r['ttl'])}
+    if set(found) != set(DNSPOD_LINES):
+        raise RuntimeError('DNSPod 缺少线路记录：%s；请先创建四条线路 A 记录，不会替您覆盖/创建业务记录。' %
+                           '、'.join(line for line in DNSPOD_LINES if line not in found))
+    return dict(config, provider='dnspod', token_file=str(Path(token_file).resolve()), line_records=found, routes={})
+
+
+def dnspod_discover(a):
+    print(json.dumps(dnspod_discovery(a.domain, a.token_file), ensure_ascii=False))
+
+
+def check_dnspod_delegation(domain, config):
+    """Read-only recursive NS preflight; never edits the parent zone."""
+    if not shutil.which('dig'): raise RuntimeError('NS 检查需要 dig：Debian/Ubuntu 可安装 dnsutils。')
+    labels = domain.split('.')
+    for i in range(len(labels) - len(config['zone'].split('.')) + 1):
+        name = '.'.join(labels[i:])
+        try:
+            r = subprocess.run(['dig', '+time=3', '+tries=1', '+short', 'NS', name],
+                               check=True, capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            raise RuntimeError('NS 查询失败；检查 DNS 网络后重试。') from None
+        servers = sorted(set(v.lower().rstrip('.') for v in r.stdout.split()))
+        if not servers: continue
+        if servers != sorted(config['nameservers']):
+            raise RuntimeError('NS 尚未指向当前 DNSPod 区域；请按控制台 NS 完成委派并等待缓存刷新。')
+        return {'ok': True, 'delegation': name, 'nameservers': servers}
+    raise RuntimeError('未找到 DNSPod NS 委派；请先在父域添加 NS 记录（不自动修改父域）。')
+
+
+def dnspod_configure(a):
+    path = Path(a.state)
+    before = json.loads(path.read_text())
+    config = dnspod_discovery(before['domain'], a.token_file)
+    proof = check_dnspod_delegation(before['domain'], config)
+    # The control domain may remain on another DNS provider; only the business
+    # hostname is delegated to DNSPod. Certificate issuance is handled separately.
+    if not getattr(a, 'apply', False):
+        print(json.dumps({'preview': True, 'dns': config, 'delegation': proof}, ensure_ascii=False, indent=2))
+        return
+    with state_lock(str(path)+'.cert-issue'), state_lock(path):
+        latest = json.loads(path.read_text())
+        if any(latest.get(k) != before.get(k) for k in ('domain', 'dns', 'certificates')):
+            raise RuntimeError('入口配置并发变化，请重新检查。')
+        # A versioned private file avoids changing a live credential on cancellation.
+        fd, token_path = tempfile.mkstemp(prefix='dnspod-', suffix='.token', dir=path.parent)
+        try:
+            with os.fdopen(fd, 'w') as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(Path(a.token_file).read_text().strip() + '\n')
+            config['token_file'] = token_path
+            old = latest.get('dns') or {}
+            if old.get('provider') == 'dnspod': config['routes'] = old.get('routes') or {}
+            backup_file(path)
+            latest['dns'] = config
+            latest.pop('line_states', None)
+            latest['dns_needs_confirmation'] = True
+            atomic_write(path, latest)
+        except Exception:
+            Path(token_path).unlink(missing_ok=True)
+            raise
+    print('DNSPod 已接入，节点/注册码保留；每条记录已获得接管授权。主控下轮检查将同步线路。')
 
 def certificate_info(pair, domain):
     pair=Path(pair)
@@ -1755,6 +1896,100 @@ def issue_certificates(state, config):
         install_certificate({'domain':domain,'engine':'nginx','certificate_directory':str(root/name)},
             {'domain':domain,'certificate':(live/'fullchain.pem').read_text(),'private_key':(live/'privkey.pem').read_text()},reload=False)
 
+def controller_caddyfile_path():
+    # The environment override keeps this flow testable without touching a host's
+    # real Caddyfile.  Production always uses the system Caddyfile.
+    return Path(os.environ.get('EMBY_PROXY_CADDYFILE', '/etc/caddy/Caddyfile'))
+
+def controller_caddy_block(domain):
+    return ('# BEGIN MANAGED EMBY PROXY CONTROLLER: %s\n'
+            '%s {\n'
+            '    reverse_proxy 127.0.0.1:19090\n'
+            '}\n'
+            '# END MANAGED EMBY PROXY CONTROLLER: %s\n' % (domain, domain, domain))
+
+def update_controller_caddyfile(domain, path):
+    """Add/update only our controller vhost, refusing unrelated conflicts."""
+    path=Path(path); original=path.read_text() if path.exists() else ''
+    block=controller_caddy_block(domain)
+    marker=re.compile(r'(?ms)^# BEGIN MANAGED EMBY PROXY CONTROLLER: '
+                     +re.escape(domain)+r'\s*$.*?^# END MANAGED EMBY PROXY CONTROLLER: '
+                     +re.escape(domain)+r'\s*$\n?')
+    if marker.search(original):
+        updated=marker.sub(block,original,count=1)
+    else:
+        # A previous manual deployment may contain the exact safe block without
+        # markers.  Mark it in-place so subsequent runs are idempotent.
+        plain=re.compile(r'(?ms)^'+re.escape(domain)+r'\s*\{\s*reverse_proxy\s+127\.0\.0\.1:19090\s*\}\s*')
+        if plain.search(original):
+            updated=plain.sub(block,original,count=1)
+        elif re.search(r'(?m)^\s*'+re.escape(domain)+r'\s*\{', original):
+            raise RuntimeError('Caddyfile 已存在非脚本托管的主控域名，拒绝覆盖：'+domain)
+        else:
+            updated=original.rstrip()+ ('\n\n' if original.strip() else '') + block
+    if updated == original:
+        return None
+    backup=backup_file(path)
+    path.parent.mkdir(parents=True,exist_ok=True)
+    path.write_text(updated)
+    os.chmod(path,0o644)
+    return backup
+
+def https_proxy_setup(a):
+    """Put the controller behind Caddy HTTPS (HTTP-01), without exposing 19090."""
+    if os.geteuid() != 0: raise RuntimeError('HTTPS 主控配置需要 root 或 sudo。')
+    path=Path(a.state); domain=str(getattr(a,'control_domain','') or '').strip().lower().rstrip('.')
+    with state_lock(str(path)+'.https-proxy'):
+        state=json.loads(path.read_text())
+        domain=domain or str(state.get('control_domain','')).strip().lower().rstrip('.')
+        if not domain: raise RuntimeError('请先在主控初始化时填写独立主控域名。')
+        if not re.fullmatch(r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]*',domain):
+            raise RuntimeError('主控必须使用独立的有效域名。')
+        if domain == state.get('domain'): raise RuntimeError('主控域名不能与业务入口相同。')
+        if not shutil.which('caddy'): raise RuntimeError('未找到 Caddy；请先安装并启动 Caddy。')
+        active=subprocess.run(['systemctl','is-active','--quiet','caddy'],check=False,
+                              stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode == 0
+        if not active: raise RuntimeError('Caddy 未运行；请先启动 Caddy，且不要让脚本接管已有 Web 服务。')
+        caddyfile=controller_caddyfile_path(); caddy_backup=None; state_backup=backup_file(path)
+        try:
+            caddy_backup=update_controller_caddyfile(domain,caddyfile)
+            for command in (['caddy','fmt','--overwrite',str(caddyfile)],
+                            ['caddy','validate','--config',str(caddyfile),'--adapter','caddyfile'],
+                            ['systemctl','reload','caddy']):
+                subprocess.run(command,check=True)
+            with state_lock(path):
+                latest=json.loads(path.read_text())
+                latest['control_domain']=domain
+                latest['controller_front_proxy']='caddy'
+                latest['controller_url']='https://'+domain
+                atomic_write(path,latest)
+            master_install(argparse.Namespace(state=str(path.resolve()),listen='127.0.0.1:19090',reconcile_interval=30))
+            if os.environ.get('EMBY_PROXY_SKIP_HTTPS_VERIFY') != '1':
+                if not shutil.which('curl'): raise RuntimeError('缺少 curl，无法验证 HTTPS 主控。')
+                verified=False; last=''
+                for _ in range(10):
+                    try:
+                        result=subprocess.run(['curl','--noproxy','*','-fsS','--connect-timeout','5','--max-time','10','https://'+domain+'/status'],check=True,capture_output=True,text=True,timeout=15)
+                        payload=json.loads(result.stdout)
+                        if payload.get('entry_id') == latest.get('entry_id'):
+                            verified=True; break
+                        last='入口 ID 不匹配'
+                    except Exception as e:
+                        last=str(e)
+                    time.sleep(6)
+                if not verified: raise RuntimeError('HTTPS 主控验证失败（请确认 A 记录已指向本机、放行 80/443，并等待 DNS/证书传播）：'+last)
+        except Exception:
+            # Restore both files and reload the previous known-good Caddy config.
+            try:
+                if caddy_backup: restore_file(caddyfile,caddy_backup)
+                subprocess.run(['caddy','validate','--config',str(caddyfile),'--adapter','caddyfile'],check=False)
+                subprocess.run(['systemctl','reload','caddy'],check=False)
+            except Exception: pass
+            try: restore_file(path,state_backup)
+            except Exception: pass
+            raise
+    print('主控 HTTPS 已配置：https://'+domain+'（Caddy 443 → 127.0.0.1:19090）')
+
 def cert_setup(a):
     if os.geteuid() != 0: raise RuntimeError('证书配置需要 root 或 sudo。')
     domain=str(a.control_domain).strip().lower().rstrip('.')
@@ -1875,12 +2110,19 @@ class Controller:
             if self.state.get('active_node') == node_id: self.state['active_node'] = None
             self.save()
             return 200, {'revoked_node':node_id}
+    def eligible(self, nid, current=None):
+        node = self.state.get('nodes', {}).get(nid)
+        if not node: return False
+        quota = int(node.get('quota_bytes', 0))
+        online = now() - int(node.get('last_seen', 0)) <= HEARTBEAT_TTL
+        within = quota <= 0 or int(node.get('used_bytes', 0)) < quota
+        return bool(node.get('healthy') and online and within and
+                    (nid == current or node.get('status') != 'suspect'))
     def select(self):
         out=[]; current=self.state.get('active_node')
         for nid,n in self.state['nodes'].items():
-            quota=int(n.get('quota_bytes',0)); online=now()-int(n.get('last_seen',0)) <= HEARTBEAT_TTL; within=quota <= 0 or int(n.get('used_bytes',0)) < quota
             # 容忍活动节点的短暂失败，但不把正在失败的备用节点提升为活动节点。
-            if n.get('healthy') and online and within and (nid == current or n.get('status') != 'suspect'):
+            if self.eligible(nid, current):
                 out.append((int(n.get('priority',0)), nid))
         best=max(out, default=(0,None))
         active=next((item for item in out if item[1] == current),None)
@@ -1890,6 +2132,8 @@ class Controller:
     def reconcile(self):
         with self.lock, state_lock(self.path):
             self.reload()
+            if (self.state.get('dns') or {}).get('provider') == 'dnspod':
+                return self.reconcile_dnspod()
             selected=self.select(); previous=self.state.get('active_node'); changed=selected != previous; dns_result=None
             ip=self.state['nodes'][selected].get('public_ip') if selected else None
             needs_update=bool(selected and (changed or self.state.get('confirmed_dns_ip') != ip or self.state.get('dns_needs_confirmation')))
@@ -1912,6 +2156,8 @@ class Controller:
             return {'selected_node':selected,'active_node':self.state.get('active_node'),'previous_node':previous,'changed':self.state.get('active_node') != previous,'reason':reason,'dns':dns_result}
     def update_dns(self, nid):
         dns=self.state.get('dns') or {}; node=self.state['nodes'][nid]
+        if dns.get('provider') == 'dnspod':
+            return self.update_dnspod(nid)
         if dns.get('provider') != 'cloudflare': return {'ok':False,'skipped':'dns provider not configured'}
         if not node.get('public_ip'): return {'ok':False,'error':'selected node has no public_ip'}
         if not all(dns.get(key) for key in ('zone_id','record_id','token_file')):
@@ -1935,6 +2181,113 @@ class Controller:
                 return {'ok':False,'error':'DNS read-back mismatch; retry on next reconcile'}
             return {'ok':True,'content':node['public_ip'],'verified':True}
         except (OSError, urllib.error.URLError, ValueError) as e: return {'ok':False,'error':str(e)}
+    def update_dnspod(self, fallback):
+        plans = self.line_plan()
+        results = {}; errors = {}
+        for line, plan in plans.items():
+            target = plan.get('selected_node') or fallback
+            if not target: errors[line] = 'no eligible node'; continue
+            response = self.update_dnspod_line(line, self.state['nodes'][target].get('public_ip'))
+            if response.get('ok'):
+                results[line] = dict(response, node_id=target)
+            else: errors[line] = response.get('error', 'unconfirmed')
+        return {'ok': bool(results) and not errors, 'verified': bool(results) and not errors,
+                'records': results, 'errors': errors}
+    def line_plan(self):
+        dns = self.state.get('dns') or {}
+        routes = dns.get('routes') or {}
+        plans = {}
+        for line in DNSPOD_LINES:
+            previous = (self.state.get('line_states') or {}).get(line) or {}
+            current = previous.get('active_node')
+            preferred = routes.get(line) or routes.get('默认')
+            eligible = [nid for nid in self.state['nodes'] if self.eligible(nid, current)]
+            best = max(eligible, key=lambda nid: (nid == preferred,
+                int(self.state['nodes'][nid].get('priority', 0)), nid == current, nid), default=None)
+            if current in eligible and now() - int(previous.get('last_switch_at', 0)) < SWITCH_COOLDOWN:
+                best = current
+            plans[line] = {'selected_node': best, 'preferred_node': preferred,
+                           'active_node': current, 'content': self.state['nodes'][best].get('public_ip') if best else None}
+        return plans
+
+    def dnspod_record(self, line, token):
+        dns = self.state['dns']; managed = dns['line_records'][line]
+        result = dnspod_call('Record.Info', {'domain_id': dns['domain_id'], 'record_id': managed['record_id']}, token)
+        r = result.get('record') or {}; domain = result.get('domain') or {}
+        if not (str(domain.get('id')) == str(dns['domain_id']) and
+                str(r.get('id')) == str(managed['record_id']) and r.get('sub_domain') == dns['sub_domain'] and
+                r.get('record_type') == 'A' and r.get('record_line') == line and
+                str(r.get('record_line_id')) == str(managed['record_line_id']) and str(r.get('enabled')) == '1' and
+                r.get('weight') is None and not r.get('monitor_status')):
+            raise RuntimeError('DNSPod 记录身份/类型/线路/状态已变化；拒绝覆盖，请重新检查接管范围。')
+        return r
+
+    def update_dnspod_line(self, line, ip):
+        dns = self.state['dns']; managed = dns['line_records'][line]
+        try:
+            ip = str(ipaddress.IPv4Address(ip))
+            token = Path(dns['token_file']).read_text().strip()
+            original = self.dnspod_record(line, token)
+            # DNSPod locks repeatedly submitted no-op writes; read first, even after
+            # timeout/partial failure. Preserve user TTL instead of resetting it.
+            if original.get('value') == ip:
+                return {'ok': True, 'verified': True, 'content': ip, 'unchanged': True}
+            snapshots = self.state.setdefault('dnspod_record_backups', [])
+            snapshots.append({'at': now(), 'line': line, 'record': original})
+            self.state['dnspod_record_backups'] = snapshots[-40:]
+            self.save()  # backup and retry flag must survive a process crash after PUT
+            params = {'domain_id': dns['domain_id'], 'record_id': managed['record_id'],
+                      'sub_domain': dns['sub_domain'], 'record_type': 'A',
+                      'record_line_id': managed['record_line_id'], 'value': ip,
+                      'ttl': int(original['ttl'])}
+            dnspod_call('Record.Modify', params, token)
+            if self.dnspod_record(line, token).get('value') != ip:
+                raise RuntimeError('DNSPod 回读 IP 不匹配，下轮重新读取后重试。')
+            return {'ok': True, 'verified': True, 'content': ip}
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            return {'ok': False, 'error': 'DNSPod 线路未确认；检查凭据、记录身份、TTL/套餐及网络。'}
+
+    def reconcile_dnspod(self):
+        plans = self.line_plan()
+        states = self.state.setdefault('line_states', {})
+        results = {}
+        previous = self.state.get('active_node')
+        for line, plan in plans.items():
+            item = states.setdefault(line, {})
+            nid = plan['selected_node']; ip = plan['content']
+            if not nid:
+                item['reason'] = 'no_eligible_nodes'
+                results[line] = dict(plan, reason=item['reason'])
+                continue
+            changed = nid != item.get('active_node')
+            check = (changed or ip != item.get('confirmed_ip') or item.get('needs_confirmation') or
+                     self.state.get('dns_needs_confirmation') or now() - int(item.get('confirmed_at', 0)) >= 300)
+            if check:
+                item['needs_confirmation'] = True
+                self.save()
+                response = self.update_dnspod_line(line, ip)
+                item['last_result'] = response
+                if response.get('ok') is True:
+                    if changed: item['last_switch_at'] = now()
+                    item.update(active_node=nid, confirmed_ip=ip, confirmed_at=now(),
+                                needs_confirmation=False, reason='dns_confirmed')
+                else: item['reason'] = 'dns_unconfirmed'
+            else: item['reason'] = 'unchanged'
+            results[line] = dict(plan, active_node=item.get('active_node'), reason=item['reason'])
+            self.save()  # partial success is explicit; only failed lines retry
+        self.state['dns_needs_confirmation'] = False
+        default = states.get('默认') or {}
+        self.state['active_node'] = default.get('active_node')
+        self.state['confirmed_dns_ip'] = default.get('confirmed_ip')
+        self.state['dns_confirmed_at'] = default.get('confirmed_at', 0)
+        failed = any(v.get('reason') == 'dns_unconfirmed' for v in results.values())
+        empty = any(v.get('reason') == 'no_eligible_nodes' for v in results.values())
+        reason = 'dns_unconfirmed' if failed else 'no_eligible_nodes' if empty else 'dns_confirmed'
+        self.state['last_reconcile'] = now(); self.state['last_reconcile_reason'] = reason
+        self.save()
+        return {'active_node': self.state['active_node'], 'previous_node': previous,
+                'selected_node': plans['默认']['selected_node'], 'lines': results,
+                'changed': self.state['active_node'] != previous, 'reason': reason}
     def public_status(self):
         with self.lock, state_lock(self.path):
             self.reload()
@@ -1958,6 +2311,8 @@ class Controller:
     def private_status(self):
         with self.lock, state_lock(self.path):
             self.reload(); result=copy.deepcopy(self.state); result['selected_node']=self.select()
+            if (self.state.get('dns') or {}).get('provider') == 'dnspod':
+                result['selected_lines']=self.line_plan()
         result.pop('enroll_tokens',None)
         for n in result.get('nodes',{}).values(): n.pop('token_hash',None)
         if result.get('certificates'):
@@ -2015,6 +2370,12 @@ def init_state(a):
     entry_id=(a.entry_id.strip() if a.entry_id else '') or ('domain-'+domain)
     source=validate_endpoint(a.source, allow_http=True, label='源站 URL')
     if a.engine not in ('caddy','nginx'): raise RuntimeError('引擎只能是 caddy 或 nginx。')
+    control_domain=str(getattr(a,'control_domain','') or '').strip().lower().rstrip('.')
+    if control_domain:
+        if not re.fullmatch(r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]*',control_domain):
+            raise RuntimeError('主控域名格式无效；请填写不带协议、端口或路径的完整域名。')
+        if control_domain == domain:
+            raise RuntimeError('主控域名不能与业务入口域名相同。')
     path=Path(a.state)
     if path.exists():
         if not getattr(a, 'force', False):
@@ -2027,9 +2388,28 @@ def init_state(a):
         backup.write_bytes(path.read_bytes())
         os.chmod(backup, 0o600)
     state={'schema_version':1,'entry_id':entry_id,'domain':domain,'source':source,'engine':a.engine,'active_node':None,'enroll_tokens':{},'nodes':{}}
-    if a.zone_id and a.record_id and a.token_file: state['dns']={'provider':'cloudflare','zone_id':a.zone_id,'record_id':a.record_id,'token_file':a.token_file,'ttl':60}
+    if control_domain: state['control_domain']=control_domain
+    if a.zone_id and a.record_id and a.token_file:
+        state['dns']={'provider':'cloudflare','zone_id':a.zone_id,'record_id':a.record_id,'token_file':a.token_file,'ttl':60}
     with state_lock(a.state): atomic_write(a.state,state)
     print('已创建多线路入口：'+a.state)
+def set_dns_routes(a):
+    path=Path(a.state)
+    with state_lock(path):
+        state=json.loads(path.read_text()); dns=state.get('dns') or {}
+        if dns.get('provider') != 'dnspod': raise RuntimeError('当前入口未配置 DNSPod。')
+        routes={}
+        for raw in a.route or []:
+            if '=' not in raw: raise RuntimeError('线路格式必须是 线路=节点 ID。')
+            line,node=(part.strip() for part in raw.split('=',1))
+            if line not in DNSPOD_LINES: raise RuntimeError('仅支持：%s。' % '、'.join(DNSPOD_LINES))
+            if node and node not in state.get('nodes',{}): raise RuntimeError('节点不存在：%s' % node)
+            if node: routes[line]=node
+        if routes != (dns.get('routes') or {}):
+            # Explicit operator policy changes may override preemption cooldown.
+            for previous in (state.get('line_states') or {}).values(): previous['last_switch_at']=0
+        dns['routes']=routes; state['dns']=dns; backup_file(path); atomic_write(path,state)
+    print('DNSPod 线路路由已保存：'+json.dumps(routes,ensure_ascii=False,sort_keys=True))
 def auto_node_id(state, public_ip):
     base='edge-'+re.sub(r'[^A-Za-z0-9]+','-',str(public_ip).strip()).strip('-').lower()
     base=base if base != 'edge-' else 'edge-node'
@@ -2039,9 +2419,17 @@ def auto_node_id(state, public_ip):
     return candidate
 def issue(a):
     path=Path(a.state)
-    controller_url=validate_endpoint(a.controller_url, allow_http=True, label='主控 URL')
     with state_lock(path):
         state=json.loads(path.read_text()); state.setdefault('enroll_tokens',{}); state.setdefault('nodes',{})
+        controller_url=str(getattr(a,'controller_url','') or '').strip()
+        if not controller_url:
+            control_domain=state.get('certificates',{}).get('control_domain') or state.get('control_domain','')
+            if control_domain:
+                scheme='https' if state.get('certificates') else 'http'
+                controller_url='%s://%s:19090' % (scheme, control_domain)
+        if not controller_url:
+            raise RuntimeError('请填写 --controller-url，或先在入口配置中设置独立主控域名。')
+        controller_url=validate_endpoint(controller_url, allow_http=True, label='主控 URL')
         if state.get('certificates'):
             validate_endpoint(controller_url,allow_http=False,label='证书主控地址')
             if urlparse(controller_url).hostname != state['certificates']['control_domain']:
@@ -2289,10 +2677,14 @@ def node_once(a):
 def main():
     p=argparse.ArgumentParser(prog='emby-proxy controller'); sub=p.add_subparsers(dest='cmd',required=True)
     x=sub.add_parser('cert-setup'); x.add_argument('--state',required=True); x.add_argument('--control-domain',required=True); x.add_argument('--install-deps',action='store_true'); x.set_defaults(fn=cert_setup)
+    x=sub.add_parser('https-proxy-setup'); x.add_argument('--state',required=True); x.add_argument('--control-domain',default=''); x.set_defaults(fn=https_proxy_setup)
     x=sub.add_parser('cert-renew'); x.add_argument('--state',required=True); x.set_defaults(fn=cert_renew)
     x=sub.add_parser('node-cert-sync'); x.add_argument('--state',default='/etc/emby-proxy/multiline-node.json'); x.set_defaults(fn=node_cert_sync)
-    x=sub.add_parser('init'); x.add_argument('--state',required=True); x.add_argument('--entry-id',default=''); x.add_argument('--domain',required=True); x.add_argument('--source',required=True); x.add_argument('--engine',default='caddy'); x.add_argument('--zone-id'); x.add_argument('--record-id'); x.add_argument('--token-file'); x.add_argument('--force',action='store_true'); x.set_defaults(fn=init_state)
-    x=sub.add_parser('issue'); x.add_argument('--state',required=True); x.add_argument('--controller-url',required=True); x.add_argument('--node-id',default=''); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',default='',help='公网 IPv4；省略时在边缘检测 (auto-ip)'); x.set_defaults(fn=issue)
+    x=sub.add_parser('init'); x.add_argument('--state',required=True); x.add_argument('--entry-id',default=''); x.add_argument('--domain',required=True); x.add_argument('--source',required=True); x.add_argument('--engine',default='caddy'); x.add_argument('--control-domain',default=''); x.add_argument('--zone-id'); x.add_argument('--record-id'); x.add_argument('--token-file'); x.add_argument('--force',action='store_true'); x.set_defaults(fn=init_state)
+    x=sub.add_parser('dnspod-configure'); x.add_argument('--state',required=True); x.add_argument('--token-file',required=True); x.add_argument('--apply',action='store_true'); x.set_defaults(fn=dnspod_configure)
+    x=sub.add_parser('dnspod-discover'); x.add_argument('--domain',required=True); x.add_argument('--token-file',required=True); x.set_defaults(fn=dnspod_discover)
+    x=sub.add_parser('set-lines'); x.add_argument('--state',required=True); x.add_argument('--route',action='append',default=[]); x.set_defaults(fn=set_dns_routes)
+    x=sub.add_parser('issue'); x.add_argument('--state',required=True); x.add_argument('--controller-url',default=''); x.add_argument('--node-id',default=''); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',default='',help='公网 IPv4；省略时在边缘检测 (auto-ip)'); x.set_defaults(fn=issue)
     x=sub.add_parser('serve'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=serve)
     x=sub.add_parser('master-install'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=master_install)
     x=sub.add_parser('node-install', description='边缘安装：auto-ip / engine-preflight-cert-v1'); x.add_argument('--controller-url',required=True); x.add_argument('--entry-id',required=True); x.add_argument('--node-id',required=True); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',default='',help='公网 IPv4；省略时在边缘检测 (auto-ip)'); x.add_argument('--enroll-token',required=True); x.set_defaults(fn=node_install)
@@ -2375,6 +2767,8 @@ ui_valid_domain() {
   [[ "$1" =~ \.[A-Za-z]{2,}$ ]] || { warn "请填写完整域名，例如 emby.example.com。"; return 1; }
 }
 
+ui_valid_optional_domain() { [[ -z "$1" ]] || ui_valid_domain "$1"; }
+
 ui_valid_url() {
   python3 - "$1" <<'PY'
 import sys
@@ -2429,7 +2823,7 @@ controller_default_engine() {
 }
 
 controller_init_menu() {
-  local state entry_id domain source engine zone_id record_id token_file answer cf_token discovered token_candidate force=0
+  local state entry_id domain control_domain source engine zone_id record_id token_file answer cf_token discovered token_candidate force=0
   state="$(controller_state_path)"
   ui_section "1 / 3  配置主控入口"
   printf '只配置一次域名和源站；入口 ID 自动生成。任一问题输入 q 取消。\n'
@@ -2444,15 +2838,22 @@ controller_init_menu() {
   entry_id="domain-$domain"
   ui_read_field source "Emby 源站（域名或 URL，可带端口）" "" ui_valid_source || return 0
   [[ "$source" == *://* ]] || source="https://$source"
+  while true; do
+    ui_read_field control_domain "独立主控域名（可选，留空稍后配置）" "" ui_valid_optional_domain || return 0
+    control_domain="$(printf '%s' "$control_domain" | tr '[:upper:]' '[:lower:]')"
+    [[ -z "$control_domain" || "$control_domain" != "$domain" ]] && break
+    warn "主控域名不能与业务入口域名相同，请重新输入或留空。"
+  done
   engine="$(jq -r '.engine // empty' "$state" 2>/dev/null || true)"
   [[ "$engine" == caddy || "$engine" == nginx ]] || engine="$(controller_default_engine)"
   info "边缘统一使用 ${engine}；如需指定其他引擎，请使用 CLI 的 --engine 参数。"
-  printf '\n自动切换 DNS 需要 Cloudflare；选 n 仅建立本地配置，不会自动切换。\n'
+  printf '\nCloudflare 主备切换在此配置；使用 DNSPod 请选 n，建好入口后进入菜单 10 配置运营商线路。\n'
   token_file="$STATE_HOME/cf.token"
   local cf_default=n
   [[ -s "$token_file" ]] && cf_default=y
   ui_read_field answer "启用 Cloudflare A 记录切换？y/n" "$cf_default" ui_valid_yes_no || return 0
   local -a args=(init --state "$state" --entry-id "$entry_id" --domain "$domain" --source "$source" --engine "$engine")
+  [[ -z "$control_domain" ]] || args+=(--control-domain "$control_domain")
   (( force == 1 )) && args+=(--force)
   if [[ "$answer" =~ ^[Yy]$ ]]; then
     if [[ -s "$token_file" ]]; then
@@ -2482,7 +2883,7 @@ controller_init_menu() {
     args+=(--zone-id "$zone_id" --record-id "$record_id" --token-file "$token_file")
   fi
   controller_cli "${args[@]}" || return 1
-  printf '\n入口：%s\n访问域名：https://%s\n下一步：选 2 启动主控服务，再选 3 添加边缘节点。\n' "$entry_id" "$domain"
+  printf '\n入口：%s\n访问域名：https://%s\n主控域名：%s\n下一步：先让主控域名 A 记录指向主控 VPS，再选 8 配置 HTTPS；DNSPod 先选 10 接入 DNS。\n' "$entry_id" "$domain" "${control_domain:-稍后配置}"
 }
 
 controller_generate_node_id() {
@@ -2572,12 +2973,21 @@ controller_read_quota() {
 ui_valid_optional_ipv4() { [[ -z "$1" ]] || ui_valid_ipv4 "$1"; }
 
 controller_issue_menu() {
-  local state name priority quota quota_input public_ip controller_url saved_url status expected advanced
+  local state name priority quota quota_input public_ip controller_url saved_url control_domain status expected advanced
   state="$(controller_require_state)" || return 1
   ui_section "3 / 3  添加边缘节点"
   printf '填写节点信息，生成命令后复制到对应 VPS 执行。输入 q 取消。\n'
   printf '主控 URL 示例：https://control.example.com；必须先配置好 HTTPS 入口。\n'
   saved_url="$(jq -r '.controller_url // empty' "$state")"
+  control_domain="$(jq -r '.control_domain // empty' "$state")"
+  if [[ -z "$saved_url" && -n "$control_domain" ]]; then
+    if jq -e '.certificates != null' "$state" >/dev/null 2>&1; then
+      saved_url="https://${control_domain}:19090"
+    else
+      saved_url="http://${control_domain}:19090"
+    fi
+    info "已沿用初始化时设置的主控域名：${saved_url}"
+  fi
   if [[ -n "$saved_url" ]]; then
     controller_url="$saved_url"
     info "沿用上次验证通过的主控 URL：${controller_url}（如失效会要求重新填写）"
@@ -2668,6 +3078,12 @@ controller_status_menu() {
       elif . >= 1048576 then ((. / 1048576 * 100 | floor) / 100 | tostring) + " MiB"
       else (tostring) + " B" end;
     "\n访问域名：https://\(.domain)\n固定源站：\(.source)\n当前记录节点：\(.active_node // "尚未切换")\n下一候选节点：\(.selected_node // "无可用节点")\n",
+    "DNS 提供商：" + (.dns.provider // "未配置"),
+    ((.selected_lines // {} | to_entries)[] | .key as $line | .value as $p |
+      "线路 " + $line + "：候选 " + ($p.selected_node // "无可用节点") +
+      " · 最近确认 " + (.value.active_node // "无") ),
+    ((.line_states // {} | to_entries)[] | "  " + .key + "：" + (.value.reason // "待同步") +
+      " · IP " + (.value.confirmed_ip // "尚未确认")),
     "DNS 状态：" + (if (.dns_confirmed_at // 0) == 0 then "尚未回读确认"
       else "最近确认 IP " + (.confirmed_dns_ip // "未知") end),
     "自动证书：" + (if .certificates then "已启用 · 主控 " + .certificates.control_domain else "未启用（选 8 配置）" end),
@@ -2699,6 +3115,108 @@ controller_reconcile_menu() {
   controller_cli reconcile --state "$state"
 }
 
+controller_dnspod_setup_menu() {
+  local state domain current token candidate answer
+  state="$(controller_require_state)" || return 1
+  domain="$(jq -r .domain "$state")"
+  ui_section "DNSPod 接入 · 不清空节点"
+  printf '入口：%s\n' "$domain"
+  printf '先在 DNSPod 添加/验证此子域名，再在父域设置控制台给出的 NS。\n'
+  printf 'DNSPod 为同一主机建立 默认/电信/联通/移动 各一条启用的 A 记录；不设权重或其他监控。\n'
+  printf '脚本只接管这四条记录；不会修改父域 NS，也不会删除其他网站记录。\n'
+  printf '首版使用 DNSPod ID,Token（不是腾讯云 SecretId/SecretKey），仅留主控。\n'
+  current="$(jq -r 'if .dns.provider == "dnspod" then .dns.token_file else empty end' "$state")"
+  if [[ -n "$current" && -s "$current" ]]; then
+    ui_read_field answer "沿用已有 DNSPod Token？y/n" y ui_valid_yes_no || return 0
+  else
+    answer=n
+  fi
+  if [[ "$answer" =~ ^[Yy]$ ]]; then
+    candidate="$current"
+  else
+    printf 'DNSPod ID,Token（输入隐藏，q 取消）：'
+    IFS= read -r -s token || return 0; printf '\n'
+    [[ ! "$token" =~ ^[qQ]$ ]] || return 0
+    [[ "$token" =~ ^[0-9]+,[A-Za-z0-9_-]+$ ]] || { warn "格式错误，应为 ID,Token。"; return 1; }
+    candidate="$(mktemp "$(dirname "$state")/.dnspod-input.XXXXXX")" || return 1
+    chmod 600 "$candidate"
+    printf '%s\n' "$token" >"$candidate"; unset token
+  fi
+  if ! controller_cli dnspod-configure --state "$state" --token-file "$candidate"; then
+    [[ "$candidate" == "$current" ]] || rm -f "$candidate"
+    return 1
+  fi
+  warn "确认后主控将在下一轮自动接管以上四条记录；已有客户端受 DNS 缓存影响。"
+  if ! ui_read_field answer "确认启用 DNSPod 线路切换？y/n" n ui_valid_yes_no; then
+    [[ "$candidate" == "$current" ]] || rm -f "$candidate"
+    return 0
+  fi
+  if [[ "$answer" =~ ^[Yy]$ ]]; then
+    if ! controller_cli dnspod-configure --state "$state" --token-file "$candidate" --apply; then
+      [[ "$candidate" == "$current" ]] || rm -f "$candidate"
+      return 1
+    fi
+    info "接入完成。返回控制器选 8 配置自动 HTTPS（DNSPod/其他 DNS 使用 Caddy HTTP-01），再选 3 接入边缘；随后设置线路。"
+  fi
+  [[ "$candidate" == "$current" ]] || rm -f "$candidate"
+  return 0
+}
+
+controller_dnspod_menu() {
+  local choice
+  while true; do
+    ui_header "DNSPod 运营商线路 · 实验版" "1 接入 DNS → 自动证书/添加节点 → 2 设置线路"
+    ui_item 1 "接入/检查 DNSPod" "自动查找区域/记录，预览后确认；保留节点"
+    ui_item 2 "设置线路节点" "默认/电信/联通/移动；0 自动选路"
+    ui_item 3 "查看线路状态" "每条线路的候选、已确认节点和故障"
+    ui_item 4 "立即同步线路" "只改已接管的四条 A 记录"
+    ui_item 0 "返回上一级" "q 也可返回"
+    ui_prompt; IFS= read -r choice || return 0
+    case "$choice" in
+      1) menu_run controller_dnspod_setup_menu ;;
+      2) menu_run controller_lines_menu ;;
+      3) menu_run controller_status_menu ;;
+      4) menu_run controller_reconcile_menu ;;
+      0|q|Q) return ;;
+      *) warn "请输入有效序号。" ;;
+    esac
+  done
+}
+
+controller_lines_menu() {
+  local state provider line node answer entries count row choice default id current
+  local -a routes=()
+  state="$(controller_require_state)" || return 1
+  provider="$(jq -r '.dns.provider // empty' "$state")"
+  [[ "$provider" == dnspod ]] || { warn "请先接入 DNSPod。"; return 1; }
+  entries="$(jq -c '(.nodes // {}) | to_entries | sort_by(.key)' "$state")"
+  count="$(jq length <<<"$entries")"
+  (( count > 0 )) || { warn "还没有边缘节点，请返回控制器选 3 添加节点。"; return 1; }
+  ui_section "DNSPod 运营商线路"
+  printf '选择节点序号即可。0=自动按优先级；指定节点故障/超额时回退到健康节点。\n'
+  jq -r 'to_entries[] | "  \(.key+1)) \(.value.value.name // .value.key) [\(.value.key)]"' <<<"$entries"
+  printf '  0) 自动选择（未匹配的运营商走“默认”线路）\n'
+  for line in 默认 电信 联通 移动; do
+    current="$(jq -r --arg line "$line" '.dns.routes[$line] // empty' "$state")"
+    default="$(jq -r --arg id "$current" '([to_entries[] | select(.value.key==$id) | (.key+1)] | first) // 0' <<<"$entries")"
+    while true; do
+      ui_read_field choice "$line 节点序号" "$default" || return 0
+      [[ "$choice" =~ ^[0-9]{1,5}$ ]] && (( 10#$choice <= count )) || { warn "请输入 0–${count}，q 取消。"; continue; }
+      if (( 10#$choice > 0 )); then
+        id="$(jq -r --argjson i "$((10#$choice - 1))" '.[$i].key' <<<"$entries")"
+        routes+=(--route "$line=$id")
+      fi
+      break
+    done
+  done
+  printf '\n即将保存（留自动的运营商沿用默认节点偏好，再按健康/配额/优先级回退）：\n'
+  printf '  %s\n' "${routes[@]}"
+  ui_read_field answer "确认保存并由主控自动同步？y/n" n ui_valid_yes_no || return 0
+  [[ "$answer" =~ ^[Yy]$ ]] || return 0
+  controller_cli set-lines --state "$state" "${routes[@]}" || return 1
+  info "线路配置已保存；主控下一轮自动同步，也可选择立即同步。"
+}
+
 controller_logs_menu() {
   systemctl --no-pager -n 100 status emby-proxy-master.service || true
 }
@@ -2712,6 +3230,7 @@ controller_menu_summary() {
   fi
   if ! jq -er '
     "\n  入口：" + .domain + " · 已注册 " + ((.nodes // {} | length) | tostring) + " 个节点",
+    "  主控域名：" + (.control_domain // "稍后配置") + " · 主控地址：" + (.controller_url // "尚未启动"),
     "  当前记录节点：" + (.active_node // "尚未切换") + " · DNS 自动切换：" + (if .dns then "已配置" else "未启用" end)
   ' "$state"; then
     warn "状态文件无法读取，请先备份检查，不要直接重新初始化。"
@@ -2725,18 +3244,31 @@ controller_menu_summary() {
 }
 
 controller_cert_menu() {
-  local state domain answer
+  local state domain answer provider
   state="$(controller_require_state)" || return 1
-  ui_section "自动证书 · DNS-01 签发与 HTTPS 领取"
-  domain="$(jq -r '.certificates.control_domain // ("control." + .domain)' "$state")"
+  provider="$(jq -r '.dns.provider // empty' "$state")"
+  domain="$(jq -r '.certificates.control_domain // .control_domain // ("control." + .domain)' "$state")"
   ui_read_field domain "独立主控域名（A 记录需提前指向主控 VPS）" "$domain" ui_valid_domain || return 0
-  warn "将安装 Certbot/Cloudflare 插件、申请证书，并把本项目主控改为 HTTPS 0.0.0.0:19090。"
-  info "不改业务 A 记录、不接管已有 80/443 服务。请放行 TCP 19090；已有 HTTP 节点需重新接入 HTTPS。"
-  info "证书私钥在同一入口节点间共享。续期每 12 小时检查，边缘每小时同步。"
+  if [[ "$provider" == cloudflare ]]; then
+    ui_section "自动证书 · Cloudflare DNS-01"
+    warn "将安装 Certbot/Cloudflare 插件、申请证书，并让主控直接监听 HTTPS 19090。"
+    info "不改业务 A 记录、不接管已有 80/443 服务。请放行 TCP 19090；已有 HTTP 节点需重新接入 HTTPS。"
+    info "证书私钥在同一入口节点间共享。续期每 12 小时检查，边缘每小时同步。"
+  else
+    ui_section "自动 HTTPS · Caddy HTTP-01"
+    warn "Caddy 将在 443 终止 HTTPS，并反代到本机 127.0.0.1:19090；不会把主控端口暴露公网。"
+    info "适用于 DNSPod 或其他 DNS：只需让主控域名 A 记录指向本机，并放行 TCP 80/443。Caddy 自动申请和续期证书。"
+  fi
+  info "不会覆盖非脚本托管的 Caddy 站点；修改前会自动备份配置，校验失败会恢复。"
   ui_read_field answer "确认配置并启动主控？y/n" n ui_valid_yes_no || return 0
   [[ "$answer" =~ ^[Yy]$ ]] || return 0
-  controller_cli cert-setup --state "$state" --control-domain "$domain" --install-deps || return 1
-  ok "主控 HTTPS 已启动：https://${domain}:19090；选 3 为边缘生成新安装命令。"
+  if [[ "$provider" == cloudflare ]]; then
+    controller_cli cert-setup --state "$state" --control-domain "$domain" --install-deps || return 1
+    ok "主控 HTTPS 已启动：https://${domain}:19090；选 3 为边缘生成新安装命令。"
+  else
+    controller_cli https-proxy-setup --state "$state" --control-domain "$domain" || return 1
+    ok "主控 HTTPS 已启动：https://${domain}；选 3 为边缘生成新安装命令。"
+  fi
 }
 
 controller_menu() {
@@ -2745,13 +3277,14 @@ controller_menu() {
     ui_header "多线路控制器 · 实验版" "1 配置入口 → 8 自动证书/HTTPS → 3 接入节点"
     controller_menu_summary
     ui_section "首次配置 · 按顺序完成"
-    ui_item 1 "配置主控入口" "域名、固定源站、Cloudflare"
+    ui_item 1 "配置主控入口" "域名、固定源站；DNSPod 随后选 10"
     ui_item 8 "配置自动证书" "主控 HTTPS、签发续期、边缘领取"
     ui_item 3 "添加边缘节点" "生成一条安装命令"
     ui_section "日常管理"
     ui_item 2 "启动已有主控服务" "沿用已配置的服务；首次默认本机监听"
     ui_item 4 "节点状态与用量" "心跳、配额、当前节点"
     ui_item 5 "立即同步 DNS" "优先级选路，不中转媒体"
+    ui_item 10 "DNSPod 运营商线路" "DNSPod：默认/电信/联通/移动"
     ui_item 6 "服务状态与日志" "排查主控启动问题"
     ui_item 7 "高级主控参数" "监听地址、检查间隔；通常无需修改"
     ui_item 9 "同步本机边缘证书" "立即领取最新版本，失败保留旧证书"
@@ -2764,6 +3297,7 @@ controller_menu() {
       3) menu_run controller_issue_menu ;;
       4) menu_run controller_status_menu ;;
       5) menu_run controller_reconcile_menu ;;
+      10) controller_dnspod_menu ;;
       6) menu_run controller_logs_menu ;;
       7) menu_run controller_master_advanced_menu ;;
       8) menu_run controller_cert_menu ;;

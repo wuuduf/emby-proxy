@@ -105,6 +105,89 @@ class FailoverTests(unittest.TestCase):
         self.c.state['dns'] = dict(provider='cloudflare', zone_id='zone', record_id='record', token_file=str(token))
         self.c.save()
 
+    def configure_dnspod(self):
+        token = self.path.parent / 'dnspod-token'
+        token.write_text('12345,fixture-token')
+        self.c.state['dns'] = dict(provider='dnspod', domain_id='42', sub_domain='emby',
+            token_file=str(token), ttl=600, routes={'电信': 'a', '联通': 'b', '移动': 'b'},
+            line_records={line: {'record_id': str(i), 'record_line_id': 'line-'+str(i)}
+                          for i, line in enumerate(('默认', '电信', '联通', '移动'), 1)})
+        self.c.save()
+
+    def dnspod_response(self, records=None):
+        return self.response({'status': {'code': '1', 'message': '接口调用成功'},
+                              **({'records': records} if records is not None else {})})
+
+    def dnspod_record_response(self, record_id, line, line_id, value, domain_id='42'):
+        return self.response({'status': {'code': '1', 'message': 'ok'},
+            'domain': {'id': domain_id}, 'record': {'id': record_id, 'sub_domain': 'emby',
+            'record_type': 'A', 'record_line': line, 'record_line_id': line_id,
+            'value': value, 'enabled': '1', 'weight': None, 'monitor_status': '', 'ttl': '600'}})
+
+    def test_dnspod_operator_lines_update_and_readback(self):
+        self.configure_dnspod()
+        replies=[]
+        expected={'默认': ('a', '192.0.2.1'), '电信': ('a', '192.0.2.1'),
+                  '联通': ('b', '192.0.2.2'), '移动': ('b', '192.0.2.2')}
+        for line, record in self.c.state['dns']['line_records'].items():
+            node, ip = expected[line]
+            replies.append(self.dnspod_record_response(record['record_id'], line, record['record_line_id'], '192.0.2.9'))
+            replies.append(self.dnspod_response())
+            replies.append(self.dnspod_record_response(record['record_id'], line, record['record_line_id'], ip))
+        opener=Mock(); opener.open=Mock(side_effect=replies)
+        with patch.object(ns['urllib'].request, 'build_opener', return_value=opener) as build:
+            result=self.c.update_dns('a')
+        self.assertTrue(result['ok'], result)
+        self.assertEqual({line: item['node_id'] for line, item in result['records'].items()},
+                         {line: node for line, (node, _) in expected.items()})
+        self.assertEqual(len(opener.open.call_args_list), 12)
+        self.assertTrue(all(c.args[0].get_method() == 'POST' for c in opener.open.call_args_list))
+        body=opener.open.call_args_list[1].args[0].data.decode()
+        self.assertIn('login_token=12345%2Cfixture-token', body)
+        self.assertIn('record_line_id=line-1', body)
+
+    def test_dnspod_unhealthy_assigned_line_falls_back_to_primary(self):
+        self.configure_dnspod()
+        self.c.state['nodes']['b']['healthy']=False
+        self.c.save()
+        replies=[]
+        for line, record in self.c.state['dns']['line_records'].items():
+            replies += [self.dnspod_record_response(record['record_id'], line, record['record_line_id'], '192.0.2.9'),
+                        self.dnspod_response(),
+                        self.dnspod_record_response(record['record_id'], line, record['record_line_id'], '192.0.2.1')]
+        opener=Mock(); opener.open=Mock(side_effect=replies)
+        with patch.object(ns['urllib'].request, 'build_opener', return_value=opener):
+            result=self.c.update_dns('a')
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(all(item['node_id'] == 'a' for item in result['records'].values()))
+
+    def test_dnspod_reconcile_persists_per_line_failover(self):
+        self.configure_dnspod()
+        with patch.object(self.c, 'update_dnspod_line', side_effect=lambda line, ip:
+                          {'ok': True, 'verified': True, 'content': ip}):
+            first=self.c.reconcile()
+        self.assertEqual(first['reason'], 'dns_confirmed')
+        self.assertEqual(self.c.state['line_states']['联通']['active_node'], 'b')
+        self.c.state['nodes']['b']['healthy']=False
+        self.c.save()
+        with patch.object(self.c, 'update_dnspod_line', side_effect=lambda line, ip:
+                          {'ok': True, 'verified': True, 'content': ip}) as update:
+            second=self.c.reconcile()
+        self.assertEqual(second['reason'], 'dns_confirmed')
+        self.assertEqual(self.c.state['line_states']['联通']['active_node'], 'a')
+        self.assertEqual(self.c.state['line_states']['移动']['active_node'], 'a')
+        self.assertGreaterEqual(update.call_count, 2)
+
+    def test_dnspod_discovery_requires_all_operator_records(self):
+        token=self.path.parent/'token'; token.write_text('12345,fixture-token')
+        args=SimpleNamespace(domain='emby.example.com', token_file=str(token))
+        responses=[self.response({'status': {'code': '1', 'message': 'ok'}, 'domains': [{'id': '42', 'name': 'example.com', 'status': 'enable', 'grade_ns': ['ns1.example']}]}),
+                   self.dnspod_response([{'id': '1', 'name': 'emby', 'type': 'A', 'line': '默认', 'line_id': '0', 'value': '192.0.2.1', 'enabled': '1', 'weight': None, 'monitor_status': '', 'ttl': '600'}])]
+        opener=Mock(); opener.open=Mock(side_effect=responses)
+        with patch.object(ns['urllib'].request, 'build_opener', return_value=opener):
+            with self.assertRaisesRegex(RuntimeError, '缺少线路记录'):
+                ns['dnspod_discover'](args)
+
     def response(self, body):
         return io.BytesIO(json.dumps(body).encode())
 

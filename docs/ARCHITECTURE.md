@@ -21,14 +21,16 @@ setup-emby-proxy.sh（无参数）
 
 **多线路实验控制面**：
 ```text
-controller init → controller.json
+controller init → 业务入口域名 + 可选独立主控域名 → controller.json
 controller issue → 一次性注册命令（默认不携带边缘 IP）
 node-install → 边缘自动检测公网 IPv4 / 本机引擎预检 → POST /enroll → 节点配置/服务/定时器
 node → POST /heartbeat → 健康、用量、last_seen
-serve 的周期 reconcile → 带防抖/冷却的 select → Cloudflare A 记录写入 + API 回读确认
+serve 的周期 reconcile → 带防抖/冷却的 select → DNS Provider 写入 + API 回读确认
 ```
 控制器不承载媒体流量。这是按优先级选择单个活动节点的 DNS 切换，不是逐请求负载均衡。
 DNS 缓存与已有播放连接不会随 A 记录立即迁移。
+
+DNS Provider 目前有两种：Cloudflare 单 A 记录主备，以及 DNSPod 四条线路记录（默认/电信/联通/移动）。DNSPod 模式先只读校验托管区域、子域委派和记录身份，再逐条修改并回读；每条线路可以指定节点，指定节点不健康或超额时回退到健康候选。父域 NS 委派由用户完成，控制器不提供未认证的父域写操作。
 
 ## 关键模块
 
@@ -63,5 +65,5 @@ DNS 缓存与已有播放连接不会随 A 记录立即迁移。
 
 ## 可选集中证书
 
-菜单 8 / controller cert-setup：复用 CF Token，通过 Certbot DNS-01 为入口和独立主控域名签发证书；控制器在自己的端口启用原生 TLS。/certificate 只接受真实 TLS 和本入口节点令牌，不信任 X-Forwarded-Proto，不允许 HTTP 重定向携带凭据。
+菜单 8 会按 DNS Provider 选择控制面 HTTPS：DNSPod/其他 DNS 使用 `https-proxy-setup`，Caddy 只监听 443 并反代到控制器本机 `127.0.0.1:19090`，由 Caddy 通过 HTTP-01 自动申请/续期证书；Cloudflare Token 仍使用 `cert-setup` 的 DNS-01，在控制器自己的端口启用原生 TLS。两种方式都不把未加密 19090 暴露公网。配置前备份 Caddyfile，遇到冲突、校验或 reload 失败恢复原文件；/certificate 只接受真实 TLS 和本入口节点令牌，不信任 X-Forwarded-Proto，不允许 HTTP 重定向携带凭据。
 边缘注册后从主控下载所属入口证书，经校验再使用版本目录 + current 原子切换；两种引擎通过 tls_directory 加载同一接口。独立 cert-renew 和 cert-sync 定时器管理续期；普通单机入口不改变原证书管理方式。详见 CERTIFICATES.md。

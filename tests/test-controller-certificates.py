@@ -177,4 +177,20 @@ class Certificates(unittest.TestCase):
         self.assertEqual((self.root/'edge'/'current').resolve(),current)
         self.assertEqual(json.loads((self.root/'edge'/'status.json').read_text())['status'],'sync_failed')
 
+    def test_caddy_controller_block_is_marked_idempotent_and_refuses_conflict(self):
+        path=self.root/'Caddyfile'
+        path.write_text('existing.example.com {\n\trespond "ok"\n}\n\n'
+                        'control.example.com {\n\n reverse_proxy 127.0.0.1:19090\n}\n')
+        backup=ns['update_controller_caddyfile']('control.example.com',path)
+        self.assertIsNotNone(backup)
+        text=path.read_text()
+        self.assertIn('# BEGIN MANAGED EMBY PROXY CONTROLLER: control.example.com',text)
+        self.assertEqual(text.count('control.example.com {'),1)
+        self.assertIsNone(ns['update_controller_caddyfile']('control.example.com',path))
+        conflict=self.root/'conflict.Caddyfile'
+        conflict.write_text('control.example.com {\n reverse_proxy 127.0.0.1:9000\n}\n')
+        with self.assertRaises(RuntimeError):
+            ns['update_controller_caddyfile']('control.example.com',conflict)
+        self.assertNotIn('BEGIN MANAGED',conflict.read_text())
+
 if __name__ == '__main__': unittest.main()

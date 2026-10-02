@@ -32,7 +32,7 @@ class MenuUX(unittest.TestCase):
     def test_init_minimal_defaults_and_retry(self):
         self.state.unlink()
         r = self.run_menu('controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_init_menu',
-                          'bad domain\nTEST.EXAMPLE.COM\norigin.example.com:8443\nn\n\n')
+                          'bad domain\nTEST.EXAMPLE.COM\norigin.example.com:8443\n\nn\n\n')
         self.assertEqual(r.returncode, 0, r.stderr)
         for arg in ['domain-test.example.com', 'test.example.com', 'https://origin.example.com:8443', 'caddy']:
             self.assertIn('ARG:' + arg + '\n', r.stdout)
@@ -49,12 +49,20 @@ class MenuUX(unittest.TestCase):
         (self.home / 'cf.token').write_text('fixture-token\n')
         r = self.run_menu('controller_cf_discover_ids() { printf "zone-id\\trecord-id"; }; '
                           'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_init_menu',
-                          'test.example.com\norigin.example.com\n\n')
+                          'test.example.com\norigin.example.com\n\n\n')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('自动沿用本地 600 权限文件', r.stdout)
         self.assertNotIn('API Token（输入隐藏', r.stdout)
         self.assertIn('ARG:--token-file', r.stdout)
         self.assertEqual((self.home / 'cf.token').stat().st_mode & 0o777, 0o600)
+
+    def test_init_persists_dedicated_controller_domain(self):
+        self.state.unlink()
+        r = self.run_menu('controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_init_menu',
+                          'test.example.com\norigin.example.com\ncontrol.example.com\nn\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('ARG:--control-domain\nARG:control.example.com\n', r.stdout)
+        self.assertIn('主控域名：control.example.com', r.stdout)
 
     def test_issue_minimal_defaults_never_detects_controller_ip(self):
         self.data['controller_url'] = 'https://control.example.com'
@@ -68,6 +76,15 @@ class MenuUX(unittest.TestCase):
         self.assertNotIn('ARG:--public-ip', r.stdout)
         self.assertNotIn('ARG:--node-id', r.stdout)
         self.assertIn('边缘 VPS', r.stdout)
+
+    def test_issue_uses_saved_controller_domain_when_url_missing(self):
+        self.data['control_domain'] = 'control.example.com'
+        self.state.write_text(json.dumps(self.data))
+        r = self.run_menu('curl() { [[ "$*" == *"http://control.example.com:19090/status"* ]] || return 99; '
+                          "printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
+                          'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_issue_menu', '\n\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('ARG:http://control.example.com:19090\n', r.stdout)
 
     def test_issue_advanced_quota_and_ip_retry(self):
         r = self.run_menu("curl() { printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
@@ -221,11 +238,22 @@ class MenuUX(unittest.TestCase):
         self.assertNotIn('SHOULD_NOT_RUN',r.stdout)
 
     def test_certificate_setup_menu_calls_atomic_setup(self):
+        self.data['dns'] = {'provider': 'cloudflare'}
+        self.state.write_text(json.dumps(self.data))
         r = self.run_menu('controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_cert_menu', 'control.example.com\ny\n')
         self.assertEqual(r.returncode,0,r.stderr)
         self.assertIn('ARG:cert-setup',r.stdout)
         self.assertIn('ARG:--install-deps',r.stdout)
-        self.assertIn('0.0.0.0:19090',r.stderr)
+        self.assertIn('19090',r.stderr)
+
+    def test_dns_provider_uses_caddy_https_proxy_setup(self):
+        self.data['dns'] = {'provider': 'dnspod'}
+        self.state.write_text(json.dumps(self.data))
+        r = self.run_menu('controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_cert_menu', 'control.example.com\ny\n')
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertIn('ARG:https-proxy-setup',r.stdout)
+        self.assertNotIn('ARG:cert-setup',r.stdout)
+        self.assertIn('80/443',r.stdout)
 
 
 if __name__ == '__main__':

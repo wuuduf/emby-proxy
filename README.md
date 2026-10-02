@@ -172,7 +172,9 @@ sudo ep uninstall
 
 ## 多线路主控（实验版，单脚本）
 
-多线路功能已经合并进 `emby-proxy` 本身. 控制器只负责节点注册、心跳、节点选择和 Cloudflare A 记录切换, **不经过它转发媒体流量**. 主控固定一个源站，边缘节点复用同一域名和源站配置。
+多线路功能已经合并进 `emby-proxy` 本身. 控制器只负责节点注册、心跳、节点选择和 DNS 记录切换, **不经过它转发媒体流量**. 主控固定一个源站，边缘节点复用同一域名和源站配置。
+
+当前支持两种 DNS 策略：Cloudflare 的单记录主备切换，以及 DNSPod 的“默认/电信/联通/移动”线路解析。DNSPod 版本仍是 DNS 分流，不是逐请求负载均衡：DNS 缓存和已经建立的 Emby 播放连接不会立即迁移。
 
 主控端示例:
 
@@ -181,6 +183,7 @@ sudo ep uninstall
 sudo ep controller init --state /etc/emby-proxy/controller.json \
   --entry-id domain-emby.example.com \
   --domain emby.example.com --source https://origin.example.com \
+  --control-domain control.example.com \
   --zone-id <ZONE_ID> --record-id <RECORD_ID> --token-file /etc/emby-proxy/cf.token
 
 # 为每台边缘 VPS 生成一次性注册命令；省略 --node-id 时按公网 IP 自动生成
@@ -193,7 +196,7 @@ sudo ep controller master-install --state /etc/emby-proxy/controller.json \
   --listen 0.0.0.0:19090
 ```
 
-也可以直接在 `ep` 菜单选择 `11 多线路控制器`，按向导完成：**1 配置入口 → 8 自动证书与 HTTPS → 3 添加边缘节点**（已有手动证书部署仍可用 2 启动主控）。日常查看用选项 4，手动同步 DNS 用 5，查服务日志用 6；只有需要自定义监听或检查间隔时才使用 7。向导支持 `q` 取消、字段错误原地重填；操作失败返回控制器菜单，不退出整个面板。
+也可以直接在 `ep` 菜单选择 `11 多线路控制器`，按向导完成：**1 配置入口 → 填写独立主控域名（可选）→ 10 DNSPod 线路（可选）→ 8 自动证书与 HTTPS → 3 添加边缘节点**（已有手动证书部署仍可用 2 启动主控服务）。主控域名只用于控制器注册和心跳，不能与业务入口域名相同；填写后会自动保存。使用 DNSPod 或其他 DNS 时，菜单 8 会让 Caddy 在 443 自动申请/续期证书，并反代到本机 `127.0.0.1:19090`，边缘命令自动使用 `https://主控域名`；使用 Cloudflare Token 时保留 Certbot DNS-01 和 `:19090` 原生 TLS 流程。若暂时留空，仍可在菜单 8 或添加节点时补充。DNSPod 菜单会先只读检查区域、子域名委派和四条 A 记录，确认后才接管；不会修改父域 NS，也不会删除其他记录。日常查看用选项 4，手动同步 DNS 用 5，查服务日志用 6；只有需要自定义监听或检查间隔时才使用 7。向导支持 `q` 取消、字段错误原地重填；操作失败返回控制器菜单，不退出整个面板。
 
 菜单初始化时不需要手动选择引擎、查找 `entry_id`、`zone_id`、`record_id` 或填写文件路径：脚本会优先复用正在运行的 Caddy/Nginx，没有已安装引擎时默认 Caddy；再根据域名自动生成 `domain-<domain>` 入口 ID，隐藏读取 API Token，将它保存为主控本地 `600` 权限的 `cf.token`，然后按对外域名自动查找匹配的 Zone 和 A 记录。首次启用 Cloudflare 才需要粘贴 Token，后续会自动沿用本地 Token。需要指定其他引擎的高级用户使用 CLI 的 `--engine` 参数。该域名必须先在 Cloudflare DNS 中存在一条 A 记录（建议使用 DNS only/灰云）。命令行 `controller init` 也支持省略 `--entry-id` 自动生成，或显式传入自定义 ID 以兼容自动化部署。
 
@@ -203,7 +206,23 @@ sudo ep controller master-install --state /etc/emby-proxy/controller.json \
 
 复制命令时必须使用纯文本 URL，例如 `https://control.example.com`，不要把 Markdown 链接的 `[]()` 一起复制。主控菜单先请求 `/status` 并核对入口 ID，通过后才生成命令；主控地址成功使用后会自动记住，添加下一台不再重复询问。连不通时才要求重新填写，并提示端口、防火墙和 TLS 问题。
 
-这个功能目前仍是实验实现: 控制器没有管理员登录；菜单 8 可启用独立域名的内建 TLS，未启用时仍是 HTTP, 注册令牌只能使用一次且 15 分钟后失效, 主控服务直接本地调用 DNS 选路，不再提供未认证的 `/reconcile` 变更接口；公开 `/status` 只返回入口身份，边缘心跳会检查本机 HTTPS 健康路径，并从 Caddy/Nginx JSON 访问日志累计响应字节到 `/var/lib/emby-proxy/used_bytes`。正式使用应放在 WireGuard 或 HTTPS 访问控制后. 多线路已合并到 `main`，但仍按实验功能维护。
+这个功能目前仍是实验实现: 控制器没有管理员登录；菜单 8 可启用独立域名的 HTTPS，DNSPod/其他 DNS 由 Caddy 代理 443，Cloudflare 可用内建 TLS；注册令牌只能使用一次且 15 分钟后失效, 主控服务直接本地调用 DNS 选路，不再提供未认证的 `/reconcile` 变更接口；公开 `/status` 只返回入口身份，边缘心跳会检查本机 HTTPS 健康路径，并从 Caddy/Nginx JSON 访问日志累计响应字节到 `/var/lib/emby-proxy/used_bytes`。正式使用应放在 WireGuard 或 HTTPS 访问控制后. 多线路已合并到 `main`，但仍按实验功能维护。
+
+### DNSPod 线路模式（第一阶段）
+
+DNSPod 只负责回答 DNS，不承载媒体流量。使用前在 DNSPod 添加并验证业务子域名，然后按 DNSPod 控制台给出的 NS 在父域添加委派；官方说明子域名托管需要专业版及以上套餐，且脚本不会替你修改父域 NS。[DNSPod 子域名托管说明](https://docs.dnspod.cn/dns/subdomain-resolution/)
+
+在 DNSPod 中为同一主机准备四条启用的 IPv4 A 记录：`默认`、`电信`、`联通`、`移动`。不要设置权重、D 监控、AAAA 或 CNAME；脚本只接管这四条记录，并在每次修改前用 `Record.Info` 校验记录 ID、线路、类型和状态，修改后再次回读。DNSPod 的线路列表包含电信、联通、移动等运营商线路。[DNSPod 线路说明](https://docs.dnspod.cn/dns/dns-record-line/)
+
+菜单流程：
+
+```text
+ep → 11 多线路控制器 → 10 DNSPod 运营商线路 → 1 接入/检查 DNSPod
+```
+
+输入 DNSPod Token 时直接粘贴 `ID,Token`，脚本只在主控保存 600 权限文件；边缘节点不会收到 DNSPod 凭据。预览通过后确认接管，再用 **2 设置线路节点** 为电信/联通/移动指定边缘节点；指定节点不健康或配额耗尽时，控制器自动回退到当前健康节点。主控每轮会逐条修改并回读确认，失败线路单独重试，不会把未确认的记录宣称为已切换。
+
+DNSPod 传统 Token API 只支持主账号 Token；如果使用腾讯云 SecretId/SecretKey，需要后续增加腾讯云 API 3.0 Provider，不能直接填入当前向导。
 
 ### 自动切换规则
 
@@ -225,17 +244,17 @@ sudo ep controller master-install --state /etc/emby-proxy/controller.json \
 这是**单活动节点的 DNS 故障切换**，不是同时向多台服务器分摊请求。API 回读成功只确认 Cloudflare 记录，客户端缓存和已有播放连接不会立刻迁移。
 本轮逻辑回归不等于真实 VPS、证书签发或播放器无缝切换验收。
 
-## 备用节点自动证书（实验版）
+## 主控与备用节点自动 HTTPS（实验版）
 
 主控菜单：**1 配置入口 → 8 配置自动证书 → 3 添加边缘节点**。
 
-开始前，给主控准备一个独立域名，例如 `control.example.com`，A 记录指向主控 VPS，放行 TCP **19090**。它不能与业务入口域名相同。首版不会自动创建/覆盖这条 A 记录；不需要为了证书切换业务 DNS。
+开始前，给主控准备一个独立域名，例如 `control.example.com`，A 记录指向主控 VPS，不能与业务入口域名相同。DNSPod/其他 DNS 模式放行 TCP **80/443**；Cloudflare 原生 DNS-01 模式放行 TCP **19090**。首版不会自动创建/覆盖这条 A 记录。
 
-选 8 后只需填写主控域名并确认。脚本复用本地 Cloudflare Token，安装 Certbot/Cloudflare DNS 插件，通过 DNS-01 分别签发入口和主控证书，启动本项目的 HTTPS 主控服务，不接管已有 80/443 Web 服务。Token 应限制到所需 Zone，需有 DNS 编辑及域名发现所需读取权限。
+选 8 后只需填写主控域名并确认。若入口使用 DNSPod 或未配置 Cloudflare Token，脚本会检查现有 Caddy，备份并追加带标记的主控站点，执行 `caddy fmt/validate` 后 reload；Caddy 通过 HTTP-01 在 443 自动申请/续期证书，主控服务只监听 `127.0.0.1:19090`。若入口使用 Cloudflare Token，则复用 Certbot DNS-01 分别签发入口和主控证书，主控直接启用原生 TLS。Token 应限制到所需 Zone，需有 DNS 编辑及域名发现所需读取权限。
 
 边缘仍复制选 3 生成的一条命令：自动注册 → 通过 HTTPS 领取证书 → 安装 Caddy/Nginx 托管入口 → 上报 HTTPS 健康状态。Cloudflare Token 不发送给边缘；只有同一入口的证书和私钥会在该组节点共享。任一节点私钥泄漏时应轮换整组入口证书。
 
-- 主控每 12 小时检查续期，边缘每小时检查新证书；独立 systemd 任务，不阻塞心跳。
+- 主控每 12 小时检查续期（Caddy 证书由 Caddy 自己续期），边缘每小时检查新证书；独立 systemd 任务，不阻塞心跳。
 - 校验域名、私钥、有效期和信任链后才替换。下载失败保留旧证书；配置验证/重载失败恢复旧证书并提示服务恢复结果。
 - 菜单 4 查看节点证书同步状态与到期时间；菜单 9 手动同步本机边缘证书。
 - 已有 HTTP 节点不会自动迁移：切换主控到 HTTPS 前应安排重新接入，避免所有心跳同时中断。
@@ -244,7 +263,11 @@ sudo ep controller master-install --state /etc/emby-proxy/controller.json \
 高级命令：
 
 ```bash
-# 会安装依赖、签发证书并启动主控 HTTPS；不修改业务 A 记录
+# DNSPod/其他 DNS：Caddy 443 -> 127.0.0.1:19090，自动 HTTP-01 证书
+sudo ep controller https-proxy-setup --state /etc/emby-proxy/controller.json \
+  --control-domain control.example.com
+
+# Cloudflare：安装依赖、签发证书并启动主控原生 HTTPS
 sudo ep controller cert-setup --state /etc/emby-proxy/controller.json \
   --control-domain control.example.com --install-deps
 sudo ep controller cert-renew --state /etc/emby-proxy/controller.json

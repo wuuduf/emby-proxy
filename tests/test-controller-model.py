@@ -139,6 +139,17 @@ class ControllerTests(unittest.TestCase):
         self.assertIn('engine-preflight', out.getvalue())
         self.assertIn(') && sudo ep', out.getvalue())
 
+    def test_issue_uses_saved_controller_domain_when_url_omitted(self):
+        self.state['control_domain'] = 'control.example.com'
+        self.path.write_text(json.dumps(self.state))
+        args = SimpleNamespace(state=str(self.path), node_id='edge-domain', public_ip='192.0.2.11',
+            controller_url='', name='domain-edge', priority=100, quota_bytes=0)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            ns['issue'](args)
+        self.assertIn('--controller-url http://control.example.com:19090', out.getvalue())
+        self.assertEqual(json.loads(self.path.read_text())['controller_url'], 'http://control.example.com:19090')
+
     def test_edge_ip_detection_is_bounded_and_tls_verified(self):
         with patch.object(ns['subprocess'], 'run', return_value=SimpleNamespace(stdout='8.8.8.8\n')) as run:
             self.assertEqual(ns['resolve_edge_ipv4'](''), '8.8.8.8')
@@ -174,6 +185,20 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(self.controller.revoke({'node_id': 'edge-a'}, result['node_token'])[0], 200)
         self.assertNotIn('edge-a', self.controller.state['nodes'])
+
+    def test_init_stores_dedicated_controller_domain_and_rejects_collision(self):
+        target = Path(self.temp.name) / 'init.json'
+        args = SimpleNamespace(state=str(target), entry_id='', domain='test.example.com',
+                               source='https://origin.example.com', engine='caddy',
+                               control_domain='control.example.com', zone_id=None,
+                               record_id=None, token_file=None, force=False)
+        with redirect_stdout(io.StringIO()):
+            ns['init_state'](args)
+        self.assertEqual(json.loads(target.read_text())['control_domain'], 'control.example.com')
+        args.control_domain = 'test.example.com'
+        args.force = True
+        with self.assertRaisesRegex(RuntimeError, '不能与业务入口域名相同'):
+            ns['init_state'](args)
 
     def test_master_install_checks_restart_and_failure(self):
         args = SimpleNamespace(state=str(self.path), listen='127.0.0.1:19090', reconcile_interval=30)
