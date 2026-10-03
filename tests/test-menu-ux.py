@@ -32,7 +32,7 @@ class MenuUX(unittest.TestCase):
     def test_init_minimal_defaults_and_retry(self):
         self.state.unlink()
         r = self.run_menu('controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_init_menu',
-                          'bad domain\nTEST.EXAMPLE.COM\norigin.example.com:8443\n\nn\n\n')
+                          'bad domain\nTEST.EXAMPLE.COM\norigin.example.com:8443\n\n\nn\n\n')
         self.assertEqual(r.returncode, 0, r.stderr)
         for arg in ['domain-test.example.com', 'test.example.com', 'https://origin.example.com:8443', 'caddy']:
             self.assertIn('ARG:' + arg + '\n', r.stdout)
@@ -49,7 +49,7 @@ class MenuUX(unittest.TestCase):
         (self.home / 'cf.token').write_text('fixture-token\n')
         r = self.run_menu('controller_cf_discover_ids() { printf "zone-id\\trecord-id"; }; '
                           'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_init_menu',
-                          'test.example.com\norigin.example.com\n\n\n')
+                          'test.example.com\norigin.example.com\n\n\n\n')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('自动沿用本地 600 权限文件', r.stdout)
         self.assertNotIn('API Token（输入隐藏', r.stdout)
@@ -59,7 +59,7 @@ class MenuUX(unittest.TestCase):
     def test_init_persists_dedicated_controller_domain(self):
         self.state.unlink()
         r = self.run_menu('controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_init_menu',
-                          'test.example.com\norigin.example.com\ncontrol.example.com\nn\n')
+                          'test.example.com\norigin.example.com\ncontrol.example.com\n\nn\n')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('ARG:--control-domain\nARG:control.example.com\n', r.stdout)
         self.assertIn('主控域名：control.example.com', r.stdout)
@@ -89,7 +89,7 @@ class MenuUX(unittest.TestCase):
     def test_issue_advanced_quota_and_ip_retry(self):
         r = self.run_menu("curl() { printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
                           'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_issue_menu',
-                          'https://control.example.com\ny\n香港线路\n50\nnope\n5\ninvalid\n1.5\n999.2.3.4\n192.0.2.10\n')
+                          'https://control.example.com\n\ny\n香港线路\n50\nnope\n5\ninvalid\n1.5\n999.2.3.4\n192.0.2.10\n')
         self.assertEqual(r.returncode, 0, r.stderr)
         for arg in ['香港线路', '50', '1649267441664', '192.0.2.10']:
             self.assertIn('ARG:' + arg + '\n', r.stdout)
@@ -123,7 +123,7 @@ class MenuUX(unittest.TestCase):
     def test_issue_advanced_unlimited_still_reads_ip(self):
         r = self.run_menu("curl() { printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
                           'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_issue_menu',
-                          'https://control.example.com\ny\n线路\n100\n0\n192.0.2.10\n')
+                          'https://control.example.com\n\ny\n线路\n100\n0\n192.0.2.10\n')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('ARG:--quota-bytes\nARG:0\n', r.stdout)
         self.assertIn('ARG:--public-ip\nARG:192.0.2.10\n', r.stdout)
@@ -138,7 +138,7 @@ class MenuUX(unittest.TestCase):
         for quota_input in ['q\n', '4\nq\n', '4\n', '']:
             r = self.run_menu("curl() { printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
                               'controller_cli() { echo SHOULD_NOT_ISSUE; }; controller_issue_menu',
-                              'https://control.example.com\ny\n线路\n100\n' + quota_input)
+                              'https://control.example.com\n\ny\n线路\n100\n' + quota_input)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertNotIn('SHOULD_NOT_ISSUE', r.stdout)
 
@@ -254,6 +254,53 @@ class MenuUX(unittest.TestCase):
         self.assertIn('ARG:https-proxy-setup',r.stdout)
         self.assertNotIn('ARG:cert-setup',r.stdout)
         self.assertIn('80/443',r.stdout)
+
+    def test_cloudflare_pool_menu_refreshes_records_and_saves_weights(self):
+        token = self.home / 'cf.token'
+        token.write_text('fixture-token')
+        self.data['dns'] = {'provider': 'cloudflare', 'token_file': str(token),
+                            'record_id': 'record-a', 'record_ids': ['record-a']}
+        self.data['nodes'] = {
+            'edge-a': {'name': 'A', 'priority': 100},
+            'edge-b': {'name': 'B', 'priority': 50}}
+        self.state.write_text(json.dumps(self.data))
+        r = self.run_menu(
+            'controller_cf_discover_ids() { printf "zone-id\\trecord-a\\trecord-a,record-b"; }; '
+            'controller_cli() { printf "ARG:%s\\n" "$@"; '
+            'if [[ "$1" == set-records ]]; then jq \' .dns.record_ids=["record-a","record-b"] \' "$EMBY_PROXY_STATE_HOME/controller.json" > "$EMBY_PROXY_STATE_HOME/.tmp" && mv "$EMBY_PROXY_STATE_HOME/.tmp" "$EMBY_PROXY_STATE_HOME/controller.json"; fi; }; '
+            'controller_pool_menu',
+            'y\nedge-a=80,edge-b=20\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('ARG:set-records', r.stdout)
+        self.assertIn('ARG:--record-ids', r.stdout)
+        self.assertIn('ARG:set-pool', r.stdout)
+        self.assertIn('ARG:--weight\nARG:edge-a=80', r.stdout)
+
+    def test_schedule_menu_passes_multiple_time_slots(self):
+        self.data['dns'] = {'provider': 'cloudflare'}
+        self.data['nodes'] = {'edge-a': {'name': 'A'}, 'edge-b': {'name': 'B'}}
+        self.state.write_text(json.dumps(self.data))
+        r = self.run_menu(
+            'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_schedule_menu',
+            '00:00|edge-a=80,edge-b=20;08:00|edge-a=20,edge-b=80\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('ARG:set-schedule', r.stdout)
+        self.assertIn('ARG:--provider\nARG:cloudflare', r.stdout)
+        self.assertIn('ARG:--slot\nARG:00:00|edge-a=80,edge-b=20', r.stdout)
+        self.assertIn('ARG:--slot\nARG:08:00|edge-a=20,edge-b=80', r.stdout)
+
+    def test_dnspod_pool_menu_passes_line_and_weights(self):
+        self.data['dns'] = {'provider': 'dnspod', 'line_records': {
+            '默认': [{'record_id': '101'}, {'record_id': '102'}]}}
+        self.data['nodes'] = {'edge-a': {'name': 'A'}, 'edge-b': {'name': 'B'}}
+        self.state.write_text(json.dumps(self.data))
+        r = self.run_menu(
+            'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_dnspod_pool_menu',
+            '默认\nedge-a=80,edge-b=20\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('ARG:set-line-pool', r.stdout)
+        self.assertIn('ARG:--line\nARG:默认', r.stdout)
+        self.assertIn('ARG:--weight\nARG:edge-a=80', r.stdout)
 
 
 if __name__ == '__main__':

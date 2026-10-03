@@ -2,7 +2,7 @@
 
 ## 2026-09-30：DNSPod 运营商线路第一阶段（本地实现）
 
-- 新增 DNSPod Token API Provider：只读发现最长托管区域、子域名和 `默认/电信/联通/移动` 四条 IPv4 A 记录；接入前检查 NS 委派，脚本不修改父域 NS、不创建或删除业务记录。
+- 新增 DNSPod Token API Provider：只读发现最长托管区域、子域名和 `默认/电信/联通/移动` 四条 A/AAAA 记录；接入前检查 NS 委派，脚本不修改父域 NS、不创建或删除业务记录。
 - 控制器逐条用 `Record.Info` 校验记录身份、线路、类型、启用状态和无权重/监控，修改后再次回读；单条失败独立重试，不能把部分成功报告成全部成功。
 - 菜单新增 `11 → 10 DNSPod 运营商线路`：接入预览/确认、线路绑定、状态和立即同步。Token 只在主控保存 0600 文件；边缘不接触 DNS 凭据。
 - 每条线路可指定节点；指定节点健康/配额不满足时回退到健康候选。新增离线回归覆盖 API 参数不泄漏、线路回读、故障回退和记录缺失拒绝。
@@ -115,4 +115,69 @@
 - 已有完全匹配的手工 `domain { reverse_proxy 127.0.0.1:19090 }` 会被安全标记并复用；同域非脚本站点拒绝覆盖。Caddyfile 与状态均先备份，失败恢复。
 - 菜单 8 按 DNS Provider 分流：Cloudflare 保留 Certbot DNS-01，DNSPod/其他 DNS 走 Caddy HTTP-01；新增单测覆盖幂等、冲突和菜单分支。
 - 本地 `python3 scripts/check.py`：13/13 suites passed。DNSPod 测试主控的 Caddy 443、Let’s Encrypt、HTTPS `/status` 与双边缘心跳已用手工流程验证；本轮代码尚未重新部署主控 VPS（SSH 当前被 Fail2ban 重置）。
+
+## 本轮：Cloudflare 多记录权重池（本地实现）
+
+- Cloudflare 状态现在保存全部同名 A 记录 ID；旧的单 `record_id` 状态继续兼容。
+- 新增控制器菜单 `11 Cloudflare 多节点权重`：重新发现记录池、输入 `节点 ID=权重`，主控按记录槽位展开权重，逐条 PUT 与 GET 回读。
+- 健康检查失败、心跳过期或配额用完的节点会从活动池摘除；恢复后可重新进入权重池。部分 DNS 更新失败会保留待确认状态并在下一轮重试。
+- DNSPod 同线路多记录在本轮后续阶段接入，Cloudflare 的旧单记录状态继续兼容。
+- 本地 `python3 scripts/check.py`：13/13 suites passed。
+
+## 本轮：Cloudflare/DNSPod 定时策略（本地实现）
+
+- 新增 `controller set-schedule` / `clear-schedule` 和菜单 `12 定时调度策略`。
+- Cloudflare 档位保存权重集合；DNSPod 档位保存运营商线路到节点映射。控制器按本地时间选择最近档位，跨午夜沿用前一天最后档位。
+- 定时策略只改变候选集合，健康检查、心跳过期和配额摘除仍优先；DNS 更新仍逐条回读确认。
+- 新增档位解析、跨午夜、DNSPod 线路覆盖和菜单多档位回归；本地完整检查继续保持 13/13 suites passed。
 - 尚未做公网 ACME/systemd/Caddy/Nginx/VPS 验收；旧 HTTP 节点需安排迁移，不能原地无缝切到新控制域名；完整跨服务安装回滚仍有边界。
+
+## 本轮：DNSPod 同线路多记录权重（本地实现）
+
+- DNSPod 发现允许 `默认/电信/联通/移动` 每种线路存在多条启用 A 记录，同时保留旧版单记录状态格式。
+- 新增 DNSPod 子菜单 `5 同线路多节点权重` 和 `set-line-pool` CLI；按记录槽位将节点权重展开，健康、心跳和配额筛选优先于权重。
+- 每条记录修改前校验 ID、线路、类型、状态和监控标记，修改后逐条 `Record.Info` 回读；部分失败保留线路待确认并在下一轮重试。
+- 补充发现、分配、逐条更新、回读失败和菜单路径离线测试；当前只完成本地逻辑验证，尚未在真实 DNSPod/VPS 上执行生产切换。
+
+## 本轮：边缘节点 IPv4/IPv6 地址族（本地实现）
+
+- 主控入口新增固定 `address_family`：IPv4 使用 A，IPv6 使用 AAAA；注册码、边缘心跳和 DNS 回读必须匹配，避免同一入口混用。
+- 边缘自动检测按类型调用 `curl -4`/`curl -6`，手动地址分别校验公网 IPv4/IPv6；节点状态和心跳保存地址类型。
+- Cloudflare、DNSPod 发现与更新支持 AAAA；Caddy 使用 `bind 0.0.0.0`/`bind ::`，Nginx 仅生成所选地址族监听，健康检查同步使用对应回环地址。
+- 已补充地址类型冲突、AAAA 回读、Caddy/Nginx 单栈监听测试；仍需真实双栈 VPS、Cloudflare/DNSPod 和证书验收。
+
+## 本轮：Telegram 运维通知与查询（本地实现）
+
+- 主控新增 Telegram 出站长轮询服务、Chat ID 白名单、节点异常/恢复/配额/DNS 切换通知。
+- 边缘心跳上报最近 5 分钟有界聚合指标；Bot 提供 `/status`、`/nodes`、`/traffic`、`/access`、`/devices`、`/origins` 和 `/help` 只读命令。
+- Token 独立保存为 600 权限文件，服务使用 systemd，卸载时删除脚本托管的 Bot 单元；新增离线指标、脱敏和命令渲染测试。
+- 后续审查补充了 Bot Token 重定向保护、托管 unit 真正重启/失败回滚、遥测按需启用、有限尾部日志采样、UTF-16 消息分片和本地告警 outbox；详见 `docs/PROJECT-AUDIT.md`。
+- 继续审查补充了 Bot Token 轮换时隔离 Telegram offset、逐 Chat 授权复核、按 Chat 确认的告警 outbox、限流退避、过期心跳告警、过期摘要不计入最近流量，以及用量 v2 原子检查点和多种轮转归档补偿。
+- 尚未使用真实 Telegram Bot Token 或 VPS 验收，需在测试主控上配置自己的 Token/Chat ID 后验证网络、权限和日志轮转行为。
+
+## 本轮：Telegram 新鲜度、锁文件与失败事务收口
+
+- `/access`、`/devices` 查询现在过滤过期心跳摘要；状态文件中的异常计数、优先级或时间字段会降级为安全默认值，不会让 Bot 进程崩溃。
+- 状态锁、轮询锁和用量锁使用私有权限并拒绝跟随符号链接；证书凭据和托管证书标记也不会覆盖符号链接目标。
+- 主控、边缘节点和证书定时器在首次安装的后续 systemd 步骤失败时停止/禁用本次新建单元，避免恢复文件后留下孤儿服务。
+- 新增/更新离线回归：Telegram runtime 10 项、state/unit safety 13 项；仍未连接真实 VPS、DNS 或 Telegram。
+
+## 本轮：配置原子替换与卸载链接保护
+
+- 主控 Caddyfile 写入改为拒绝符号链接、保留原权限、文件与目录 `fsync` 后 `os.replace`；避免半写配置和误改链接目标。
+- Bash 全局配置锁采用私有创建、`noclobber` 与符号链接拒绝；卸载遇到 Caddy/Nginx 配置链接时只保留并提醒，不触碰原站文件。
+- systemd/证书回滚会保留备份文件权限；新增配置链接和原子写入回归，最终 `scripts/check.py` 已通过 22/22 套测试。
+
+## 本轮：安装目标边界与状态迁移收口
+
+- 安装器写入前拒绝目标/父目录符号链接和非普通文件；兼容 macOS 的 `/etc`、`/tmp`、`/var` 系统链接，避免测试环境误报。
+- Nginx Certbot 续期钩子采用脚本归属标记、临时文件原子安装；已有非脚本钩子不会被覆盖，卸载只删除带标记的钩子。
+- 管理索引规范化保留 `address_family` 与集中证书 `tls_directory`，避免打开菜单后丢失 IPv6/共享证书配置。
+
+## 本轮：真实多机 Cloudflare / DNSPod 验收
+
+- 在授权测试 VPS 上完成 Cloudflare 主控、集中证书、边缘自动注册、Caddy 反代、心跳/配额故障切换；停止高优先级节点后 A 记录切到备用节点，恢复并满足防抖窗口后切回。
+- 发现并修复 Cloudflare 普通 DNS 权重池的实际限制：同名同类型记录不能重复同一 IP，80/20 槽位展开会触发 API `81058`。现在在 PUT 前拒绝不可表示的权重，避免“部分写入 + 待确认”状态；需要精确权重时使用 Cloudflare Load Balancing 或支持权重的 DNS 服务。
+- 使用 DNSPod 实际完成区域/NS 委派检查、四条运营商线路接管、Nginx 边缘证书申请、HTTPS 健康检查和逐线路记录回读；源站返回 403 仍按“回源可达”处理，健康端点返回 200。
+- 验证了两台双栈 VPS 的 IPv6 出口可达性；IPv6 入口与 IPv4 入口必须分开建状态/记录，不能在同一入口混用地址族。公网双栈环境还需分别放行对应端口并准备 AAAA 记录。
+- 测试中保留了带日期后缀的 Cloudflare/DNSPod 临时记录及对应控制域名；正式使用前应删除或改名。临时控制器端口已停止，正式 Cloudflare 主控服务仍在运行。

@@ -13,9 +13,12 @@ readonly CADDYFILE="${EMBY_PROXY_CADDYFILE:-/etc/caddy/Caddyfile}"
 readonly NGINX_CONF_DIR="${EMBY_PROXY_NGINX_CONF_DIR:-/etc/nginx/conf.d}"
 readonly NGINX_LEGACY_CONFIG="${EMBY_PROXY_NGINX_LEGACY_CONFIG:-/etc/nginx/conf.d/emby-proxy-managed.conf}"
 readonly NGINX_HASH_CONFIG="${EMBY_PROXY_NGINX_HASH_CONFIG:-/etc/nginx/conf.d/00-emby-proxy-hash.conf}"
+readonly NGINX_RENEW_HOOK="${EMBY_PROXY_NGINX_RENEW_HOOK:-/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh}"
 readonly NGINX_ACME_ROOT="${EMBY_PROXY_NGINX_ACME_ROOT:-/var/www/emby-proxy-acme}"
 readonly CADDY_LOG_DIR="${EMBY_PROXY_CADDY_LOG_DIR:-/var/log/caddy}"
 readonly NGINX_LOG_DIR="${EMBY_PROXY_NGINX_LOG_DIR:-/var/log/nginx}"
+readonly TELEGRAM_UNIT="${EMBY_PROXY_TELEGRAM_UNIT:-/etc/systemd/system/emby-proxy-telegram.service}"
+readonly LOCK_FILE="${EMBY_PROXY_LOCK_FILE:-/run/lock/emby-proxy.lock}"
 readonly OS_RELEASE_FILE="${EMBY_PROXY_OS_RELEASE_FILE:-/etc/os-release}"
 readonly HEALTH_PATH="/_emby_proxy_health"
 readonly INSTALLED_BACKEND="${EMBY_PROXY_INSTALLED_BACKEND:-/usr/local/lib/emby-proxy/setup-emby-proxy.sh}"
@@ -122,6 +125,8 @@ Emby Reverse Proxy Manager $VERSION
   sudo emby-proxy update [--check]        检查或安装管理器更新
   sudo emby-proxy uninstall [--yes]       干净卸载脚本（保留 Caddy/Nginx 和证书）
   sudo emby-proxy controller ...         多线路控制器（实验版）
+  controller telegram-config|telegram-test|telegram-status
+                                          Telegram 运维通知（仅主控）
   emby-proxy version
 
 日志模式：
@@ -179,6 +184,7 @@ normalize_state_registry() {
     jq '{
       schema_version:2,
       id,engine,domain,listen_port,entry_type,public_url,managed_kind,config_file,
+      address_family,tls_directory,
       created_at,updated_at,routes
     }' "$file" >"$temp"
     if cmp -s "$file" "$temp"; then
@@ -192,8 +198,18 @@ normalize_state_registry() {
 
 acquire_lock() {
   command -v flock >/dev/null 2>&1 || return 0
-  mkdir -p /run/lock
-  exec {LOCK_FD}>/run/lock/emby-proxy.lock
+  [[ ! -L "$LOCK_FILE" ]] || die "脚本锁文件是符号链接，拒绝继续：$LOCK_FILE"
+  install -d -m 0755 "$(dirname -- "$LOCK_FILE")"
+  if [[ ! -e "$LOCK_FILE" ]]; then
+    # noclobber makes the first creation fail rather than follow an existing
+    # path introduced between the existence check and redirection.
+    (umask 077; set -o noclobber; : >"$LOCK_FILE") 2>/dev/null ||
+      die "无法安全创建脚本锁文件：$LOCK_FILE"
+  fi
+  [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]] || die "脚本锁文件不是普通文件，拒绝继续：$LOCK_FILE"
+  # Append/open never truncates the lock target. The explicit symlink checks
+  # above make a malicious replacement fail closed instead of touching data.
+  exec {LOCK_FD}>>"$LOCK_FILE"
   flock -n "$LOCK_FD" || die "另一个 emby-proxy 配置任务正在运行，请稍后重试。"
 }
 
@@ -376,9 +392,12 @@ doctor_config_quiet() {
 }
 
 doctor_certificate() {
-  local domain="$1" port="${2:-443}" pem enddate
+  local domain="$1" port="${2:-443}" family="${3:-ipv4}" pem enddate connect_host
   command -v openssl >/dev/null 2>&1 || { doctor_warn "${domain}：缺少 openssl，未检查证书。"; return; }
-  pem="$(timeout 8 openssl s_client -connect "127.0.0.1:$port" -servername "$domain" -showcerts </dev/null 2>/dev/null || true)"
+  case "$family" in ipv4|ipv6) ;; *) family=ipv4 ;; esac
+  connect_host="127.0.0.1"
+  [[ "$family" == ipv6 ]] && connect_host='[::1]'
+  pem="$(timeout 8 openssl s_client -connect "$connect_host:$port" -servername "$domain" -showcerts </dev/null 2>/dev/null || true)"
   enddate="$(openssl x509 -noout -enddate 2>/dev/null <<<"$pem" | sed 's/^notAfter=//' || true)"
   if [[ -n "$enddate" ]] && openssl x509 -noout -checkend 604800 >/dev/null 2>&1 <<<"$pem"; then
     doctor_ok "${domain}：证书有效且至少还有 7 天（到期 ${enddate}）。"
@@ -390,18 +409,29 @@ doctor_certificate() {
 }
 
 doctor_dns() {
-  local domain="$1" public_ipv4="$2" records
+  local domain="$1" family="${2:-ipv4}" public_ip="${3:-}" records record_type
+  case "$family" in ipv4|ipv6) ;; *) family=ipv4 ;; esac
+  record_type="A"
+  [[ "$family" == ipv6 ]] && record_type="AAAA"
   if command -v dig >/dev/null 2>&1; then
-    records="$(dig +time=3 +tries=1 +short A "$domain" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u | paste -sd, - || true)"
+    if [[ "$family" == ipv6 ]]; then
+      records="$(dig +time=3 +tries=1 +short AAAA "$domain" 2>/dev/null | grep ':' | sort -u | paste -sd, - || true)"
+    else
+      records="$(dig +time=3 +tries=1 +short A "$domain" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u | paste -sd, - || true)"
+    fi
   else
-    records="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd, - || true)"
+    if [[ "$family" == ipv6 ]]; then
+      records="$(getent ahostsv6 "$domain" 2>/dev/null | awk '{print $1}' | grep ':' | sort -u | paste -sd, - || true)"
+    else
+      records="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd, - || true)"
+    fi
   fi
   if [[ -z "$records" ]]; then
-    doctor_error "${domain}：未解析到 IPv4 A 记录。"
-  elif [[ -n "$public_ipv4" && ",$records," != *",$public_ipv4,"* ]]; then
-    doctor_warn "${domain}：A 记录为 ${records}，与检测到的本机公网 IPv4 $public_ipv4 不同（如使用 CDN 可忽略）。"
+    doctor_error "${domain}：未解析到 ${family} ${record_type} 记录。"
+  elif [[ -n "$public_ip" && ",$records," != *",$public_ip,"* ]]; then
+    doctor_warn "${domain}：${record_type} 记录为 ${records}，与检测到的本机公网 ${family} $public_ip 不同（如使用 CDN 可忽略）。"
   else
-    doctor_ok "${domain}：DNS A 记录 ${records}。"
+    doctor_ok "${domain}：DNS ${record_type} 记录 ${records}。"
   fi
 }
 
@@ -422,7 +452,7 @@ doctor_firewall() {
 }
 
 doctor_site() {
-  local file="$1" id engine config port code path upstream upstream_code domain public_ipv4="$2"
+  local file="$1" id engine config port code path upstream upstream_code domain family public_ip="${3:-}" public_ipv4="${2:-}"
   id="$(jq -r '.id' "$file")"; engine="$(jq -r '.engine' "$file")"
   config="$(jq -r '.config_file' "$file")"
   printf '\n%s入口：%s%s\n' "$BOLD" "$id" "$RESET"
@@ -432,8 +462,14 @@ doctor_site() {
   if systemctl is-active --quiet "$engine" 2>/dev/null; then doctor_ok "$engine 服务运行中。"; else doctor_error "$engine 服务未运行。"; fi
   doctor_config_quiet "$engine" && doctor_ok "$engine 完整配置验证通过。" || doctor_error "$engine 完整配置验证失败。"
   domain="$(jq -r '.domain' "$file")"; port="$(site_listen_port "$file")"
-  doctor_dns "$domain" "$public_ipv4"
-  doctor_certificate "$domain" "$port"
+  family="$(jq -r '.address_family // "ipv4"' "$file")"
+  if [[ "$family" == ipv6 ]]; then
+    doctor_dns "$domain" ipv6 "$public_ip"
+    doctor_certificate "$domain" "$port" ipv6
+  else
+    doctor_dns "$domain" ipv4 "$public_ipv4"
+    doctor_certificate "$domain" "$port" ipv4
+  fi
   if ss -H -lnt 2>/dev/null | awk -v port=":$port" '$4 ~ (port "$") {found=1} END{exit !found}'; then
     doctor_ok "TCP $port 正在监听。"
   else
@@ -457,7 +493,7 @@ doctor_site() {
 }
 
 run_doctor() {
-  local id="${1:-}" file public_ipv4="" os_name
+  local id="${1:-}" file public_ipv4="" public_ipv6="" os_name
   DOCTOR_OK=0; DOCTOR_WARN=0; DOCTOR_ERROR=0
   printf '%sEmby Proxy 运行诊断%s\n' "$BOLD" "$RESET"
   if [[ -r "$OS_RELEASE_FILE" ]]; then
@@ -470,10 +506,12 @@ run_doctor() {
   fi
   public_ipv4="$(curl -4 --noproxy '*' -fsS --connect-timeout 3 --max-time 6 https://api.ipify.org 2>/dev/null || true)"
   [[ -n "$public_ipv4" ]] && doctor_ok "本机公网 IPv4：$public_ipv4" || doctor_warn "无法自动检测本机公网 IPv4。"
+  public_ipv6="$(curl -6 --noproxy '*' -fsS --connect-timeout 3 --max-time 6 https://api64.ipify.org 2>/dev/null || true)"
+  [[ -n "$public_ipv6" ]] && doctor_ok "本机公网 IPv6：$public_ipv6" || doctor_warn "无法自动检测本机公网 IPv6（IPv4-only VPS 可忽略）。"
   if [[ -n "$id" ]]; then
-    file="$(require_site "$id")"; doctor_site "$file" "$public_ipv4"
+    file="$(require_site "$id")"; doctor_site "$file" "$public_ipv4" "$public_ipv6"
   else
-    while IFS= read -r file; do doctor_site "$file" "$public_ipv4"; done < <(find "$SITES_DIR" -type f -name 'domain-*.json' -print | sort)
+    while IFS= read -r file; do doctor_site "$file" "$public_ipv4" "$public_ipv6"; done < <(find "$SITES_DIR" -type f -name 'domain-*.json' -print | sort)
     (( $(site_count) > 0 )) || doctor_warn "没有管理索引；可运行 emby-proxy import。"
   fi
   printf '\n诊断汇总：正常 %s，提醒 %s，错误 %s\n' "$DOCTOR_OK" "$DOCTOR_WARN" "$DOCTOR_ERROR"
@@ -722,7 +760,7 @@ import_existing() {
 }
 
 run_backend_for_state() {
-  local file="$1" backend engine domain port kind path upstream i
+  local file="$1" backend engine domain port kind family path upstream i
   local -a args=()
   backend="$(backend_path)"
   engine="$(jq -r '.engine' "$file")"
@@ -730,6 +768,8 @@ run_backend_for_state() {
   args+=(--engine "$engine")
   domain="$(jq -r '.domain' "$file")"; port="$(site_listen_port "$file")"
   args+=(--domain "$domain")
+  family="$(jq -r '.address_family // empty' "$file")"
+  [[ -z "$family" ]] || args+=(--address-family "$family")
   local tls_directory
   tls_directory="$(jq -r '.tls_directory // empty' "$file")"
   [[ -z "$tls_directory" ]] || args+=(--tls-directory "$tls_directory" --skip-dns-check)
@@ -924,6 +964,7 @@ backup_clean() {
 apply_caddy_removal() {
   local id="$1" target="$2" candidate="$3" backup staged
   [[ -f "$target" ]] || die "Caddy 配置文件不存在：$target"
+  [[ ! -L "$target" ]] || die "Caddy 配置是符号链接，拒绝自动修改：$target"
   target="$(readlink -f "$target")"
   backup="$(backup_target "$id" "$target")"
   staged="$(mktemp "${target}.emby-candidate.XXXXXX")"
@@ -1006,6 +1047,7 @@ delete_site() {
     apply_caddy_removal "$id" "$target" "$candidate"; rm -f "$candidate"
   else
     [[ -f "$target" ]] || die "Nginx 配置文件不存在：$target"
+    [[ ! -L "$target" ]] || die "Nginx 配置是符号链接，拒绝自动删除：$target"
     backup="$(backup_target "$id" "$target")"; rm -f "$target"
     domain="$(jq -r '.domain' "$file")"
     while IFS= read -r state; do
@@ -1106,13 +1148,15 @@ ensure_short_command() {
 }
 
 uninstall_archive() {
-  local backup_root="$1" timestamp="$2" archive="$backup_root/emby-proxy-uninstall-$timestamp.tar.gz" sha items=() file
+  local backup_root="$1" timestamp="$2" archive sha items=() file
+  archive="$backup_root/emby-proxy-uninstall-$timestamp.tar.gz"
   install_managed_dir 0750 "$backup_root"
   # 只打包脚本明确管理的路径；不会把整台机器或 Caddy/Nginx 证书带走。
   for file in "$STATE_HOME" "$LEGACY_STATE_HOME" "$CADDYFILE" "$NGINX_LEGACY_CONFIG" "$NGINX_HASH_CONFIG" \
     "$NGINX_ACME_ROOT" "$MANAGER_BIN" "$LEGACY_MANAGER_BIN" "$SHORT_BIN" "$INSTALLED_BACKEND" "$MANAGER_LIBEXEC" \
     /etc/systemd/system/emby-proxy-master.service /etc/systemd/system/emby-proxy-node.service \
     /etc/systemd/system/emby-proxy-node.timer \
+    "$TELEGRAM_UNIT" "$NGINX_RENEW_HOOK" \
     /etc/systemd/system/emby-proxy-cert-renew.service /etc/systemd/system/emby-proxy-cert-renew.timer \
     /etc/systemd/system/emby-proxy-cert-sync.service /etc/systemd/system/emby-proxy-cert-sync.timer; do
     [[ -e "$file" || -L "$file" ]] && items+=("$file")
@@ -1136,16 +1180,17 @@ uninstall_archive() {
 
 uninstall_remove_caddy_markers() {
   local target="${1:-$CADDYFILE}" begin end begins ends temp saved
+  [[ ! -L "$target" ]] || { warn "Caddyfile 是符号链接，拒绝直接修改：$target"; return 0; }
   [[ -f "$target" ]] || return 0
-  begin="$(grep -Ec '^# BEGIN MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE):' "$target" 2>/dev/null || true)"
-  end="$(grep -Ec '^# END MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE):' "$target" 2>/dev/null || true)"
+  begin="$(grep -Ec '^# BEGIN MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE|PROXY CONTROLLER):' "$target" 2>/dev/null || true)"
+  end="$(grep -Ec '^# END MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE|PROXY CONTROLLER):' "$target" 2>/dev/null || true)"
   (( begin == 0 && end == 0 )) && return 0
   if (( begin != end )); then
     warn "Caddyfile 中脚本标记不完整，保留原文件：$target"
     return 0
   fi
   temp="$(mktemp /tmp/emby-proxy-uninstall-caddy.XXXXXX)"
-  awk '/^# BEGIN MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE):/{skip=1;next} /^# END MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE):/{if(skip){skip=0;next}} !skip{print}' "$target" >"$temp"
+  awk '/^# BEGIN MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE|PROXY CONTROLLER):/{skip=1;next} /^# END MANAGED EMBY (REVERSE PROXY|EXISTING ROUTE|PROXY CONTROLLER):/{if(skip){skip=0;next}} !skip{print}' "$target" >"$temp"
   saved="$(mktemp /tmp/emby-proxy-uninstall-caddy-old.XXXXXX)"; cp -a "$target" "$saved"
   cat "$temp" >"$target"; rm -f "$temp"
   if command -v caddy >/dev/null 2>&1 && ! caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1; then
@@ -1159,6 +1204,7 @@ uninstall_remove_caddy_markers() {
 
 uninstall_remove_nginx_owned_file() {
   local target="$1" marker="$2" saved
+  [[ ! -L "$target" ]] || { warn "Nginx 配置是符号链接，拒绝直接删除：$target"; return 0; }
   [[ -f "$target" ]] || return 0
   grep -F "$marker" "$target" >/dev/null 2>&1 || return 0
   saved="$(mktemp /tmp/emby-proxy-uninstall-nginx.XXXXXX)"; cp -a "$target" "$saved"; rm -f "$target"
@@ -1169,6 +1215,78 @@ uninstall_remove_nginx_owned_file() {
   fi
   rm -f "$saved"
   systemctl reload nginx >/dev/null 2>&1 || warn "Nginx 已清理，但 reload 失败，请手动检查服务。"
+}
+
+uninstall_remove_nginx_renew_hook() {
+  local target="${1:-$NGINX_RENEW_HOOK}"
+  [[ ! -L "$target" ]] || { warn "Certbot Nginx 续期钩子是符号链接，拒绝删除：$target"; return 0; }
+  [[ -f "$target" ]] || return 0
+  grep -Fx '# MANAGED EMBY-PROXY: Nginx renew hook' "$target" >/dev/null 2>&1 || {
+    warn "保留未确认归属的 Certbot Nginx 续期钩子：$target"; return 0;
+  }
+  rm -f -- "$target"
+}
+
+# The master/node units were written by the embedded controller before the
+# ownership marker was introduced.  Do not remove a same-name third-party
+# service: recognize only the exact command shape emitted by this project.
+# Telegram/certificate units use explicit markers and can be passed through
+# the same helper as well.
+uninstall_remove_owned_systemd_unit() {
+  local target="$1" kind="${2:-}" name
+  [[ -f "$target" ]] || return 0
+  case "$kind" in
+    master)
+      grep -Fq -- 'ExecStart=/usr/local/sbin/emby-proxy controller serve --state ' "$target" || {
+        warn "保留未确认归属的 systemd 单元：$target"; return 0;
+      }
+      ;;
+    node)
+      grep -Fq -- 'ExecStart=/usr/local/sbin/emby-proxy controller node --state /etc/emby-proxy/multiline-node.json' "$target" || {
+        warn "保留未确认归属的 systemd 单元：$target"; return 0;
+      }
+      ;;
+    node-timer)
+      grep -Fq -- 'Unit=emby-proxy-node.service' "$target" || {
+        warn "保留未确认归属的 systemd 单元：$target"; return 0;
+      }
+      grep -Fq -- 'OnCalendar=' "$target" || {
+        warn "保留未确认归属的 systemd 单元：$target"; return 0;
+      }
+      ;;
+    telegram)
+      grep -Fxq '# MANAGED EMBY TELEGRAM BOT' "$target" || {
+        warn "保留未确认归属的 systemd 单元：$target"; return 0;
+      }
+      ;;
+    certificate)
+      grep -Fq -- '# MANAGED EMBY CERTIFICATE' "$target" || {
+        warn "保留未确认归属的 systemd 单元：$target"; return 0;
+      }
+      ;;
+    *)
+      warn "未知的 systemd 归属类型，保留：$target"; return 0 ;;
+  esac
+  name="$(basename -- "$target")"
+  systemctl disable --now "$name" >/dev/null 2>&1 || true
+  rm -f -- "$target"
+}
+
+uninstall_remove_known_locks() {
+  # Removing an unlocked pathname is harmless; an active process keeps its FD.
+  # Only delete names created by this manager, never arbitrary *.lock files.
+  rm -f -- /run/lock/emby-proxy.lock
+  local root path
+  for root in "$STATE_HOME" "$LEGACY_STATE_HOME"; do
+    [[ -d "$root" ]] || continue
+    for path in \
+      "$root/controller.json.lock" "$root/controller.json.telegram.poll.lock" \
+      "$root/controller.json.cert-issue.lock" "$root/controller.json.https-proxy.lock" \
+      "$root/controller.json.sync.lock" "$root/multiline-node.json.lock" \
+      "$root/multiline-node.json.cert-issue.lock" "$root/usage.offset.lock"; do
+      rm -f -- "$path"
+    done
+  done
 }
 
 uninstall_manager() {
@@ -1214,6 +1332,7 @@ uninstall_manager() {
   fi
   uninstall_remove_nginx_owned_file "$NGINX_LEGACY_CONFIG" "MANAGED EMBY"
   uninstall_remove_nginx_owned_file "$NGINX_HASH_CONFIG" "MANAGED EMBY NGINX HASH CAPACITY"
+  uninstall_remove_nginx_renew_hook
   if [[ -d "$NGINX_CONF_DIR" ]]; then
     while IFS= read -r file; do
       uninstall_remove_nginx_owned_file "$file" "MANAGED EMBY SITE"
@@ -1225,19 +1344,19 @@ uninstall_manager() {
   if [[ "$NGINX_ACME_ROOT" == */emby-proxy-acme && -d "$NGINX_ACME_ROOT" ]] && ! find "$NGINX_ACME_ROOT" -type f -print -quit 2>/dev/null | grep -q .; then
     rm -rf -- "$NGINX_ACME_ROOT"
   fi
-  for file in /etc/systemd/system/emby-proxy-master.service /etc/systemd/system/emby-proxy-node.service /etc/systemd/system/emby-proxy-node.timer; do
-    systemctl disable --now "$(basename "$file")" >/dev/null 2>&1 || true
-    rm -f -- "$file"
-  done
+  uninstall_remove_owned_systemd_unit /etc/systemd/system/emby-proxy-master.service master
+  uninstall_remove_owned_systemd_unit /etc/systemd/system/emby-proxy-node.service node
+  uninstall_remove_owned_systemd_unit /etc/systemd/system/emby-proxy-node.timer node-timer
+  # A same-name Telegram unit may predate this installer.  Remove it only
+  # when our ownership marker is present; never delete a third-party service.
+  uninstall_remove_owned_systemd_unit "$TELEGRAM_UNIT" telegram
   for file in /etc/systemd/system/emby-proxy-cert-{renew,sync}.{timer,service}; do
-    if [[ -f "$file" ]] && grep -Fq '# MANAGED EMBY CERTIFICATE' "$file"; then
-      systemctl disable --now "$(basename "$file")" >/dev/null 2>&1 || true
-      rm -f -- "$file"
-    fi
+    uninstall_remove_owned_systemd_unit "$file" certificate
   done
   if [[ ! -L /etc/emby-proxy-tls && -f /etc/emby-proxy-tls/.managed-emby-certificates ]]; then
     rm -rf -- /etc/emby-proxy-tls
   fi
+  uninstall_remove_known_locks
   systemctl daemon-reload >/dev/null 2>&1 || true
   find "$CADDY_LOG_DIR" "$NGINX_LOG_DIR" -maxdepth 1 -type f -name 'emby-proxy-*-access.log' -delete 2>/dev/null || true
   if [[ -d "$STATE_HOME" && "$STATE_HOME" != "/" && "$STATE_HOME" != "/etc" && "$STATE_HOME" != "/var" && \
@@ -1252,7 +1371,9 @@ uninstall_manager() {
     unknown=0
     while IFS= read -r file; do
       case "$(basename "$file")" in
-        used_bytes|usage.offset) : ;;
+        used_bytes|usage.offset|usage.offset.lock|multiline-node.json.lock|multiline-node.json.cert-issue.lock|\
+        controller.json.lock|controller.json.telegram.poll.lock|controller.json.cert-issue.lock|\
+        controller.json.https-proxy.lock|controller.json.sync.lock) : ;;
         *) unknown=1; break ;;
       esac
     done < <(find "$LEGACY_STATE_HOME" -mindepth 1 -maxdepth 1 -print 2>/dev/null)
@@ -1512,9 +1633,10 @@ service_menu() {
 controller_cli() {
   command -v python3 >/dev/null 2>&1 || die "多线路功能需要 python3。"
   python3 - "$@" <<'PY'
-import argparse, copy, grp, hashlib, ipaddress, json, os, re, secrets, shlex, shutil, ssl, subprocess, sys, tempfile, threading, time
+import argparse, copy, grp, hashlib, ipaddress, json, math, os, re, secrets, shlex, shutil, socket, ssl, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.request
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
@@ -1534,15 +1656,69 @@ def now(): return int(time.time())
 def digest(v): return hashlib.sha256(v.encode()).hexdigest()
 def atomic_write(path, data):
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + '.tmp')
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-    # 控制器状态包含 Cloudflare token 的路径、节点令牌哈希和待用注册码。
-    # 临时文件受 umask 影响，替换前显式锁为 root/用户私有，避免 0644 泄漏。
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
+    # A fixed ``.tmp`` is both observable and racy when a heartbeat and the
+    # long-running controller update the same state.  Create the file with its
+    # private mode from the first byte, fsync it, then atomically replace the
+    # destination.  Replacing a symlink changes the link itself; it never
+    # follows it to overwrite an unrelated target.
+    payload = (json.dumps(data, indent=2, sort_keys=True) + '\n').encode()
+    fd = None; tmp = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix='.' + path.name + '.tmp-', dir=str(path.parent))
+        tmp = Path(tmp_name)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'wb') as out:
+            fd = None
+            out.write(payload); out.flush(); os.fsync(out.fileno())
+        os.replace(tmp, path)
+        # Persist the directory entry where supported.  Some test filesystems
+        # do not expose a directory fd; the durable-file write remains valid.
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try: os.fsync(dir_fd)
+            finally: os.close(dir_fd)
+        except OSError: pass
+    finally:
+        if fd is not None:
+            try: os.close(fd)
+            except OSError: pass
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+def atomic_text_write(path, content, mode=None):
+    """Atomically replace a text config without following a symlink."""
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise RuntimeError('拒绝覆盖符号链接形式的配置文件：%s' % path)
+    if mode is None:
+        try: mode = path.stat().st_mode & 0o777
+        except OSError: mode = 0o644
+    try: mode = int(mode) & 0o777
+    except (TypeError, ValueError): mode = 0o644
+    fd = None; tmp = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix='.' + path.name + '.tmp-', dir=str(path.parent))
+        tmp = Path(tmp_name)
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'w') as out:
+            fd = None
+            out.write(str(content)); out.flush(); os.fsync(out.fileno())
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try: os.fsync(dir_fd)
+            finally: os.close(dir_fd)
+        except OSError: pass
+    finally:
+        if fd is not None:
+            try: os.close(fd)
+            except OSError: pass
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 def backup_file(path):
     """Create a private, timestamped backup before an operator-level mutation."""
     path = Path(path)
+    if path.is_symlink():
+        raise RuntimeError('拒绝备份符号链接形式的受管文件：%s' % path)
     if not path.exists(): return None
     stamp = time.strftime('%Y%m%d-%H%M%S')
     backup = path.with_name(path.name + '.bak-' + stamp)
@@ -1555,20 +1731,49 @@ def backup_file(path):
     return backup
 def restore_file(path, backup):
     path = Path(path)
+    if path.is_symlink():
+        raise RuntimeError('拒绝恢复到符号链接形式的受管文件：%s' % path)
     if backup:
-        shutil.copy2(backup, path)
-        os.chmod(path, 0o600 if path.suffix == '.json' else 0o644)
+        if Path(backup).is_symlink():
+            raise RuntimeError('拒绝从符号链接备份恢复：%s' % backup)
+        # JSON state must remain private; for text configs/units retain the
+        # original backup mode instead of silently widening a 0640 Caddyfile
+        # to 0644 during rollback.
+        if path.suffix == '.json':
+            mode=0o600
+        else:
+            try: mode=Path(backup).stat().st_mode & 0o777
+            except OSError: mode=0o644
+        content=Path(backup).read_text()
+        atomic_text_write(path,content,mode)
     else:
         path.unlink(missing_ok=True)
 def write_unit(path, content):
     """Atomically install a systemd unit and return its previous-file backup."""
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise RuntimeError('拒绝覆盖符号链接形式的 systemd 单元：%s' % path)
+    if path.exists():
+        old = path.read_text(errors='replace')
+        managed = ('# MANAGED EMBY ' in old or
+                   ('ExecStart=/usr/local/sbin/emby-proxy controller serve --state ' in old and
+                    'Description=emby-proxy multiline master' in old) or
+                   ('ExecStart=/usr/local/sbin/emby-proxy controller node --state ' in old) or
+                   ('Unit=emby-proxy-' in old and 'OnCalendar=' in old))
+        if not managed:
+            raise RuntimeError('拒绝覆盖非脚本托管的 systemd 单元：%s' % path)
     backup = backup_file(path)
     tmp = path.with_name('.' + path.name + '.tmp-' + secrets.token_hex(6))
     try:
-        tmp.write_text(content)
-        os.chmod(tmp, 0o644)
+        with tmp.open('w') as out:
+            os.fchmod(out.fileno(), 0o644)
+            out.write(content); out.flush(); os.fsync(out.fileno())
         os.replace(tmp, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try: os.fsync(dir_fd)
+            finally: os.close(dir_fd)
+        except OSError: pass
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
@@ -1591,30 +1796,136 @@ def validate_endpoint(value, allow_http=True, label='地址'):
 def state_lock(path):
     """Serialize CLI updates and the long-running master service."""
     lock_path = Path(str(path) + '.lock'); lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fd = open_private_lock(lock_path)
     try:
         if fcntl is not None: fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
         if fcntl is not None: fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+def open_private_lock(path):
+    """Open a manager lock without following a user-created symlink."""
+    flags=os.O_CREAT | os.O_RDWR
+    if hasattr(os,'O_NOFOLLOW'): flags |= os.O_NOFOLLOW
+    fd=os.open(str(path),flags,0o600)
+    try: os.fchmod(fd,0o600)
+    except OSError:
+        os.close(fd); raise
+    return fd
 class NoCredentialRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl): return None
+
+def bounded_json_response(response, limit=1048576):
+    raw=response.read(limit+1)
+    if len(raw) > limit: raise ValueError('response too large')
+    result=json.loads(raw)
+    if not isinstance(result,dict): raise ValueError('invalid response')
+    return result
 
 def post_json(url, payload, token=''):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type':'application/json'}, method='POST')
     if token: req.add_header('Authorization', 'Bearer ' + token)
     try:
-        with urllib.request.build_opener(NoCredentialRedirect).open(req, timeout=20) as r: return json.loads(r.read())
+        with urllib.request.build_opener(NoCredentialRedirect).open(req, timeout=20) as r: return bounded_json_response(r)
     except urllib.error.HTTPError as e:
-        try: detail=json.loads(e.read().decode()).get('error','')
-        except Exception: detail=''
-        raise RuntimeError('主控返回 HTTP %s%s' % (e.code, ': '+detail if detail else ''))
-    except urllib.error.URLError as e:
-        raise RuntimeError('无法连接主控：%s' % e.reason)
+        code=int(getattr(e,'code',0) or 0)
+        try: e.close()
+        except OSError: pass
+        raise RuntimeError('主控返回 HTTP %s。' % code) from None
+    except (urllib.error.URLError, OSError, ValueError):
+        raise RuntimeError('无法连接主控或响应格式无效。') from None
 
 DNSPOD_API = 'https://dnsapi.cn/'
 DNSPOD_LINES = ('默认', '电信', '联通', '移动')
+ADDRESS_FAMILIES = ('ipv4', 'ipv6')
+
+def normalize_address_family(value):
+    value = str(value or 'ipv4').strip().lower()
+    if value not in ADDRESS_FAMILIES:
+        raise RuntimeError('地址类型只能是 ipv4 或 ipv6。')
+    return value
+
+def address_record_type(value):
+    return 'AAAA' if normalize_address_family(value) == 'ipv6' else 'A'
+
+def validate_node_public_ip(value, address_family):
+    """Validate an address before it can ever be written to DNS."""
+    if value in (None, ''): return None
+    try:
+        address = (ipaddress.IPv6Address if normalize_address_family(address_family) == 'ipv6'
+                   else ipaddress.IPv4Address)(str(value).strip())
+    except ValueError:
+        raise ValueError('invalid_public_ip') from None
+    if not address.is_global or address.is_multicast or address.is_unspecified:
+        raise ValueError('invalid_public_ip')
+    return str(address)
+
+def validate_node_limits(priority, quota_bytes):
+    """Return bounded integer limits accepted from an enrollment request."""
+    try:
+        if (isinstance(priority, bool) or isinstance(quota_bytes, bool) or
+                (isinstance(priority, float) and not priority.is_integer()) or
+                (isinstance(quota_bytes, float) and not quota_bytes.is_integer())): raise ValueError
+        priority = int(priority); quota_bytes = int(quota_bytes)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('invalid_node_limits') from None
+    if not 0 <= priority <= 1_000_000 or not 0 <= quota_bytes <= 2**63 - 1:
+        raise ValueError('invalid_node_limits')
+    return priority, quota_bytes
+
+METRIC_DEVICE_CLASSES = ('Unknown', 'TV', 'iOS', 'Android', 'Windows', 'macOS',
+                         'Linux', 'Emby/客户端', '浏览器', 'Other')
+
+def _metric_client(value):
+    try:
+        text=str(value).strip()
+        # Scoped interface identifiers are local metadata, not public clients.
+        if '%' in text: return ''
+        return str(ipaddress.ip_address(text))
+    except ValueError: return ''
+
+def _metric_path(value):
+    """Keep only a relative URL path, never its credentials or query string."""
+    try:
+        parsed=urlparse(str(value))
+        path=parsed.path or '/'
+    except ValueError: return '/'
+    if not path.startswith('/'): return '/'
+    path=''.join(char for char in path if ord(char) >= 32 and ord(char) != 127
+                 and not '\u202a' <= char <= '\u202e' and not '\u2066' <= char <= '\u2069')
+    return path[:256] or '/'
+
+def sanitize_metrics(value):
+    """Accept bounded counters, real IPs, fixed device classes and URL paths."""
+    if not isinstance(value,dict): return None
+    def number(item):
+        try:
+            parsed=float(item)
+            if isinstance(item,bool) or not math.isfinite(parsed): return 0
+            return max(0,min(int(parsed),10**18))
+        except (TypeError,ValueError,OverflowError): return 0
+    def bucket(name, limit):
+        grouped={}
+        rows=value.get(name,[]) if isinstance(value.get(name),list) else []
+        for row in rows[:limit * 4]:
+            if not isinstance(row,dict): continue
+            label=row.get('name','')
+            if name == 'clients': label=_metric_client(label)
+            elif name == 'devices': label=str(label) if label in METRIC_DEVICE_CLASSES else ''
+            else: label=_metric_path(label) if isinstance(label,str) and label else ''
+            if not label: continue
+            target=grouped.setdefault(label,{'name':label,'requests':0,'bytes':0})
+            target['requests']=min(10**18,target['requests']+number(row.get('requests')))
+            target['bytes']=min(10**18,target['bytes']+number(row.get('bytes')))
+        return sorted(grouped.values(),key=lambda row:(-row['bytes'],-row['requests'],row['name']))[:limit]
+    generated=number(value.get('generated_at'))
+    if generated > now()+300: generated=0
+    requests=number(value.get('requests'))
+    return {'generated_at':generated,'window_seconds':max(60,min(number(value.get('window_seconds')),3600)),
+            'requests':requests,'bytes':number(value.get('bytes')),'errors':min(requests,number(value.get('errors'))),
+            'clients':bucket('clients',20),'devices':bucket('devices',12),'paths':bucket('paths',20),
+            'sampled_rows':min(20000,number(value.get('sampled_rows'))),'truncated':value.get('truncated') is True}
 
 
 def dnspod_call(action, params, token):
@@ -1634,7 +1945,11 @@ def dnspod_call(action, params, token):
             raw = response.read(1048577)
         if len(raw) > 1048576: raise ValueError('oversize')
         result = json.loads(raw)
-    except (OSError, ValueError):
+    except urllib.error.HTTPError as error:
+        try: error.close()
+        except OSError: pass
+        raise RuntimeError('DNSPod API 请求失败；检查网络、凭据和 API 可用性。') from None
+    except (urllib.error.URLError, OSError, ValueError):
         raise RuntimeError('DNSPod API 请求失败；检查网络、凭据和 API 可用性。') from None
     status = result.get('status') if isinstance(result, dict) else None
     if not isinstance(status, dict) or str(status.get('code')) != '1':
@@ -1673,33 +1988,43 @@ def dnspod_zone(domain, token):
             'nameservers': sorted(str(n).lower().rstrip('.') for n in nameservers)}
 
 
-def dnspod_discovery(domain, token_file):
+def dnspod_discovery(domain, token_file, record_type='A'):
+    record_type = str(record_type).upper()
+    if record_type not in ('A', 'AAAA'): raise RuntimeError('DNSPod 记录类型只能是 A 或 AAAA。')
     token = Path(token_file).read_text().strip()
     config = dnspod_zone(domain, token)
     records = dnspod_pages('Record.List', {'domain_id': config['domain_id'],
         'sub_domain': config['sub_domain']}, token, 'records')
-    found = {}
+    found = {}; seen_ids = set()
     for r in records:
         if str(r.get('name', '')).lower().rstrip('.') != config['sub_domain']: continue
-        if r.get('type') in ('AAAA', 'CNAME'):
-            raise RuntimeError('入口存在 AAAA/CNAME，可能绕过本次 IPv4 线路策略；请先人工处理。')
-        if r.get('type') != 'A': continue
+        if r.get('type') == 'CNAME' or (r.get('type') in ('A', 'AAAA') and r.get('type') != record_type):
+            raise RuntimeError('入口存在与当前地址类型冲突的 A/AAAA/CNAME 记录，请先人工处理。')
+        if r.get('type') != record_type: continue
         line = r.get('line')
-        if line not in DNSPOD_LINES or line in found:
-            raise RuntimeError('存在额外/重复的 A 记录线路；首版只接管 默认/电信/联通/移动 各一条。')
-        if str(r.get('enabled')) != '1' or r.get('weight') is not None or r.get('monitor_status'):
-            raise RuntimeError('线路记录须已启用、未设置权重、未启用其他 DNS 监控。')
-        if not str(r.get('id', '')).isdigit() or not str(r.get('line_id', '')) or not str(r.get('ttl', '')).isdigit():
+        if line not in DNSPOD_LINES:
+            raise RuntimeError('存在额外的 %s 记录线路；只接管 默认/电信/联通/移动。' % record_type)
+        if str(r.get('enabled')) != '1' or r.get('monitor_status'):
+            raise RuntimeError('线路记录须已启用、未启用其他 DNS 监控。')
+        if not str(r.get('id', '')).isdigit() or str(r.get('id')) in seen_ids or not str(r.get('line_id', '')) or not str(r.get('ttl', '')).isdigit():
             raise RuntimeError('DNSPod 记录字段不完整。')
-        found[line] = {'record_id': str(r['id']), 'record_line_id': str(r['line_id']), 'ttl': int(r['ttl'])}
+        try: (ipaddress.IPv6Address if record_type == 'AAAA' else ipaddress.IPv4Address)(str(r.get('value', '')))
+        except ValueError: raise RuntimeError('DNSPod 线路记录必须是有效 %s 记录。' % record_type) from None
+        seen_ids.add(str(r['id']))
+        weight=r.get('weight')
+        if weight not in (None,'',0,'0') and not re.fullmatch(r'[1-9][0-9]{0,5}',str(weight)):
+            raise RuntimeError('DNSPod 权重必须是正整数。')
+        found.setdefault(line,[]).append({'record_id': str(r['id']), 'record_line_id': str(r['line_id']),
+                                          'ttl': int(r['ttl']), 'weight': int(weight) if weight not in (None,'',0,'0') else None})
     if set(found) != set(DNSPOD_LINES):
-        raise RuntimeError('DNSPod 缺少线路记录：%s；请先创建四条线路 A 记录，不会替您覆盖/创建业务记录。' %
-                           '、'.join(line for line in DNSPOD_LINES if line not in found))
-    return dict(config, provider='dnspod', token_file=str(Path(token_file).resolve()), line_records=found, routes={})
+        raise RuntimeError('DNSPod 缺少线路记录：%s；请先创建四条线路 %s 记录，不会替您覆盖/创建业务记录。' % (record_type,
+                           '、'.join(line for line in DNSPOD_LINES if line not in found)))
+    line_records={line:(items[0] if len(items)==1 else items) for line,items in found.items()}
+    return dict(config, provider='dnspod', record_type=record_type, token_file=str(Path(token_file).resolve()), line_records=line_records, routes={}, line_weights={})
 
 
 def dnspod_discover(a):
-    print(json.dumps(dnspod_discovery(a.domain, a.token_file), ensure_ascii=False))
+    print(json.dumps(dnspod_discovery(a.domain, a.token_file, getattr(a, 'record_type', 'A')), ensure_ascii=False))
 
 
 def check_dnspod_delegation(domain, config):
@@ -1724,7 +2049,7 @@ def check_dnspod_delegation(domain, config):
 def dnspod_configure(a):
     path = Path(a.state)
     before = json.loads(path.read_text())
-    config = dnspod_discovery(before['domain'], a.token_file)
+    config = dnspod_discovery(before['domain'], a.token_file, address_record_type(before.get('address_family', 'ipv4')))
     proof = check_dnspod_delegation(before['domain'], config)
     # The control domain may remain on another DNS provider; only the business
     # hostname is delegated to DNSPod. Certificate issuance is handled separately.
@@ -1744,6 +2069,9 @@ def dnspod_configure(a):
             config['token_file'] = token_path
             old = latest.get('dns') or {}
             if old.get('provider') == 'dnspod': config['routes'] = old.get('routes') or {}
+            if old.get('provider') == 'dnspod':
+                config['line_weights'] = old.get('line_weights') or {}
+                if old.get('schedule'): config['schedule'] = old['schedule']
             backup_file(path)
             latest['dns'] = config
             latest.pop('line_states', None)
@@ -1794,7 +2122,10 @@ def install_certificate(st, bundle, reload=True):
     if root.is_symlink() or (root.exists() and any(root.iterdir()) and not (root/'.managed-emby-certificates').is_file()):
         raise RuntimeError('证书目录不是脚本托管目录，拒绝覆盖。')
     root.mkdir(parents=True,exist_ok=True)
-    marker=root/'.managed-emby-certificates'; marker.touch(mode=0o600,exist_ok=True)
+    marker=root/'.managed-emby-certificates'
+    if marker.is_symlink() or (marker.exists() and not marker.is_file()):
+        raise RuntimeError('证书目录标记不是普通文件，拒绝覆盖。')
+    marker.touch(mode=0o600,exist_ok=True); os.chmod(marker,0o600)
     with state_lock(root/'sync'):
         os.chmod(root,0o755)
         candidate=Path(tempfile.mkdtemp(prefix='version-',dir=root)); os.chmod(candidate,0o700)
@@ -1859,17 +2190,19 @@ def install_certificate_timer(name, arguments, interval):
         '# MANAGED EMBY CERTIFICATE\n[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nUMask=0077\nTimeoutStartSec=1200\nExecStart='+command+'\n'),
         (Path('/etc/systemd/system/'+name+'.timer'),
         '# MANAGED EMBY CERTIFICATE\n[Unit]\n[Timer]\nOnBootSec=2min\nOnUnitInactiveSec='+interval+'\nRandomizedDelaySec=60\n[Install]\nWantedBy=timers.target\n')]
-    backups=[]
+    backups=[]; created=[]
     try:
         for path,content in units:
             if path.exists() and '# MANAGED EMBY CERTIFICATE' not in path.read_text():
                 raise RuntimeError('同名证书单元不是脚本托管文件，拒绝覆盖。')
+            if not path.exists(): created.append(path.name)
         for path,content in units: backups.append((path,write_unit(path,content)))
         subprocess.run(['systemctl','daemon-reload'],check=True)
         subprocess.run(['systemctl','enable','--now',name+'.timer'],check=True)
     except Exception:
         for path,backup in reversed(backups): restore_file(path,backup)
         subprocess.run(['systemctl','daemon-reload'],check=False)
+        for unit_name in created: _restore_systemd_state(unit_name,False,False)
         raise
 
 def issue_certificates(state, config):
@@ -1880,7 +2213,9 @@ def issue_certificates(state, config):
     if not token or re.search(r'\s',token): raise RuntimeError('Cloudflare Token 格式无效。')
     credentials=root/'cloudflare.ini'
     # Never truncate an existing broadly-readable file before tightening permissions.
-    fd=os.open(credentials,os.O_WRONLY|os.O_CREAT,0o600)
+    flags=os.O_WRONLY|os.O_CREAT
+    if hasattr(os,'O_NOFOLLOW'): flags |= os.O_NOFOLLOW
+    fd=os.open(credentials,flags,0o600)
     with os.fdopen(fd,'w') as out:
         os.fchmod(out.fileno(),0o600); out.truncate(0); out.write('dns_cloudflare_api_token = '+token+'\n')
     for name,domain in (('entry',state['domain']),('control',config['control_domain'])):
@@ -1918,11 +2253,11 @@ def update_controller_caddyfile(domain, path):
     if marker.search(original):
         updated=marker.sub(block,original,count=1)
     else:
-        # A previous manual deployment may contain the exact safe block without
-        # markers.  Mark it in-place so subsequent runs are idempotent.
+        # An unmarked block may belong to an operator-managed site.  Ownership
+        # must be explicit; never silently adopt or rewrite it.
         plain=re.compile(r'(?ms)^'+re.escape(domain)+r'\s*\{\s*reverse_proxy\s+127\.0\.0\.1:19090\s*\}\s*')
         if plain.search(original):
-            updated=plain.sub(block,original,count=1)
+            raise RuntimeError('Caddyfile 已存在未标记的主控站点，拒绝接管：'+domain)
         elif re.search(r'(?m)^\s*'+re.escape(domain)+r'\s*\{', original):
             raise RuntimeError('Caddyfile 已存在非脚本托管的主控域名，拒绝覆盖：'+domain)
         else:
@@ -1931,8 +2266,7 @@ def update_controller_caddyfile(domain, path):
         return None
     backup=backup_file(path)
     path.parent.mkdir(parents=True,exist_ok=True)
-    path.write_text(updated)
-    os.chmod(path,0o644)
+    atomic_text_write(path, updated)
     return backup
 
 def https_proxy_setup(a):
@@ -1977,7 +2311,7 @@ def https_proxy_setup(a):
                     except Exception as e:
                         last=str(e)
                     time.sleep(6)
-                if not verified: raise RuntimeError('HTTPS 主控验证失败（请确认 A 记录已指向本机、放行 80/443，并等待 DNS/证书传播）：'+last)
+                if not verified: raise RuntimeError('HTTPS 主控验证失败（请确认 %s 记录已指向本机、放行 80/443，并等待 DNS/证书传播）：%s' % (address_record_type(latest.get('address_family','ipv4')),last))
         except Exception:
             # Restore both files and reload the previous known-good Caddy config.
             try:
@@ -2008,6 +2342,16 @@ def cert_setup(a):
         config={'directory':str(path.resolve().parent/'certificates'),'control_domain':domain}
         issue_certificates(state,config)
         # Timer installation can fail; do not change the live controller protocol until it succeeds.
+        timer_paths=[Path('/etc/systemd/system/emby-proxy-cert-renew.service'),
+                     Path('/etc/systemd/system/emby-proxy-cert-renew.timer')]
+        timer_snapshot=[]
+        for timer_path in timer_paths:
+            if timer_path.exists() and not timer_path.is_symlink():
+                timer_snapshot.append((timer_path,True,timer_path.read_text(errors='replace'),timer_path.stat().st_mode & 0o777))
+            else:
+                timer_snapshot.append((timer_path,False,None,None))
+        timer_was_enabled=_systemd_probe('emby-proxy-cert-renew.timer','is-enabled')
+        timer_was_active=_systemd_probe('emby-proxy-cert-renew.timer','is-active')
         install_certificate_timer('emby-proxy-cert-renew',['cert-renew','--state',str(path.resolve())],'12h')
         was_active=subprocess.run(['systemctl','is-active','--quiet','emby-proxy-master.service'],capture_output=True).returncode == 0
         with state_lock(path):
@@ -2017,7 +2361,9 @@ def cert_setup(a):
             backup_file(path); latest['certificates']=config
             latest['controller_url']='https://'+domain+':19090'; atomic_write(path,latest)
         try:
-            master_install(argparse.Namespace(state=str(path.resolve()),listen='0.0.0.0:19090',reconcile_interval=30))
+            family=normalize_address_family(latest.get('address_family','ipv4'))
+            listen='[::]:19090' if family == 'ipv6' else '0.0.0.0:19090'
+            master_install(argparse.Namespace(state=str(path.resolve()),listen=listen,reconcile_interval=30))
         except Exception:
             with state_lock(path):
                 latest=json.loads(path.read_text())
@@ -2028,8 +2374,22 @@ def cert_setup(a):
             try:
                 subprocess.run(['systemctl','restart' if was_active else 'stop','emby-proxy-master.service'],check=True)
             except (OSError,subprocess.SubprocessError): print('提醒：主控配置已恢复，但服务恢复失败，请检查 systemd。',file=sys.stderr)
+            # A successful timer install followed by a failed master install is
+            # still a failed transaction. Restore both timer files and their
+            # enabled/active state so renewal cannot run against a rolled-back
+            # controller configuration.
+            try:
+                for timer_path,existed,content,mode in timer_snapshot:
+                    if existed:
+                        atomic_text_write(timer_path,content,mode)
+                    else:
+                        timer_path.unlink(missing_ok=True)
+                subprocess.run(['systemctl','daemon-reload'],check=False)
+                _restore_systemd_state('emby-proxy-cert-renew.timer',timer_was_enabled,timer_was_active)
+            except (OSError,subprocess.SubprocessError):
+                print('提醒：主控已回滚，但证书续期 timer 恢复失败，请检查 emby-proxy-cert-renew.timer。',file=sys.stderr)
             raise
-    print('入口及主控证书已准备，主控 HTTPS 已启动。主控域名 A 记录须指向本机，放行 TCP 19090。')
+    print('入口及主控证书已准备，主控 HTTPS 已启动。主控域名 %s 记录须指向本机，放行 TCP 19090。' % address_record_type(state.get('address_family','ipv4')))
 
 def cert_renew(a):
     if os.geteuid() != 0: raise RuntimeError('证书续期需要 root 或 sudo。')
@@ -2045,7 +2405,7 @@ class Controller:
         self.reload()
     def reload(self):
         self.state = json.loads(self.path.read_text())
-        self.state.setdefault('schema_version', 1); self.state.setdefault('enroll_tokens', {}); self.state.setdefault('nodes', {}); self.state.setdefault('active_node', None)
+        self.state.setdefault('schema_version', 1); self.state.setdefault('address_family', 'ipv4'); self.state.setdefault('enroll_tokens', {}); self.state.setdefault('nodes', {}); self.state.setdefault('active_node', None); self.state.setdefault('active_nodes', [])
     def save(self): atomic_write(self.path, self.state)
     def enroll(self, b, secure=False):
         with self.lock, state_lock(self.path):
@@ -2054,6 +2414,7 @@ class Controller:
                 return 403, {'error':'managed_certificates_require_https_registration'}
             if b.get('entry_id') != self.state['entry_id']: return 404, {'error':'unknown_entry'}
             node, reg = str(b.get('node_id','')), str(b.get('enroll_token',''))
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', node): return 400, {'error':'invalid_node_id'}
             pending=self.state['enroll_tokens'].get(node)
             expected=pending.get('token') if isinstance(pending,dict) else pending
             issued=pending.get('issued_at') if isinstance(pending,dict) else None
@@ -2064,17 +2425,54 @@ class Controller:
             detected = b.get('detected_engine', '')
             if detected and detected != self.state.get('engine','caddy'):
                 return 409, {'error':'engine_conflict: 边缘已有 %s，主控要求 %s；请使用引擎一致的节点，注册码未消耗。' % (detected, self.state.get('engine','caddy'))}
+            try:
+                expected_family = normalize_address_family(self.state.get('address_family', 'ipv4'))
+                requested_family = normalize_address_family(b.get('address_family', expected_family))
+            except RuntimeError:
+                return 400, {'error':'invalid_address_family'}
+            if requested_family != expected_family:
+                return 409, {'error':'address_family_conflict: 主控要求 %s，边缘提交的是 %s；注册码未消耗。' % (expected_family, requested_family)}
+            pending_family = normalize_address_family(pending.get('address_family', expected_family)) if isinstance(pending, dict) else expected_family
+            if requested_family != pending_family:
+                return 409, {'error':'address_family_conflict: 注册码要求 %s，边缘提交的是 %s；注册码未消耗。' % (pending_family, requested_family)}
+            try:
+                priority, quota_bytes = validate_node_limits(b.get('priority', 0), b.get('quota_bytes', 0))
+                public_ip = validate_node_public_ip(b.get('public_ip'), requested_family)
+            except ValueError as error:
+                return 400, {'error':str(error) or 'invalid_node_configuration'}
             token = secrets.token_urlsafe(32); self.state['enroll_tokens'].pop(node, None)
-            item = {'name':b.get('name',node), 'priority':int(b.get('priority',0)), 'quota_bytes':int(b.get('quota_bytes',0)), 'used_bytes':0, 'healthy':False, 'status':'enrolled', 'last_seen':now(), 'version':b.get('version','unknown'), 'token_hash':digest(token)}
-            if b.get('public_ip'): item['public_ip'] = str(b['public_ip'])
+            name=''.join(char for char in str(b.get('name',node) or node)[:128] if ord(char) >= 32).strip() or node
+            version=''.join(char for char in str(b.get('version','unknown') or 'unknown')[:128] if ord(char) >= 32) or 'unknown'
+            item = {'name':name, 'priority':priority, 'quota_bytes':quota_bytes, 'used_bytes':0, 'healthy':False, 'status':'enrolled', 'last_seen':now(), 'version':version, 'token_hash':digest(token), 'address_family':requested_family}
+            if public_ip: item['public_ip'] = public_ip
             self.state['nodes'][node] = item; self.save()
-            return 200, {'node_token':token, 'entry_id':self.state['entry_id'], 'domain':self.state['domain'], 'source':self.state['source'], 'engine':self.state.get('engine','caddy'),'certificate_managed':bool(self.state.get('certificates'))}
+            return 200, {'node_token':token, 'entry_id':self.state['entry_id'], 'domain':self.state['domain'], 'source':self.state['source'], 'engine':self.state.get('engine','caddy'),'address_family':expected_family,'certificate_managed':bool(self.state.get('certificates')),
+                         'telemetry_enabled':(self.state.get('telegram') or {}).get('enabled') is True}
     def heartbeat(self, b, token):
         with self.lock, state_lock(self.path):
             self.reload()
             node = self.state['nodes'].get(str(b.get('node_id','')))
             if not node or node.get('token_hash') != digest(token): return 403, {'error':'invalid_node_token'}
-            used = max(int(node.get('used_bytes',0)), int(b.get('used_bytes',0)))
+            try:
+                node_family = normalize_address_family(node.get('address_family', self.state.get('address_family','ipv4')))
+                reported_family = normalize_address_family(b.get('address_family', node_family))
+            except RuntimeError:
+                return 400, {'error':'invalid_address_family'}
+            if reported_family != node_family: return 409, {'error':'address_family_conflict'}
+            try:
+                validate_node_limits(node.get('priority',0), node.get('quota_bytes',0))
+                raw_used=b.get('used_bytes',0)
+                if (isinstance(raw_used, bool) or (isinstance(raw_used,float) and not raw_used.is_integer())): raise ValueError
+                used_value = int(raw_used)
+                if not 0 <= used_value <= 2**63 - 1:
+                    raise ValueError
+                public_ip = validate_node_public_ip(b.get('public_ip'), node_family)
+            except (TypeError, ValueError, OverflowError):
+                return 400, {'error':'invalid_node_usage_or_public_ip'}
+            version=str(b.get('version',node.get('version','unknown')) or 'unknown')[:128]
+            event=str(b.get('event','heartbeat') or 'heartbeat')[:64]
+            if any(ord(char) < 32 for char in version+event): return 400, {'error':'invalid_node_metadata'}
+            used = max(int(node.get('used_bytes',0)), used_value)
             stamp=now(); reported=b.get('healthy') is True
             # 失联恢复不能继承失联前的成功计数；计数落盘，主控重启不绕过防抖。
             if stamp-int(node.get('last_seen',0)) > HEARTBEAT_TTL:
@@ -2093,12 +2491,20 @@ class Controller:
                 node['failure_streak']=int(node.get('failure_streak',0))+1
                 if node['failure_streak'] >= FAILURE_THRESHOLD: node['healthy']=False
                 node['status']='suspect' if node.get('healthy') else 'unhealthy'
-            node.update(reported_healthy=reported, used_bytes=used, last_seen=stamp, version=b.get('version',node.get('version','unknown')), last_event=b.get('event','heartbeat'))
+            node.update(reported_healthy=reported, used_bytes=used, last_seen=stamp, version=version, last_event=event)
             cert=b.get('certificate_status')
             if isinstance(cert,dict):
                 node['certificate_status']={k:cert[k] for k in ('version','expires_at','status','last_sync') if k in cert}
-            if b.get('public_ip'): node['public_ip'] = str(b['public_ip'])
-            selected = self.select(); self.save(); return 200, {'selected_node':selected, 'accepted_used_bytes':used}
+            if public_ip:
+                node['public_ip'] = public_ip
+            # Consent is an explicit boolean. Legacy/string values such as
+            # "false" must not silently enable collection of client data.
+            telemetry_enabled=(self.state.get('telegram') or {}).get('enabled') is True
+            metrics=sanitize_metrics(b.get('metrics')) if telemetry_enabled else None
+            if metrics is not None: node['metrics']=metrics
+            else: node.pop('metrics',None)
+            selected = self.select(); self.save(); return 200, {'selected_node':selected, 'accepted_used_bytes':used,
+                                                                  'telemetry_enabled':telemetry_enabled}
     def revoke(self, b, token):
         with self.lock, state_lock(self.path):
             self.reload()
@@ -2108,6 +2514,7 @@ class Controller:
             self.state['nodes'].pop(node_id, None)
             self.state['enroll_tokens'].pop(node_id, None)
             if self.state.get('active_node') == node_id: self.state['active_node'] = None
+            self.state['active_nodes']=[nid for nid in self.state.get('active_nodes',[]) if nid != node_id]
             self.save()
             return 200, {'revoked_node':node_id}
     def eligible(self, nid, current=None):
@@ -2129,11 +2536,96 @@ class Controller:
         if active and (active[0] >= best[0] or now()-int(self.state.get('last_switch_at',0)) < SWITCH_COOLDOWN):
             return current
         return best[1]
+    def cloudflare_record_ids(self):
+        dns=self.state.get('dns') or {}
+        ids=dns.get('record_ids') or ([dns['record_id']] if dns.get('record_id') else [])
+        return [str(item) for item in ids if str(item)]
+    def weighted_pool_enabled(self):
+        return ((self.state.get('routing') or {}).get('mode') == 'weighted' and
+                len(self.cloudflare_record_ids()) >= 2)
+    def schedule_profile(self, entries, key, minute=None):
+        if not entries: return None
+        if minute is None:
+            local=time.localtime(); minute=local.tm_hour*60+local.tm_min
+        chosen=entries[-1]
+        for item in entries:
+            start=parse_schedule_time(item.get('start',''))
+            if start <= minute: chosen=item
+            else: break
+        return chosen.get(key) or {}
+    def effective_cloudflare_weights(self):
+        routing=self.state.get('routing') or {}
+        return self.schedule_profile(routing.get('schedule') or [], 'weights') or routing.get('weights') or {}
+    def weighted_pool_assignments(self):
+        """Expand configured weights into a deterministic DNS record pool."""
+        ids=self.cloudflare_record_ids(); weights=self.effective_cloudflare_weights()
+        candidates=[]
+        for nid, value in weights.items():
+            try: weight=int(value)
+            except (TypeError,ValueError): continue
+            if nid in self.state.get('nodes',{}) and weight > 0 and self.eligible(nid, self.state.get('active_node')):
+                candidates.append((nid,weight))
+        if not candidates: return []
+        candidates.sort(key=lambda item: (-item[1], item[0]))
+        slots=len(ids); total=sum(value for _,value in candidates)
+        counts={nid:(value*slots)//total for nid,value in candidates}
+        remainders=sorted([((value*slots)%total,nid) for nid,value in candidates], reverse=True)
+        for _,nid in remainders[:slots-sum(counts.values())]: counts[nid]+=1
+        expanded=[]
+        for nid,_ in candidates:
+            expanded.extend([nid]*counts[nid])
+        expanded=expanded[:slots]
+        return list(zip(ids,expanded))
+    def cloudflare_pool_duplicate_error(self, assignments):
+        """Return a safe error when a DNS slot would duplicate an A/AAAA value.
+
+        Cloudflare DNS does not allow two identical records with the same
+        name/type/content.  Expanding ``edge-a=80,edge-b=20`` across four
+        records therefore cannot represent 80/20 by repeating edge-a/edge-b;
+        a blind PUT would partially update the pool and leave it ambiguous.
+        """
+        seen={}
+        for record_id,nid in assignments:
+            ip=self.state.get('nodes',{}).get(nid,{}).get('public_ip')
+            if not ip: continue
+            previous=seen.get(str(ip))
+            if previous and previous != str(record_id):
+                return 'Cloudflare DNS 不允许同名同类型的重复 IP 记录；当前权重需要重复槽位，无法安全表示。请减少记录数量/节点，或改用 Cloudflare Load Balancing。'
+            seen[str(ip)]=str(record_id)
+        return None
+    def reconcile_cloudflare_pool(self):
+        assignments=self.weighted_pool_assignments(); previous=list(self.state.get('active_nodes') or [])
+        if not assignments:
+            self.state['last_reconcile']=now(); self.state['last_reconcile_reason']='no_eligible_nodes'; self.save()
+            return {'selected_nodes':[], 'active_nodes':previous, 'previous_nodes':previous,
+                    'changed':False, 'reason':'no_eligible_nodes'}
+        desired=[nid for _,nid in assignments]
+        desired_ips={rid:self.state['nodes'][nid].get('public_ip') for rid,nid in assignments}
+        confirmed=self.state.get('confirmed_record_ips') or {}
+        needs=desired != previous or any(confirmed.get(rid) != ip for rid,ip in desired_ips.items()) or self.state.get('dns_needs_confirmation')
+        result=None; reason='unchanged'
+        if needs:
+            duplicate_error=self.cloudflare_pool_duplicate_error(assignments)
+            result={'ok':False,'verified':False,'error':duplicate_error} if duplicate_error else self.update_dns_pool(assignments)
+            if result.get('ok'):
+                self.state['active_nodes']=desired; self.state['active_node']=desired[0]
+                self.state['confirmed_record_ips']=desired_ips; self.state['confirmed_dns_ip']=desired_ips.get(assignments[0][0])
+                self.state['dns_needs_confirmation']=False; self.state['dns_confirmed_at']=now()
+                if desired != previous: self.state['last_switch_at']=now()
+                reason='dns_confirmed'
+            else:
+                self.state['dns_needs_confirmation']=True; reason='dns_unconfirmed'
+            self.state['last_dns_result']=result
+        self.state['last_reconcile']=now(); self.state['last_reconcile_reason']=reason; self.save()
+        return {'selected_nodes':desired, 'active_nodes':self.state.get('active_nodes',previous),
+                'previous_nodes':previous, 'changed':self.state.get('active_nodes',previous) != previous,
+                'reason':reason, 'dns':result}
     def reconcile(self):
         with self.lock, state_lock(self.path):
             self.reload()
             if (self.state.get('dns') or {}).get('provider') == 'dnspod':
                 return self.reconcile_dnspod()
+            if self.weighted_pool_enabled(): return self.reconcile_cloudflare_pool()
             selected=self.select(); previous=self.state.get('active_node'); changed=selected != previous; dns_result=None
             ip=self.state['nodes'][selected].get('public_ip') if selected else None
             needs_update=bool(selected and (changed or self.state.get('confirmed_dns_ip') != ip or self.state.get('dns_needs_confirmation')))
@@ -2158,6 +2650,9 @@ class Controller:
         dns=self.state.get('dns') or {}; node=self.state['nodes'][nid]
         if dns.get('provider') == 'dnspod':
             return self.update_dnspod(nid)
+        if self.weighted_pool_enabled():
+            assignments=[(record_id,nid) for record_id in self.cloudflare_record_ids()]
+            return self.update_dns_pool(assignments)
         if dns.get('provider') != 'cloudflare': return {'ok':False,'skipped':'dns provider not configured'}
         if not node.get('public_ip'): return {'ok':False,'error':'selected node has no public_ip'}
         if not all(dns.get(key) for key in ('zone_id','record_id','token_file')):
@@ -2165,22 +2660,46 @@ class Controller:
         try: token=Path(dns['token_file']).read_text().strip()
         except (OSError, KeyError) as e: return {'ok':False,'error':str(e)}
         if not token: return {'ok':False,'error':'empty Cloudflare token file'}
-        payload={'type':'A','name':self.state['domain'],'content':node['public_ip'],'ttl':int(dns.get('ttl',60)),'proxied':False}
-        req=urllib.request.Request('https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s' % (dns['zone_id'],dns['record_id']), data=json.dumps(payload).encode(), headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'}, method='PUT')
+        return self.update_cloudflare_record(dns['record_id'], node['public_ip'], token)
+
+    def update_cloudflare_record(self, record_id, ip, token):
+        dns=self.state.get('dns') or {}
+        record_type=dns.get('record_type') or address_record_type(self.state.get('address_family','ipv4'))
+        if record_type not in ('A','AAAA'): return {'ok':False,'error':'invalid DNS record type'}
         try:
-            with urllib.request.urlopen(req, timeout=5) as r: result=json.loads(r.read())
-            if not isinstance(result,dict): return {'ok':False,'error':'invalid DNS update response'}
+            ip=str((ipaddress.IPv6Address if record_type == 'AAAA' else ipaddress.IPv4Address)(str(ip)))
+        except ValueError:
+            return {'ok':False,'error':'selected node IP does not match DNS record type'}
+        payload={'type':record_type,'name':self.state['domain'],'content':ip,'ttl':int(dns.get('ttl',60)),'proxied':False}
+        req=urllib.request.Request('https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s' % (dns['zone_id'],record_id), data=json.dumps(payload).encode(), headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'}, method='PUT')
+        try:
+            with urllib.request.build_opener(NoCredentialRedirect).open(req, timeout=5) as r: result=bounded_json_response(r)
             if not result.get('success'): return {'ok':False,'errors':result.get('errors',[])}
             readback=urllib.request.Request(req.full_url, headers={'Authorization':'Bearer '+token}, method='GET')
-            with urllib.request.urlopen(readback, timeout=5) as r: verified=json.loads(r.read())
-            if not isinstance(verified,dict): return {'ok':False,'error':'invalid DNS read-back response'}
+            with urllib.request.build_opener(NoCredentialRedirect).open(readback, timeout=5) as r: verified=bounded_json_response(r)
             record=verified.get('result') or {}
-            if not (verified.get('success') and isinstance(record,dict) and record.get('type') == 'A' and
+            if not (verified.get('success') and isinstance(record,dict) and str(record.get('id')) == str(record_id) and record.get('type') == record_type and
                     record.get('name','').lower().rstrip('.') == self.state['domain'].lower().rstrip('.') and
-                    record.get('content') == node['public_ip'] and record.get('proxied') is False):
+                    record.get('content') == ip and record.get('proxied') is False):
                 return {'ok':False,'error':'DNS read-back mismatch; retry on next reconcile'}
-            return {'ok':True,'content':node['public_ip'],'verified':True}
-        except (OSError, urllib.error.URLError, ValueError) as e: return {'ok':False,'error':str(e)}
+            return {'ok':True,'content':ip,'record_id':record_id,'verified':True}
+        except (OSError, urllib.error.URLError, ValueError): return {'ok':False,'error':'Cloudflare DNS API 请求失败或响应格式无效'}
+    def update_dns_pool(self, assignments):
+        dns=self.state.get('dns') or {}
+        if dns.get('provider') != 'cloudflare': return {'ok':False,'error':'weighted pool requires Cloudflare'}
+        if not all(dns.get(key) for key in ('zone_id','token_file')): return {'ok':False,'error':'incomplete Cloudflare configuration'}
+        try: token=Path(dns['token_file']).read_text().strip()
+        except OSError as e: return {'ok':False,'error':str(e)}
+        if not token: return {'ok':False,'error':'empty Cloudflare token file'}
+        records={}; errors={}
+        for record_id,nid in assignments:
+            ip=self.state['nodes'].get(nid,{}).get('public_ip')
+            if not ip: errors[record_id]='selected node has no public_ip'; continue
+            response=self.update_cloudflare_record(record_id,ip,token)
+            if response.get('ok'): records[record_id]=dict(response,node_id=nid)
+            else: errors[record_id]=response.get('error','unconfirmed')
+        return {'ok':bool(records) and not errors,'verified':bool(records) and not errors,
+                'records':records,'errors':errors}
     def update_dnspod(self, fallback):
         plans = self.line_plan()
         results = {}; errors = {}
@@ -2196,6 +2715,9 @@ class Controller:
     def line_plan(self):
         dns = self.state.get('dns') or {}
         routes = dns.get('routes') or {}
+        scheduled=self.schedule_profile(dns.get('schedule') or [], 'routes')
+        if scheduled:
+            routes=dict(routes); routes.update(scheduled)
         plans = {}
         for line in DNSPOD_LINES:
             previous = (self.state.get('line_states') or {}).get(line) or {}
@@ -2210,22 +2732,75 @@ class Controller:
                            'active_node': current, 'content': self.state['nodes'][best].get('public_ip') if best else None}
         return plans
 
+    def dnspod_line_records(self, line):
+        raw=(self.state.get('dns') or {}).get('line_records',{}).get(line) or []
+        return raw if isinstance(raw,list) else [raw]
+
+    def line_pool_assignments(self, line, plan=None):
+        records=self.dnspod_line_records(line)
+        plan=plan or self.line_plan()[line]
+        scheduled=self.schedule_profile((self.state.get('dns') or {}).get('schedule') or [], 'routes') or {}
+        if line in scheduled:
+            target=scheduled[line]
+            if self.eligible(target,plan.get('active_node')):
+                return [(item.get('record_id'),target) for item in records]
+        weights=((self.state.get('dns') or {}).get('line_weights') or {}).get(line) or {}
+        if not weights:
+            return [(item.get('record_id'),plan.get('selected_node')) for item in records if plan.get('selected_node')]
+        candidates=[]
+        for nid,value in weights.items():
+            try: weight=int(value)
+            except (TypeError,ValueError): continue
+            if nid in self.state.get('nodes',{}) and weight>0 and self.eligible(nid,plan.get('active_node')):
+                candidates.append((nid,weight))
+        if not candidates: return []
+        candidates.sort(key=lambda item:(-item[1],item[0])); slots=len(records); total=sum(v for _,v in candidates)
+        counts={nid:(v*slots)//total for nid,v in candidates}
+        remainder=sorted([((v*slots)%total,nid) for nid,v in candidates],reverse=True)
+        for _,nid in remainder[:slots-sum(counts.values())]: counts[nid]+=1
+        if slots>=len(candidates):
+            for nid,_ in candidates:
+                if counts[nid]==0:
+                    donor=max((item for item in candidates if counts[item[0]]>1),key=lambda item:(counts[item[0]],item[1]),default=None)
+                    if donor: counts[donor[0]]-=1; counts[nid]=1
+        expanded=[]
+        for nid,_ in candidates: expanded.extend([nid]*counts[nid])
+        return [(item.get('record_id'),nid) for item,nid in zip(records,expanded[:slots])]
+
     def dnspod_record(self, line, token):
-        dns = self.state['dns']; managed = dns['line_records'][line]
+        dns = self.state['dns']; managed = self.dnspod_line_records(line)[0]
+        record_type = dns.get('record_type') or address_record_type(self.state.get('address_family','ipv4'))
         result = dnspod_call('Record.Info', {'domain_id': dns['domain_id'], 'record_id': managed['record_id']}, token)
         r = result.get('record') or {}; domain = result.get('domain') or {}
         if not (str(domain.get('id')) == str(dns['domain_id']) and
                 str(r.get('id')) == str(managed['record_id']) and r.get('sub_domain') == dns['sub_domain'] and
-                r.get('record_type') == 'A' and r.get('record_line') == line and
+                r.get('record_type') == record_type and r.get('record_line') == line and
                 str(r.get('record_line_id')) == str(managed['record_line_id']) and str(r.get('enabled')) == '1' and
-                r.get('weight') is None and not r.get('monitor_status')):
+                not r.get('monitor_status')):
             raise RuntimeError('DNSPod 记录身份/类型/线路/状态已变化；拒绝覆盖，请重新检查接管范围。')
         return r
 
+    def dnspod_records(self, line, token):
+        records=[]; dns=self.state['dns']; record_type = dns.get('record_type') or address_record_type(self.state.get('address_family','ipv4'))
+        for managed in self.dnspod_line_records(line):
+            result=dnspod_call('Record.Info', {'domain_id':dns['domain_id'],'record_id':managed['record_id']}, token)
+            r=result.get('record') or {}; domain=result.get('domain') or {}
+            if not (str(domain.get('id'))==str(dns['domain_id']) and str(r.get('id'))==str(managed['record_id']) and
+                    r.get('sub_domain')==dns['sub_domain'] and r.get('record_type')==record_type and
+                    r.get('record_line')==line and str(r.get('record_line_id'))==str(managed['record_line_id']) and
+                    str(r.get('enabled'))=='1' and not r.get('monitor_status')):
+                raise RuntimeError('DNSPod 记录身份/类型/线路/状态已变化；拒绝覆盖，请重新检查接管范围。')
+            records.append(r)
+        return records
+
     def update_dnspod_line(self, line, ip):
         dns = self.state['dns']; managed = dns['line_records'][line]
+        if len(self.dnspod_line_records(line)) > 1:
+            plan=self.line_plan()[line]; assignments=self.line_pool_assignments(line,plan)
+            return self.update_dnspod_pool(line,assignments)
         try:
-            ip = str(ipaddress.IPv4Address(ip))
+            family = self.state.get('address_family','ipv4')
+            ip = str((ipaddress.IPv6Address if family == 'ipv6' else ipaddress.IPv4Address)(ip))
             token = Path(dns['token_file']).read_text().strip()
             original = self.dnspod_record(line, token)
             # DNSPod locks repeatedly submitted no-op writes; read first, even after
@@ -2237,15 +2812,41 @@ class Controller:
             self.state['dnspod_record_backups'] = snapshots[-40:]
             self.save()  # backup and retry flag must survive a process crash after PUT
             params = {'domain_id': dns['domain_id'], 'record_id': managed['record_id'],
-                      'sub_domain': dns['sub_domain'], 'record_type': 'A',
+                      'sub_domain': dns['sub_domain'], 'record_type': dns.get('record_type') or address_record_type(family),
                       'record_line_id': managed['record_line_id'], 'value': ip,
                       'ttl': int(original['ttl'])}
+            if original.get('weight') not in (None, ''): params['weight'] = str(original['weight'])
             dnspod_call('Record.Modify', params, token)
             if self.dnspod_record(line, token).get('value') != ip:
                 raise RuntimeError('DNSPod 回读 IP 不匹配，下轮重新读取后重试。')
             return {'ok': True, 'verified': True, 'content': ip}
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             return {'ok': False, 'error': 'DNSPod 线路未确认；检查凭据、记录身份、TTL/套餐及网络。'}
+
+    def update_dnspod_pool(self, line, assignments):
+        dns=self.state['dns']; record_type = dns.get('record_type') or address_record_type(self.state.get('address_family','ipv4'))
+        if not assignments: return {'ok':False,'error':'no eligible node'}
+        try:
+            token=Path(dns['token_file']).read_text().strip()
+            records={str(r['id']):r for r in self.dnspod_records(line,token)}; results={}; errors={}
+            for record_id,nid in assignments:
+                original=records.get(str(record_id)); ip=self.state['nodes'].get(nid,{}).get('public_ip')
+                if not original or not ip: errors[str(record_id)]='record or node IP unavailable'; continue
+                try: ip=str((ipaddress.IPv6Address if record_type == 'AAAA' else ipaddress.IPv4Address)(str(ip)))
+                except ValueError: errors[str(record_id)]='selected node IP does not match DNS record type'; continue
+                if original.get('value') == ip:
+                    results[str(record_id)]={'ok':True,'unchanged':True,'content':ip,'node_id':nid}; continue
+                params={'domain_id':dns['domain_id'],'record_id':str(record_id),'sub_domain':dns['sub_domain'],
+                        'record_type':record_type,'record_line_id':original['record_line_id'],'value':ip,'ttl':int(original['ttl'])}
+                if original.get('weight') not in (None, ''): params['weight'] = str(original['weight'])
+                dnspod_call('Record.Modify',params,token)
+                verified=self.dnspod_records(line,token)
+                check=next((item for item in verified if str(item.get('id'))==str(record_id)),{})
+                if check.get('value') != ip: errors[str(record_id)]='DNSPod 回读 IP 不匹配'
+                else: results[str(record_id)]={'ok':True,'content':ip,'node_id':nid,'verified':True}
+            return {'ok':bool(results) and not errors,'verified':bool(results) and not errors,'records':results,'errors':errors}
+        except (OSError,RuntimeError,ValueError,KeyError,TypeError):
+            return {'ok':False,'error':'DNSPod 多记录未确认；检查凭据、记录身份、TTL/套餐及网络。'}
 
     def reconcile_dnspod(self):
         plans = self.line_plan()
@@ -2256,8 +2857,30 @@ class Controller:
             item = states.setdefault(line, {})
             nid = plan['selected_node']; ip = plan['content']
             if not nid:
-                item['reason'] = 'no_eligible_nodes'
+                item['reason'] = 'no_eligible_nodes'; item['needs_confirmation'] = True
                 results[line] = dict(plan, reason=item['reason'])
+                continue
+            if len(self.dnspod_line_records(line)) > 1:
+                assignments=self.line_pool_assignments(line,plan)
+                desired=[node for _,node in assignments]
+                previous_pool=item.get('active_nodes') or []
+                confirmed_pool=item.get('confirmed_record_ips') or {}
+                desired_ips={record_id:self.state['nodes'][node].get('public_ip') for record_id,node in assignments}
+                check=(desired != previous_pool or any(confirmed_pool.get(record_id) != value for record_id,value in desired_ips.items()) or
+                       item.get('needs_confirmation') or self.state.get('dns_needs_confirmation'))
+                if check:
+                    item['needs_confirmation']=True; self.save()
+                    response=self.update_dnspod_pool(line,assignments); item['last_result']=response
+                    if response.get('ok') is True:
+                        if desired != previous_pool: item['last_switch_at']=now()
+                        item.update(active_nodes=desired, active_node=desired[0] if desired else None,
+                                    confirmed_record_ips=desired_ips, confirmed_ip=desired_ips.get(assignments[0][0]) if assignments else None,
+                                    confirmed_at=now(), needs_confirmation=False, reason='dns_confirmed')
+                    else: item['reason']='dns_unconfirmed'
+                else: item['reason']='unchanged'
+                results[line]=dict(plan, selected_nodes=desired, active_nodes=item.get('active_nodes',previous_pool),
+                                   active_node=item.get('active_node'), reason=item['reason'])
+                self.save()
                 continue
             changed = nid != item.get('active_node')
             check = (changed or ip != item.get('confirmed_ip') or item.get('needs_confirmation') or
@@ -2275,7 +2898,13 @@ class Controller:
             else: item['reason'] = 'unchanged'
             results[line] = dict(plan, active_node=item.get('active_node'), reason=item['reason'])
             self.save()  # partial success is explicit; only failed lines retry
-        self.state['dns_needs_confirmation'] = False
+        # Keep the global retry flag set while any line is unconfirmed or has
+        # no eligible node. Clearing it after a partial success made the menu
+        # claim DNS was fully synchronized and could delay a failed line's
+        # retry until a later unrelated change.
+        self.state['dns_needs_confirmation'] = any(
+            bool(item.get('needs_confirmation')) or item.get('reason') in ('dns_unconfirmed', 'no_eligible_nodes')
+            for item in states.values())
         default = states.get('默认') or {}
         self.state['active_node'] = default.get('active_node')
         self.state['confirmed_dns_ip'] = default.get('confirmed_ip')
@@ -2311,6 +2940,8 @@ class Controller:
     def private_status(self):
         with self.lock, state_lock(self.path):
             self.reload(); result=copy.deepcopy(self.state); result['selected_node']=self.select()
+            if self.weighted_pool_enabled():
+                result['selected_nodes']=[nid for _,nid in self.weighted_pool_assignments()]
             if (self.state.get('dns') or {}).get('provider') == 'dnspod':
                 result['selected_lines']=self.line_plan()
         result.pop('enroll_tokens',None)
@@ -2323,6 +2954,635 @@ class Controller:
                 except (OSError,ValueError): status={'status':'not_ready'}
                 result['certificate_status'][name]=status
         return result
+
+TELEGRAM_API='https://api.telegram.org/bot'
+TELEGRAM_MESSAGE_LIMIT=3900
+TELEGRAM_ALERT_MAX=100
+TELEGRAM_ALERT_MAX_AGE=7*86400
+TELEGRAM_ALERT_BATCH=8
+TELEGRAM_ALERT_SEND_BUDGET=20
+
+def telegram_alert_generation(config, token=None):
+    """Return a non-secret identity for the currently published Bot config.
+
+    ``configuration_id`` is written by telegram_configure.  Older state files
+    do not have it, so the token fingerprint is used as a compatibility
+    generation without ever persisting the token itself.
+    """
+    value=str((config or {}).get('configuration_id') or '')
+    if value: return value[:128]
+    if token:
+        return 'token:'+telegram_token_fingerprint(token)
+    return 'legacy'
+
+def telegram_normalize_alert(raw, index=0, generation='legacy'):
+    """Validate/normalize one durable outbox row, or return ``None``."""
+    if not isinstance(raw,dict): return None
+    message=raw.get('message')
+    if not isinstance(message,str): message=str(message or '')
+    message=message.strip()
+    if not message or len(message) > 12000: return None
+    try: created=int(raw.get('created_at') or 0)
+    except (TypeError,ValueError): created=0
+    if created < 0: created=0
+    event_id=str(raw.get('id') or '')
+    if not re.fullmatch(r'[A-Za-z0-9._:-]{1,128}',event_id):
+        event_id=hashlib.sha256((message+'|'+str(created)+'|'+str(index)).encode()).hexdigest()[:32]
+    row={'id':event_id,'message':message,'created_at':created,
+         'generation':str(raw.get('generation') or generation)[:128],
+         'delivered_chat_ids':[]}
+    delivered=raw.get('delivered_chat_ids')
+    if isinstance(delivered,(list,tuple,set)):
+        row['delivered_chat_ids']=sorted({str(item) for item in delivered if re.fullmatch(r'-?[0-9]{3,30}',str(item))})
+    try: attempts=max(0,min(int(raw.get('attempts') or 0),16))
+    except (TypeError,ValueError): attempts=0
+    if attempts: row['attempts']=attempts
+    try: next_at=int(raw.get('next_attempt_at') or 0)
+    except (TypeError,ValueError): next_at=0
+    if next_at > 0: row['next_attempt_at']=next_at
+    return row
+
+class TelegramAPIError(RuntimeError):
+    """A sanitized Bot API error with bounded retry information."""
+    def __init__(self, message, status=0, retry_after=0):
+        super().__init__(message)
+        self.status=int(status or 0)
+        self.retry_after=max(0,min(int(retry_after or 0),3600))
+
+def telegram_token(config):
+    path=Path(str((config or {}).get('token_file','')))
+    try:
+        stat=path.stat()
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError('Telegram Bot Token 文件必须是普通文件。')
+        if stat.st_mode & 0o077:
+            raise RuntimeError('Telegram Bot Token 文件权限过宽；应为 600。')
+        if stat.st_uid not in (0,getattr(os,'geteuid',lambda:0)()):
+            raise RuntimeError('Telegram Bot Token 文件所有者无效。')
+        token=path.read_text().strip()
+    except RuntimeError:
+        raise
+    except OSError:
+        raise RuntimeError('Telegram Bot Token 文件不可读。') from None
+    if not re.fullmatch(r'\d{6,20}:[A-Za-z0-9_-]{20,200}',token):
+        raise RuntimeError('Telegram Bot Token 文件格式无效。')
+    return token
+
+def telegram_api(token, method, payload=None, timeout=25):
+    data=urlencode({key:(json.dumps(value,separators=(',',':')) if isinstance(value,(list,dict)) else str(value))
+                    for key,value in (payload or {}).items()}).encode()
+    request=urllib.request.Request(TELEGRAM_API+token+'/'+method, data=data,
+                                   headers={'Content-Type':'application/x-www-form-urlencoded'}, method='POST')
+    try:
+        # Never follow a redirect from the bot API URL: the token is part of
+        # that URL and must not be forwarded to an untrusted location.
+        with urllib.request.build_opener(NoCredentialRedirect).open(request, timeout=timeout) as response:
+            raw=response.read(1048577)
+            if len(raw) > 1048576: raise RuntimeError('Telegram API 响应过大。')
+            result=json.loads(raw)
+    except RuntimeError:
+        raise
+    except urllib.error.HTTPError as error:
+        status=int(getattr(error,'code',0) or 0)
+        retry=0; result=None
+        try:
+            raw=error.read(1048577)
+            if len(raw) <= 1048576:
+                result=json.loads(raw)
+        except (OSError,ValueError,TypeError):
+            result=None
+        finally:
+            try: error.close()
+            except OSError: pass
+        if isinstance(result,dict):
+            params=result.get('parameters')
+            candidate=params.get('retry_after') if isinstance(params,dict) else 0
+            try: retry=int(candidate)
+            except (TypeError,ValueError): retry=0
+            if result.get('error_code') == 429: status=429
+        if status == 429:
+            raise TelegramAPIError('Telegram API 限流；稍后重试。',status,retry) from None
+        raise TelegramAPIError('Telegram API 请求失败。',status) from None
+    except (OSError,ValueError,urllib.error.URLError):
+        # Avoid reflecting remote exception text (which may contain the bot
+        # URL/token or attacker-controlled response data).
+        raise TelegramAPIError('Telegram API 请求失败；稍后重试。') from None
+    if not isinstance(result,dict) or result.get('ok') is not True:
+        code=result.get('error_code') if isinstance(result,dict) else None
+        code=str(code) if isinstance(code,int) else 'unknown'
+        params=result.get('parameters') if isinstance(result,dict) else None
+        retry=params.get('retry_after') if isinstance(params,dict) else 0
+        try: retry=int(retry)
+        except (TypeError,ValueError): retry=0
+        if 0 < retry <= 3600:
+            raise TelegramAPIError('Telegram API 限流；稍后重试。',code,retry)
+        raise TelegramAPIError('Telegram API 返回失败。',code)
+    return result.get('result')
+
+def telegram_token_fingerprint(token):
+    return hashlib.sha256(str(token).encode()).hexdigest()[:24]
+
+TELEGRAM_CURSOR_MAX=(1 << 63)-1
+
+def telegram_read_offset(path, token):
+    """Read an update cursor only when it belongs to this Bot Token."""
+    try: item=json.loads(Path(path).read_text())
+    except (OSError,ValueError,TypeError): return 0
+    if not isinstance(item,dict) or item.get('token_fingerprint') != telegram_token_fingerprint(token): return 0
+    value=item.get('offset',0)
+    # Telegram update IDs are JSON integers.  Do not coerce booleans,
+    # floats, strings or unbounded values into a cursor: doing so can skip an
+    # entire Bot queue after a corrupted/hand-edited state file.
+    if isinstance(value,bool) or not isinstance(value,int) or not 0 <= value <= TELEGRAM_CURSOR_MAX:
+        return 0
+    return value
+
+def telegram_write_offset(path, token, offset):
+    path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
+    fd,temp_name=tempfile.mkstemp(prefix='.'+path.name+'.',dir=str(path.parent))
+    temp=Path(temp_name)
+    try:
+        os.fchmod(fd,0o600)
+        with os.fdopen(fd,'w') as stream:
+            json.dump({'version':1,'token_fingerprint':telegram_token_fingerprint(token),
+                       'offset':min(TELEGRAM_CURSOR_MAX,max(0,int(offset)) )},stream,separators=(',',':')); stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
+        temp.replace(path)
+    finally:
+        if temp.exists(): temp.unlink()
+
+def telegram_read_state(path):
+    return json.loads(Path(path).read_text())
+
+def _metric_counter(value):
+    """Render a bounded counter without trusting hand-edited state."""
+    try:
+        if isinstance(value,bool): raise ValueError
+        return max(0,min(int(value or 0),10**18))
+    except (TypeError,ValueError,OverflowError):
+        return 0
+
+def _fmt_bytes(value):
+    value=_metric_counter(value); units=('B','KiB','MiB','GiB','TiB'); size=float(value); index=0
+    while size >= 1024 and index < len(units)-1: size/=1024; index+=1
+    return ('%.1f %s' % (size,units[index])) if index else ('%d B' % value)
+
+def _fmt_node_state(node):
+    quota=_metric_counter(node.get('quota_bytes')); used=_metric_counter(node.get('used_bytes'))
+    if quota > 0 and used >= quota: return '配额已用完'
+    last_seen=_metric_counter(node.get('last_seen'))
+    if int(time.time())-last_seen > HEARTBEAT_TTL: return '心跳过期'
+    if node.get('healthy') is not True: return str(node.get('status') or '不健康')
+    return '正常'
+
+def telegram_load_sites(controller_path):
+    root=Path(controller_path).parent/'sites.d'; rows=[]
+    for file in sorted(root.glob('domain-*.json')) if root.is_dir() else []:
+        try: item=json.loads(file.read_text())
+        except (OSError,ValueError): continue
+        rows.append(item)
+    return rows
+
+def telegram_render(state, command, controller_path):
+    nodes=state.get('nodes') or {}; command=command.lower().split('@',1)[0]
+    lines=[]
+    if command in ('/help','/start'):
+        return ('可用命令：\n/status  主控、DNS 和当前节点\n/nodes   节点健康、地址、配额、累计流量\n'
+                '/traffic 最近 5 分钟流量摘要\n/access  最近 5 分钟访问 IP 和路径\n/devices 最近 5 分钟设备类型\n'
+                '/origins 源站和本机代理入口\n/refresh 读取最新已上报状态\n仅允许配置的 Telegram Chat ID 使用。')
+    if command in ('/status','/refresh'):
+        lines=['入口：%s' % (state.get('domain') or '-'),'地址类型：%s' % (state.get('address_family') or 'ipv4'),
+               '固定源站：%s' % (state.get('source') or '-'),'DNS：%s' % ((state.get('dns') or {}).get('provider') or '未配置'),
+               '当前节点：%s' % (state.get('active_node') or '尚未切换'),'节点数：%d' % len(nodes)]
+        if state.get('last_reconcile_reason'): lines.append('最近同步：%s' % state['last_reconcile_reason'])
+        for node_id,node in sorted(nodes.items()): lines.append('%s [%s]：%s' % (node.get('name') or node_id,node_id,_fmt_node_state(node)))
+        return '\n'.join(lines)
+    if command == '/nodes':
+        lines=['节点状态：']
+        for node_id,node in sorted(nodes.items(), key=lambda item:(-_metric_counter(item[1].get('priority')),item[0])):
+            quota='不限额' if not _metric_counter(node.get('quota_bytes')) else _fmt_bytes(node.get('quota_bytes'))
+            lines.append('%s [%s] · %s · %s · IP %s' % (node.get('name') or node_id,node_id,_fmt_node_state(node),node.get('address_family','ipv4'),node.get('public_ip','-')))
+            last_seen=_metric_counter(node.get('last_seen'))
+            lines.append('  流量 %s / %s · 最近心跳 %s' % (_fmt_bytes(node.get('used_bytes')),quota,time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(last_seen)) if last_seen else '-'))
+        return '\n'.join(lines) if len(lines)>1 else '暂无已注册节点。'
+    if command == '/traffic':
+        lines=['流量摘要（各边缘最近 5 分钟 + 累计用量；过期摘要不计入最近窗口）：']
+        total=0; recent=0
+        for node_id,node in sorted(nodes.items()):
+            metric=node.get('metrics') or {}; fresh=_metric_is_fresh(metric); value=_metric_counter(metric.get('bytes')) if fresh else 0; total+=_metric_counter(node.get('used_bytes')); recent+=value
+            lines.append('%s：最近 %s · 请求 %s · 累计 %s · %s' % (node.get('name') or node_id,_fmt_bytes(value),_metric_counter(metric.get('requests')) if fresh else '-',_fmt_bytes(node.get('used_bytes')),_metric_freshness(metric)))
+            if fresh:
+                for row in (metric.get('paths') or [])[:5]:
+                    lines.append('  路径 %s：%s · %s 请求' % (row.get('name','/'),_fmt_bytes(row.get('bytes')),_metric_counter(row.get('requests'))))
+        lines.append('合计累计：%s；最近窗口：%s' % (_fmt_bytes(total),_fmt_bytes(recent)))
+        return '\n'.join(lines)
+    if command in ('/access','/devices'):
+        bucket='clients' if command == '/access' else 'devices'; title='访问 IP' if bucket == 'clients' else '设备类型'; lines=['最近 5 分钟%s：' % title]
+        for node_id,node in sorted(nodes.items()):
+            metric=node.get('metrics') or {}
+            if not _metric_is_fresh(metric): continue
+            rows=metric.get(bucket) or []
+            if not rows: continue
+            lines.append('%s（%s）：' % (node.get('name') or node_id,_metric_freshness(metric)))
+            for row in rows[:10]: lines.append('  %s · %s 请求 · %s' % (row.get('name','-'),_metric_counter(row.get('requests')),_fmt_bytes(row.get('bytes'))))
+        return '\n'.join(lines) if len(lines)>1 else '最近窗口暂无访问摘要（等待边缘心跳上报）。'
+    if command == '/origins':
+        lines=['源站/代理入口：', '控制器入口 %s → %s' % (state.get('domain') or '-',state.get('source') or '-')]
+        sites=telegram_load_sites(controller_path)
+        for item in sites:
+            for route in item.get('routes') or []:
+                lines.append('%s %s → %s' % (item.get('domain') or item.get('id') or '-',route.get('path') or '/',route.get('upstream') or '-'))
+        return '\n'.join(lines)
+    return '未知命令。发送 /help 查看可用命令。'
+
+def telegram_send(token, chat_id, text, authorize=None):
+    # Telegram limits message text by UTF-16 code units, not Python code
+    # points. Split hard as well as on line boundaries so one long path or
+    # attacker-controlled label cannot make the notification fail.
+    def units(value): return len(value.encode('utf-16-le')) // 2
+    def chunks(value):
+        current=[]; size=0
+        for line in str(value).splitlines() or ['']:
+            pieces=[]; piece=''; piece_size=0
+            for char in line:
+                char_units=2 if ord(char) > 0xffff else 1
+                if piece and piece_size+char_units > TELEGRAM_MESSAGE_LIMIT:
+                    if piece: pieces.append(piece)
+                    piece=char; piece_size=char_units
+                else:
+                    piece += char; piece_size += char_units
+            pieces.append(piece)
+            for part in pieces:
+                extra=units(part)+(1 if current else 0)
+                if current and size+extra > TELEGRAM_MESSAGE_LIMIT:
+                    yield '\n'.join(current); current=[]; size=0
+                current.append(part); size += units(part)+(1 if len(current)>1 else 0)
+        if current: yield '\n'.join(current)
+    for chunk in chunks(text):
+        # A long response may span several API calls.  Recheck authorization
+        # immediately before every chunk so a revoked Chat ID or rotated Bot
+        # Token cannot receive the remainder of a sensitive response.
+        if authorize is not None and not authorize(token, str(chat_id)):
+            return False
+        telegram_api(token,'sendMessage',{'chat_id':chat_id,'text':chunk},timeout=15)
+    return True
+
+def telegram_alerts(path):
+    with state_lock(path):
+        state=json.loads(Path(path).read_text()); config=state.get('telegram') or {}
+        if config.get('enabled') is not True: return []
+        current={'active_node':state.get('active_node'),'active_nodes':list(state.get('active_nodes') or []),'selected_lines':{},'nodes':{}}
+        for line,item in (state.get('line_states') or {}).items():
+            if isinstance(item,dict): current['selected_lines'][line]=item.get('active_node')
+        for node_id,node in (state.get('nodes') or {}).items():
+            last_seen=int(node.get('last_seen') or 0)
+            fresh=last_seen > 0 and now()-last_seen <= HEARTBEAT_TTL
+            healthy=node.get('healthy') is True and fresh
+            status=_fmt_node_state(node)
+            if not fresh: status='心跳过期'
+            current['nodes'][node_id]={'healthy':healthy,'status':status,
+                                       'quota':bool(node.get('quota_bytes') and node.get('used_bytes',0)>=node.get('quota_bytes'))}
+        previous=config.get('alert_state') if isinstance(config.get('alert_state'),dict) else {}
+        if not previous:
+            config['alert_state']=current; state['telegram']=config; atomic_write(path,state)
+            return []
+        alerts=[]
+        if previous.get('active_node') != current['active_node'] and current['active_node']:
+            alerts.append('DNS 当前节点已切换：%s → %s' % (previous.get('active_node') or '无',current['active_node']))
+        if previous.get('active_nodes') != current['active_nodes'] and current['active_nodes']:
+            alerts.append('DNS 权重池已更新：%s' % (', '.join(current['active_nodes']) or '无'))
+        if previous.get('selected_lines') != current['selected_lines'] and current['selected_lines']:
+            changes=[]
+            for line,nid in sorted(current['selected_lines'].items()):
+                if (previous.get('selected_lines') or {}).get(line) != nid: changes.append('%s=%s' % (line,nid or '无'))
+            if changes: alerts.append('DNSPod 线路已切换：' + '，'.join(changes))
+        for node_id,value in current['nodes'].items():
+            old=(previous.get('nodes') or {}).get(node_id) or {}
+            if old.get('healthy') is True and value['healthy'] is False: alerts.append('节点异常：%s（%s）' % (node_id,value['status']))
+            elif old.get('healthy') is False and value['healthy'] is True: alerts.append('节点恢复：%s' % node_id)
+            if old.get('quota') is False and value['quota'] is True: alerts.append('节点配额已用完：%s' % node_id)
+        # Persist the alert state and outbox in the same lock transaction. A
+        # disable/reconfigure racing this check cannot resurrect old state.
+        try: alert_token=telegram_token(config)
+        except RuntimeError: alert_token=''
+        generation=telegram_alert_generation(config,alert_token)
+        pending=config.get('pending_alerts') if isinstance(config.get('pending_alerts'),list) else []
+        normalized=[]
+        seen_ids=set()
+        for index,item in enumerate(pending):
+            row=telegram_normalize_alert(item,index,generation)
+            if row is not None and row['id'] in seen_ids:
+                row['id']=hashlib.sha256((row['message']+'|'+str(row['created_at'])+'|duplicate|'+str(index)).encode()).hexdigest()[:32]
+            if row is not None and row['generation'] == generation and (not row['created_at'] or now()-row['created_at'] <= TELEGRAM_ALERT_MAX_AGE):
+                normalized.append(row)
+                seen_ids.add(row['id'])
+        # Do not deduplicate by message text: the same node can fail, recover,
+        # and fail again with an identical message. The state transition above
+        # already prevents duplicates on unchanged heartbeats.
+        for alert in alerts:
+            normalized.append({'id':secrets.token_hex(16),'message':str(alert)[:12000],
+                               'created_at':now(),'generation':generation,
+                               'delivered_chat_ids':[]})
+        config['pending_alerts']=normalized[-TELEGRAM_ALERT_MAX:]; config['alert_state']=current
+        state['telegram']=config; atomic_write(path,state)
+        return alerts
+
+def telegram_deliver_alerts(path, token, allowed):
+    """Send durable alerts with per-chat acknowledgements and safe merging."""
+    with state_lock(path):
+        state=json.loads(Path(path).read_text()); config=state.get('telegram') or {}
+        if config.get('enabled') is not True: return
+        try: current_token=telegram_token(config)
+        except RuntimeError: return
+        current_allowed={str(item) for item in config.get('chat_ids') or []}
+        generation=telegram_alert_generation(config,current_token)
+        pending=[]
+        source=config.get('pending_alerts') if isinstance(config.get('pending_alerts'),list) else []
+        seen_ids=set()
+        for index,item in enumerate(source):
+            row=telegram_normalize_alert(item,index,generation)
+            if row is not None and row['id'] in seen_ids:
+                row['id']=hashlib.sha256((row['message']+'|'+str(row['created_at'])+'|duplicate|'+str(index)).encode()).hexdigest()[:32]
+            if row is not None and row['generation'] == generation:
+                pending.append(row)
+                seen_ids.add(row['id'])
+    # Continue to the merge phase even with no sendable rows: this purges
+    # malformed, expired, or previous-configuration events durably. A totally
+    # empty queue can still return without taking a second lock.
+    if not pending and not source: return
+    outcomes={}; limit=0
+    for raw in pending:
+        if limit >= TELEGRAM_ALERT_BATCH or sum(1 for _ in outcomes) >= TELEGRAM_ALERT_SEND_BUDGET: break
+        message=raw['message']; created=raw['created_at']; event_id=raw['id']
+        if created and now() >= created and now()-created > TELEGRAM_ALERT_MAX_AGE:
+            outcomes[event_id]=None
+            continue
+        delivered=set(raw.get('delivered_chat_ids') or [])
+        try: next_at=int(raw.get('next_attempt_at') or 0)
+        except (TypeError,ValueError): next_at=0
+        if next_at > now(): continue
+        failed=False
+        sent_count=0
+        for chat_id in sorted(current_allowed-delivered):
+            if sent_count >= TELEGRAM_ALERT_SEND_BUDGET: failed=True; break
+            # Re-read authorization immediately before each network send.
+            with state_lock(path):
+                latest=json.loads(Path(path).read_text()); latest_config=latest.get('telegram') or {}
+                if latest_config.get('enabled') is not True: failed=True; break
+                try: send_token=telegram_token(latest_config)
+                except RuntimeError: failed=True; break
+                send_allowed={str(item) for item in latest_config.get('chat_ids') or []}
+                send_generation=telegram_alert_generation(latest_config,send_token)
+            # Never deliver an event from an older Bot/chat configuration to a
+            # newly authorized recipient.
+            if send_generation != raw['generation'] or chat_id not in send_allowed:
+                failed=True; break
+            try: telegram_send(send_token,chat_id,'emby-proxy 通知：\n'+message); delivered.add(chat_id)
+            except TelegramAPIError as error:
+                failed=True; print('[telegram] notification failed: '+str(error),file=sys.stderr,flush=True)
+                retry_after=max(0,min(int(getattr(error,'retry_after',0) or 0),3600))
+                if retry_after: raw['next_attempt_at']=now()+retry_after
+            except Exception as error:
+                failed=True; print('[telegram] notification failed: '+str(error),file=sys.stderr,flush=True)
+            sent_count += 1
+        if failed:
+            try: attempts=min(int(raw.get('attempts') or 0)+1,16)
+            except (TypeError,ValueError): attempts=1
+            raw['attempts']=attempts
+            raw.setdefault('next_attempt_at',now()+min(3600,max(30,2**min(attempts,8))))
+        else: raw.pop('next_attempt_at',None); raw.pop('attempts',None)
+        raw['delivered_chat_ids']=sorted(delivered); outcomes[event_id]=raw; limit+=1
+    with state_lock(path):
+        state=json.loads(Path(path).read_text()); config=state.get('telegram') or {}
+        latest_pending=config.get('pending_alerts') if isinstance(config.get('pending_alerts'),list) else []
+        latest_enabled=config.get('enabled') is True
+        latest_allowed={str(item) for item in config.get('chat_ids') or []} if latest_enabled else set()
+        latest_token=''
+        try: latest_token=telegram_token(config) if latest_enabled else ''
+        except RuntimeError: latest_enabled=False
+        latest_generation=telegram_alert_generation(config,latest_token)
+        merged=[]; handled=set(outcomes)
+        seen_ids=set()
+        for index,item in enumerate(latest_pending):
+            raw=telegram_normalize_alert(item,index,latest_generation)
+            if raw is None or raw['generation'] != latest_generation: continue
+            if raw['id'] in seen_ids:
+                raw['id']=hashlib.sha256((raw['message']+'|'+str(raw['created_at'])+'|duplicate|'+str(index)).encode()).hexdigest()[:32]
+            seen_ids.add(raw['id'])
+            event_id=raw['id']
+            result=outcomes.get(event_id)
+            if event_id in handled and result is None: continue
+            if event_id in handled:
+                raw.update(result)
+                if latest_allowed and latest_allowed.issubset(set(raw.get('delivered_chat_ids') or [])): continue
+            merged.append(raw)
+        # A disable/reconfigure wins over in-flight sends; do not resurrect
+        # rows that were intentionally cleared while network I/O was running.
+        config['pending_alerts']=merged[-TELEGRAM_ALERT_MAX:] if latest_enabled else []
+        state['telegram']=config; atomic_write(path,state)
+
+def telegram_configure(a):
+    path=Path(a.state); token=Path(a.token_file).read_text().strip()
+    if not re.fullmatch(r'\d{6,20}:[A-Za-z0-9_-]{20,200}',token): raise RuntimeError('Telegram Bot Token 格式无效。')
+    chat_ids=[]
+    for raw in str(a.chat_ids).split(','):
+        raw=raw.strip()
+        if not re.fullmatch(r'-?[0-9]{3,30}',raw): raise RuntimeError('Chat ID 必须是数字，可用逗号分隔多个。')
+        if raw not in chat_ids: chat_ids.append(raw)
+    # Validate the bot and optional test message before publishing either the
+    # token file or the state. A failed network/Chat-ID check must leave the
+    # previous Bot fully usable instead of half-updating the configuration.
+    telegram_api(token,'getMe',{},timeout=15)
+    if getattr(a,'test',False):
+        for chat_id in chat_ids: telegram_send(token,chat_id,'emby-proxy Telegram 通知已配置成功。发送 /help 查看命令。')
+    target=Path(a.persist_token or path.with_name('telegram.token')); target.parent.mkdir(parents=True,exist_ok=True)
+    old_token=None; old_mode=None; had_token=target.is_file()
+    if had_token:
+        old_token=target.read_bytes(); old_mode=target.stat().st_mode & 0o777
+    fd,temp_name=tempfile.mkstemp(prefix='.'+target.name+'.',dir=str(target.parent)); temp=Path(temp_name)
+    try:
+        os.fchmod(fd,0o600)
+        with os.fdopen(fd,'w') as stream:
+            stream.write(token); stream.flush(); os.fsync(stream.fileno())
+        temp.replace(target)
+        with state_lock(path):
+            state=json.loads(path.read_text()); backup_file(path)
+            # A new bot/chat generation must never receive events or a
+            # baseline collected under the previous allowlist. This is both
+            # a privacy boundary and a deterministic alert baseline.
+            state['telegram']={'enabled':True,'token_file':str(target),'chat_ids':chat_ids,
+                               'poll_interval':30,'configuration_id':secrets.token_urlsafe(18),
+                               'alert_state':{},'pending_alerts':[]}
+            atomic_write(path,state)
+    except Exception:
+        # Restore a custom/previous token if state publication failed. The
+        # incoming temporary file is always removed and never left readable.
+        try:
+            if had_token:
+                restore=target.with_name('.'+target.name+'.restore')
+                rfd,rname=tempfile.mkstemp(prefix=restore.name+'.',dir=str(target.parent))
+                os.fchmod(rfd,int(old_mode or 0o600))
+                with os.fdopen(rfd,'wb') as stream: stream.write(old_token or b''); stream.flush(); os.fsync(stream.fileno())
+                Path(rname).replace(target)
+            else: target.unlink(missing_ok=True)
+        except OSError: pass
+        raise
+    finally:
+        if temp.exists(): temp.unlink()
+    print('Telegram Bot 已配置：%d 个 Chat ID；Token 仅保存在 %s' % (len(chat_ids),target))
+
+def telegram_test(a):
+    state=telegram_read_state(a.state); config=state.get('telegram') or {}
+    if config.get('enabled') is not True: raise RuntimeError('Telegram Bot 尚未启用。')
+    token=telegram_token(config)
+    for chat_id in config.get('chat_ids') or []: telegram_send(token,chat_id,'emby-proxy 测试通知正常。')
+    print('测试消息已发送。')
+
+def telegram_disable(a):
+    path=Path(a.state)
+    with state_lock(path):
+        state=json.loads(path.read_text()); backup_file(path); config=state.get('telegram') or {}
+        config['enabled']=False; config['pending_alerts']=[]; state['telegram']=config
+        for node in (state.get('nodes') or {}).values(): node.pop('metrics',None)
+        atomic_write(path,state)
+    print('Telegram Bot 已停用。')
+
+def telegram_status(a):
+    state=telegram_read_state(a.state); config=state.get('telegram') or {}
+    print(json.dumps({'enabled':config.get('enabled') is True,'chat_ids':config.get('chat_ids',[]),'token_file':config.get('token_file',''),'service':'emby-proxy-telegram.service'},ensure_ascii=False,indent=2))
+
+@contextmanager
+def telegram_poll_lock(path):
+    """Serialize polling processes and always release the fd on failure."""
+    if fcntl is None:
+        yield
+        return
+    lock_path=Path(str(path)+'.telegram.poll.lock'); lock_path.parent.mkdir(parents=True,exist_ok=True)
+    fd=open_private_lock(lock_path)
+    try:
+        try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except OSError: raise RuntimeError('Telegram 轮询服务已在运行，拒绝启动第二个实例。')
+        yield
+    finally:
+        try: fcntl.flock(fd,fcntl.LOCK_UN)
+        finally: os.close(fd)
+
+def telegram_serve(a):
+    path=Path(a.state)
+    with telegram_poll_lock(path):
+        return telegram_serve_loop(a,path)
+
+def telegram_serve_loop(a,path):
+    def runtime():
+        config=(telegram_read_state(path).get('telegram') or {})
+        if config.get('enabled') is not True: return None
+        token=telegram_token(config); allowed={str(item) for item in config.get('chat_ids') or []}
+        if not allowed: raise RuntimeError('Telegram 未配置允许的 Chat ID。')
+        return token,allowed,Path(config.get('offset_file') or path.with_name('telegram.offset'))
+    def activate(current):
+        """Bind a poll cycle to one token and refresh Bot identity/webhook."""
+        token,allowed,offset_file=current
+        offset_file.parent.mkdir(parents=True,exist_ok=True)
+        # Long polling and a webhook are mutually exclusive. Do not silently
+        # delete a webhook that another operator or deployment may own.
+        me=telegram_api(token,'getMe',{},timeout=15) or {}
+        bot_username=str(me.get('username') or '').lower() if isinstance(me,dict) else ''
+        webhook=telegram_api(token,'getWebhookInfo',{},timeout=15) or {}
+        if isinstance(webhook,dict) and str(webhook.get('url') or ''):
+            raise RuntimeError('Telegram Bot 已配置 webhook；请先在 Telegram 侧删除 webhook，再启动轮询。')
+        return token,allowed,offset_file,bot_username
+
+    current=runtime()
+    if not current: raise RuntimeError('Telegram Bot 尚未启用。')
+    token,allowed,offset_file,bot_username=activate(current)
+    offset=telegram_read_offset(offset_file,token)
+
+    def authorized(send_token, chat_id):
+        # Check both identity and ACL from disk immediately before each API
+        # call. The callback is intentionally fail-closed on malformed state.
+        try: fresh=runtime()
+        except Exception: return False
+        return bool(fresh and fresh[0] == send_token and str(chat_id) in fresh[1])
+
+    print('[telegram] bot polling started',flush=True)
+    while True:
+        current=runtime()
+        if not current:
+            print('[telegram] disabled; stopping',flush=True); return
+        # A token rotation must start a new Bot session, including getMe and
+        # webhook checks. Never send a request from an old session with the
+        # new token or carry the old cursor to the new Bot.
+        if current[0] != token or current[2] != offset_file:
+            token,allowed,offset_file,bot_username=activate(current)
+            offset=telegram_read_offset(offset_file,token)
+        else:
+            allowed=current[1]
+            offset=telegram_read_offset(offset_file,token)
+        try:
+            updates=telegram_api(token,'getUpdates',{'offset':offset,'timeout':20,'allowed_updates':['message']},timeout=30) or []
+        except TelegramAPIError as error:
+            print('[telegram] polling failed: '+str(error),file=sys.stderr,flush=True)
+            updates=[]; time.sleep(max(1,min(error.retry_after or 10,3600)))
+        except RuntimeError as error:
+            print('[telegram] polling failed: '+str(error),file=sys.stderr,flush=True)
+            updates=[]; time.sleep(10)
+        # Telegram normally returns a list.  A malformed API mock/proxy must
+        # not make the daemon iterate a string/dict or acknowledge data.
+        if not isinstance(updates,list):
+            time.sleep(1)
+            continue
+        # If config changed while getUpdates was blocked, discard the entire
+        # old-Bot batch. Processing it with the replacement token could leak
+        # replies and would write the old cursor into the new offset file.
+        after_poll=runtime()
+        if not after_poll:
+            print('[telegram] disabled; stopping',flush=True); return
+        if after_poll[0] != token or after_poll[2] != offset_file:
+            continue
+        allowed=after_poll[1]
+        for update in updates:
+            if not isinstance(update,dict): continue
+            value=update.get('update_id')
+            if isinstance(value,bool) or not isinstance(value,int) or not 0 <= value <= TELEGRAM_CURSOR_MAX:
+                continue
+            update_id=value
+            # Authorization is reloaded for every update. A disable or Chat
+            # ID rotation during a long poll must take effect before any
+            # reply, rather than waiting for the next 20-second poll.
+            fresh=runtime()
+            if not fresh:
+                print('[telegram] disabled; stopping',flush=True); return
+            fresh_token,fresh_allowed,fresh_offset_file=fresh
+            if fresh_token != token or fresh_offset_file != offset_file:
+                # Do not process a batch after rotation. The next iteration
+                # activates the replacement Bot and fetches its own queue.
+                continue
+            allowed=fresh_allowed
+            message=update.get('message') if isinstance(update,dict) else None
+            if not isinstance(message,dict):
+                offset=max(offset,update_id+1); telegram_write_offset(offset_file,token,offset); continue
+            chat=message.get('chat') if isinstance(message.get('chat'),dict) else {}; chat_id=str(chat.get('id',''))
+            if chat_id in allowed:
+                text=str(message.get('text') or '').strip()
+                # Ignore ordinary chat text; the bot is a read-only command
+                # endpoint, not a chat echo service.
+                if text.startswith('/'):
+                    command=text.split()[0]
+                    command_match=re.fullmatch(r'(/[A-Za-z0-9_]+)(?:@([^\s]+))?',command)
+                    if command_match and (not command_match.group(2) or command_match.group(2).lower() == bot_username):
+                        try:
+                            current_state=Controller(str(path)).private_status()
+                            telegram_send(token,chat_id,telegram_render(current_state,command,str(path)),authorize=authorized)
+                        except Exception as error:
+                            try: telegram_send(token,chat_id,'查询失败，请稍后重试。',authorize=authorized)
+                            except Exception as send_error: print('[telegram] reply failed: '+str(send_error),file=sys.stderr,flush=True)
+            # A malformed/unauthorized update is acknowledged as well, so it
+            # cannot block the queue forever. A failed reply is best-effort.
+            offset=max(offset,update_id+1)
+            telegram_write_offset(offset_file,token,offset)
+        try:
+            telegram_alerts(path); telegram_deliver_alerts(path,token,allowed)
+        except Exception as error:
+            print('[telegram] alert processing failed: '+str(error),file=sys.stderr,flush=True)
 
 class Handler(BaseHTTPRequestHandler):
     def handle(self):
@@ -2345,6 +3605,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path=urlparse(self.path).path; b=self.body()
             secure=isinstance(getattr(self,'connection',None),ssl.SSLSocket)
+            # In Caddy/Nginx HTTPS-proxy mode the controller receives plain
+            # HTTP from the local reverse proxy. Trust its X-Forwarded-Proto
+            # only when the peer is loopback; a public client cannot forge it.
+            if not secure and str(self.headers.get('X-Forwarded-Proto','')).lower() == 'https':
+                try: secure=ipaddress.ip_address(self.client_address[0]).is_loopback
+                except (ValueError,TypeError): secure=False
             if path == '/certificate':
                 code,result=self.server.controller.certificate(b,self.headers.get('Authorization','').removeprefix('Bearer ').strip(),secure=secure)
             elif path == '/enroll':
@@ -2365,6 +3631,9 @@ class Server(ThreadingHTTPServer):
         if context: sock=context.wrap_socket(sock,server_side=True,do_handshake_on_connect=False)
         return sock,address
 
+class IPv6Server(Server):
+    address_family=socket.AF_INET6
+
 def init_state(a):
     domain=a.domain.strip().lower().rstrip('.')
     entry_id=(a.entry_id.strip() if a.entry_id else '') or ('domain-'+domain)
@@ -2376,6 +3645,7 @@ def init_state(a):
             raise RuntimeError('主控域名格式无效；请填写不带协议、端口或路径的完整域名。')
         if control_domain == domain:
             raise RuntimeError('主控域名不能与业务入口域名相同。')
+    address_family=normalize_address_family(getattr(a,'address_family','ipv4'))
     path=Path(a.state)
     if path.exists():
         if not getattr(a, 'force', False):
@@ -2387,10 +3657,20 @@ def init_state(a):
             suffix += 1
         backup.write_bytes(path.read_bytes())
         os.chmod(backup, 0o600)
-    state={'schema_version':1,'entry_id':entry_id,'domain':domain,'source':source,'engine':a.engine,'active_node':None,'enroll_tokens':{},'nodes':{}}
+    state={'schema_version':1,'entry_id':entry_id,'domain':domain,'source':source,'engine':a.engine,'address_family':address_family,'active_node':None,'active_nodes':[],'enroll_tokens':{},'nodes':{}}
     if control_domain: state['control_domain']=control_domain
-    if a.zone_id and a.record_id and a.token_file:
-        state['dns']={'provider':'cloudflare','zone_id':a.zone_id,'record_id':a.record_id,'token_file':a.token_file,'ttl':60}
+    record_ids=[]
+    raw_record_ids=str(getattr(a,'record_ids','') or '').strip()
+    if raw_record_ids:
+        record_ids=[item for item in raw_record_ids.split(',') if item]
+    elif a.record_id:
+        record_ids=[str(a.record_id)]
+    if len(set(record_ids)) != len(record_ids) or any(not re.fullmatch(r'[0-9a-fA-F-]{4,128}', item) for item in record_ids):
+        raise RuntimeError('Cloudflare record_ids 必须是去重后的记录 ID。')
+    if a.zone_id and record_ids and a.token_file:
+        state['dns']={'provider':'cloudflare','zone_id':a.zone_id,'record_id':record_ids[0],
+                      'record_ids':record_ids,'record_type':address_record_type(address_family),
+                      'token_file':a.token_file,'ttl':60}
     with state_lock(a.state): atomic_write(a.state,state)
     print('已创建多线路入口：'+a.state)
 def set_dns_routes(a):
@@ -2410,6 +3690,140 @@ def set_dns_routes(a):
             for previous in (state.get('line_states') or {}).values(): previous['last_switch_at']=0
         dns['routes']=routes; state['dns']=dns; backup_file(path); atomic_write(path,state)
     print('DNSPod 线路路由已保存：'+json.dumps(routes,ensure_ascii=False,sort_keys=True))
+
+def set_dnspod_line_pool(a):
+    path=Path(a.state); weights={}
+    if a.line not in DNSPOD_LINES: raise RuntimeError('仅支持：%s。' % '、'.join(DNSPOD_LINES))
+    for raw in a.weight or []:
+        if '=' not in raw: raise RuntimeError('权重格式必须是节点 ID=数字。')
+        node,value=(part.strip() for part in raw.split('=',1))
+        if node in weights or not re.fullmatch(r'[1-9][0-9]{0,5}',value): raise RuntimeError('权重必须是正整数且节点不能重复。')
+        weights[node]=int(value)
+    with state_lock(path):
+        state=json.loads(path.read_text()); dns=state.get('dns') or {}
+        if dns.get('provider') != 'dnspod': raise RuntimeError('当前入口未配置 DNSPod。')
+        records=dns.get('line_records',{}).get(a.line)
+        records=records if isinstance(records,list) else ([records] if records else [])
+        if len(records)<2: raise RuntimeError('该运营商线路至少需要两条 DNSPod %s 记录。' % address_record_type(state.get('address_family','ipv4')))
+        unknown=sorted(set(weights)-set(state.get('nodes',{})))
+        if unknown: raise RuntimeError('权重包含未注册节点：'+','.join(unknown))
+        if not weights: raise RuntimeError('至少配置一个节点权重。')
+        backup_file(path); dns.setdefault('line_weights',{})[a.line]=weights; state['dns']=dns
+        state['dns_needs_confirmation']=True; atomic_write(path,state)
+    print('%s 线路权重已保存：%s' % (a.line,json.dumps(weights,ensure_ascii=False,sort_keys=True)))
+
+def set_cloudflare_records(a):
+    path=Path(a.state); raw=str(a.record_ids or '')
+    record_ids=[item.strip() for item in raw.split(',') if item.strip()]
+    if not record_ids or len(set(record_ids)) != len(record_ids) or any(not re.fullmatch(r'[0-9a-fA-F-]{4,128}', item) for item in record_ids):
+        raise RuntimeError('至少需要一个去重后的 Cloudflare record ID。')
+    with state_lock(path):
+        state=json.loads(path.read_text()); dns=state.get('dns') or {}
+        if dns.get('provider') != 'cloudflare': raise RuntimeError('当前入口未配置 Cloudflare。')
+        backup_file(path); dns['record_ids']=record_ids; dns['record_id']=record_ids[0]
+        state['dns']=dns
+        # Shrinking a weighted pool to one record changes the semantics back
+        # to single-active failover. Drop stale pool metadata so the menu and
+        # status view cannot claim a weighted pool that is no longer usable.
+        if len(record_ids) < 2:
+            state.pop('routing', None)
+            state['active_nodes'] = []
+            state.pop('confirmed_record_ips', None)
+        state['dns_needs_confirmation']=True; atomic_write(path,state)
+    print('Cloudflare 记录池已保存：'+','.join(record_ids))
+
+def set_pool_weights(a):
+    path=Path(a.state); weights={}
+    for raw in a.weight or []:
+        if '=' not in raw: raise RuntimeError('权重格式必须是节点 ID=数字。')
+        node,value=(part.strip() for part in raw.split('=',1))
+        if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}',node) or not re.fullmatch(r'[1-9][0-9]{0,5}',value):
+            raise RuntimeError('权重必须是正整数，节点 ID 格式无效。')
+        if node in weights: raise RuntimeError('节点权重重复：'+node)
+        weights[node]=int(value)
+    with state_lock(path):
+        state=json.loads(path.read_text()); dns=state.get('dns') or {}
+        if dns.get('provider') != 'cloudflare': raise RuntimeError('多节点权重模式当前需要 Cloudflare。')
+        record_ids=dns.get('record_ids') or ([dns['record_id']] if dns.get('record_id') else [])
+        if len(record_ids) < 2: raise RuntimeError('至少需要两条同名 Cloudflare %s 记录；先在 DNS 中创建，再刷新记录池。' % address_record_type(state.get('address_family','ipv4')))
+        unknown=sorted(set(weights)-set(state.get('nodes',{})))
+        if unknown: raise RuntimeError('权重包含未注册节点：'+','.join(unknown))
+        if not weights: raise RuntimeError('至少配置一个节点权重。')
+        backup_file(path); state['routing']={'mode':'weighted','weights':weights,'schedule':[]}
+        state['active_nodes']=[]; state['dns_needs_confirmation']=True; atomic_write(path,state)
+    print('多节点权重已保存：'+json.dumps(weights,ensure_ascii=False,sort_keys=True))
+
+def parse_schedule_time(value):
+    value=str(value).strip()
+    match=re.fullmatch(r'([01][0-9]|2[0-3]):([0-5][0-9])',value)
+    if not match: raise RuntimeError('时间必须是 HH:MM（例如 08:00）。')
+    return int(match.group(1))*60+int(match.group(2))
+
+def parse_schedule_weights(raw, nodes):
+    weights={}
+    for item in str(raw).split(','):
+        if '=' not in item: raise RuntimeError('权重格式必须是节点 ID=数字。')
+        node,value=(part.strip() for part in item.split('=',1))
+        if node not in nodes: raise RuntimeError('调度策略包含未注册节点：'+node)
+        if not re.fullmatch(r'[1-9][0-9]{0,5}',value): raise RuntimeError('调度权重必须是正整数。')
+        if node in weights: raise RuntimeError('调度策略中的节点重复：'+node)
+        weights[node]=int(value)
+    if not weights: raise RuntimeError('调度策略至少需要一个节点权重。')
+    return weights
+
+def set_schedule(a):
+    path=Path(a.state); slots=[]; seen=set()
+    with state_lock(path):
+        state=json.loads(path.read_text()); provider=str(a.provider or '')
+        if provider not in ('cloudflare','dnspod'):
+            provider='dnspod' if (state.get('dns') or {}).get('provider') == 'dnspod' else 'cloudflare'
+        for raw in a.slot or []:
+            if '|' not in raw: raise RuntimeError('调度格式必须是 HH:MM|策略内容。')
+            start,body=(part.strip() for part in raw.split('|',1)); minute=parse_schedule_time(start)
+            if minute in seen: raise RuntimeError('调度时间重复：'+start)
+            seen.add(minute)
+            if provider == 'cloudflare':
+                dns=state.get('dns') or {}; record_ids=dns.get('record_ids') or ([dns['record_id']] if dns.get('record_id') else [])
+                if dns.get('provider') != 'cloudflare' or len(record_ids) < 2:
+                    raise RuntimeError('Cloudflare 定时权重需要至少两条同名 %s 记录。' % address_record_type(state.get('address_family','ipv4')))
+                weights=parse_schedule_weights(body,state.get('nodes',{}))
+                slots.append({'start':start,'minute':minute,'weights':weights})
+            else:
+                if (state.get('dns') or {}).get('provider') != 'dnspod': raise RuntimeError('当前入口未配置 DNSPod。')
+                routes={}
+                for item in body.split(','):
+                    if '=' not in item: raise RuntimeError('线路策略格式必须是 线路=节点 ID。')
+                    line,node=(part.strip() for part in item.split('=',1))
+                    if line not in DNSPOD_LINES: raise RuntimeError('仅支持：%s。' % '、'.join(DNSPOD_LINES))
+                    if node not in state.get('nodes',{}): raise RuntimeError('调度策略包含未注册节点：'+node)
+                    if line in routes:
+                        raise RuntimeError('同一调度档位中的线路不能重复：'+line)
+                    routes[line]=node
+                if not routes: raise RuntimeError('至少需要一条 DNSPod 线路策略。')
+                slots.append({'start':start,'minute':minute,'routes':routes})
+        slots.sort(key=lambda item:item['minute'])
+        for item in slots: item.pop('minute',None)
+        backup_file(path)
+        if provider == 'cloudflare':
+            # Keep the static profile as the fallback outside scheduled slots;
+            # the schedule is an overlay and must not destroy the user's base
+            # weights when it is later cleared.
+            state['routing']={'mode':'weighted','weights':(state.get('routing') or {}).get('weights') or {},'schedule':slots}
+        else:
+            dns=state['dns']; dns['schedule']=slots; state['dns']=dns
+        state['dns_needs_confirmation']=True; state['last_switch_at']=0; atomic_write(path,state)
+    print('定时调度已保存：%s 个时间档位（按主控服务器本地时间）' % len(slots))
+
+def clear_schedule(a):
+    path=Path(a.state)
+    with state_lock(path):
+        state=json.loads(path.read_text()); backup_file(path)
+        if (state.get('dns') or {}).get('provider') == 'dnspod':
+            state['dns'].pop('schedule',None)
+        else:
+            state.setdefault('routing',{}).pop('schedule',None)
+        state['dns_needs_confirmation']=True; state['last_switch_at']=0; atomic_write(path,state)
+    print('定时调度已清除。')
 def auto_node_id(state, public_ip):
     base='edge-'+re.sub(r'[^A-Za-z0-9]+','-',str(public_ip).strip()).strip('-').lower()
     base=base if base != 'edge-' else 'edge-node'
@@ -2421,7 +3835,16 @@ def issue(a):
     path=Path(a.state)
     with state_lock(path):
         state=json.loads(path.read_text()); state.setdefault('enroll_tokens',{}); state.setdefault('nodes',{})
+        configured_family=normalize_address_family(state.get('address_family','ipv4'))
+        requested_family=str(getattr(a,'address_family','') or '').strip()
+        address_family=normalize_address_family(requested_family or configured_family)
+        if requested_family and address_family != configured_family:
+            raise RuntimeError('该入口已固定使用 %s，不能为单个节点混用 %s。' % (configured_family, address_family))
+        # 菜单首次验证通过后会把地址保存到状态；CLI 省略参数时优先沿用
+        # 该值，避免 DNSPod/Caddy HTTPS 主控被错误降级成旧的 HTTP 回退地址。
         controller_url=str(getattr(a,'controller_url','') or '').strip()
+        if not controller_url:
+            controller_url=str(state.get('controller_url') or '').strip()
         if not controller_url:
             control_domain=state.get('certificates',{}).get('control_domain') or state.get('control_domain','')
             if control_domain:
@@ -2435,20 +3858,24 @@ def issue(a):
             if urlparse(controller_url).hostname != state['certificates']['control_domain']:
                 raise RuntimeError('请使用已配置的主控 HTTPS 域名生成注册码。')
         node_id=(a.node_id or '').strip() or auto_node_id(state,a.public_ip)
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', node_id):
+            raise RuntimeError('节点 ID 只能包含字母、数字、点、下划线、连字符或冒号。')
         token=secrets.token_urlsafe(24)
-        state['enroll_tokens'][node_id]={'token':token,'issued_at':now()}
+        state['enroll_tokens'][node_id]={'token':token,'issued_at':now(),'address_family':address_family}
         state['controller_url']=controller_url
         backup_file(path)
         atomic_write(path,state)
-    values=['sudo','ep','controller','node-install','--controller-url',controller_url,'--entry-id',state['entry_id'],'--node-id',node_id,'--name',a.name or node_id,'--priority',str(a.priority),'--quota-bytes',str(a.quota_bytes)]
+    values=['sudo','ep','controller','node-install','--controller-url',controller_url,'--entry-id',state['entry_id'],'--node-id',node_id,'--name',a.name or node_id,'--priority',str(a.priority),'--quota-bytes',str(a.quota_bytes),'--address-family',address_family]
     if a.public_ip: values += ['--public-ip',a.public_ip]
     values += ['--enroll-token',token]
     # 边缘 VPS 可以是全新机器或旧版管理器；命令先确保当前管理器具备 node-install，再注册。
     # 旧管理器必须升级到带引擎预检的协议，再使用本次注册码。
     bootstrap_url=os.environ.get('EMBY_PROXY_BOOTSTRAP_URL','https://raw.githubusercontent.com/wuuduf/emby-proxy/main/setup-emby-proxy.sh')
     command=' '.join(shlex.quote(str(v)) for v in values)
-    bootstrap='tmp=$(mktemp) && trap \'rm -f "$tmp"\' EXIT && curl -fsSL %s -o "$tmp" && sudo bash "$tmp" --manager-only && sudo ep controller node-install --help 2>&1 | grep -q engine-preflight' % shlex.quote(bootstrap_url)
-    print("(command -v ep >/dev/null 2>&1 && sudo ep controller node-install --help 2>&1 | grep -q engine-preflight-cert-v1) || (bash -c %s) && %s" % (shlex.quote(bootstrap.replace('grep -q engine-preflight','grep -q engine-preflight-cert-v1')), command))
+    # 旧版管理器可能已经包含早期 engine-preflight 标记，却还不认识
+    # IPv4/IPv6 的 --address-family；能力探测必须检查真实参数。
+    bootstrap='tmp=$(mktemp) && trap \'rm -f "$tmp"\' EXIT && curl -fsSL %s -o "$tmp" && sudo bash "$tmp" --manager-only && sudo ep controller node-install --help 2>&1 | grep -q -- "--address-family"' % shlex.quote(bootstrap_url)
+    print("(command -v ep >/dev/null 2>&1 && sudo ep controller node-install --help 2>&1 | grep -q -- '--address-family') || (bash -c %s) && %s" % (shlex.quote(bootstrap), command))
     print("提示：注册码只能使用一次，签发后 15 分钟失效。")
 def validate_interval(value):
     try: interval=int(value)
@@ -2463,9 +3890,34 @@ def validate_listen(value):
     if not re.fullmatch(r'[A-Za-z0-9_.:\-\[\]]+', host) or not port.isdigit() or not 0 <= int(port) <= 65535:
         raise RuntimeError('监听端口必须在 0-65535 之间。')
     return value
+def systemd_quote(value):
+    """Quote one ExecStart argument without shell-evaluating operator paths."""
+    # systemd expands percent specifiers even inside a quoted ExecStart
+    # argument; double literal percent signs before writing the unit.
+    value=str(value).replace('\\','\\\\').replace('%','%%').replace('$','$$').replace('"','\\"').replace('\n','\\n')
+    return '"'+value+'"'
+def _systemd_probe(unit, verb):
+    """Return a pre-change systemd state without making a failed probe fatal."""
+    try:
+        subprocess.run(['systemctl', verb, '--quiet', unit], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+def _restore_systemd_state(unit, was_enabled, was_active):
+    """Best-effort restore used only after a unit transaction fails."""
+    commands = [
+        ['systemctl', 'enable' if was_enabled else 'disable', unit],
+        ['systemctl', 'restart' if was_active else 'stop', unit],
+    ]
+    for command in commands:
+        try: subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError): pass
 def serve(a):
     listen=validate_listen(a.listen); interval=validate_interval(a.reconcile_interval)
-    host,port=listen.rsplit(':',1); c=Controller(a.state); s=Server((host,int(port)),c); print('多线路主控监听 '+listen,flush=True); stop=threading.Event()
+    host,port=listen.rsplit(':',1); host=host.strip('[]')
+    server_class=IPv6Server if ':' in host else Server
+    c=Controller(a.state); s=server_class((host,int(port)),c); print('多线路主控监听 '+listen,flush=True); stop=threading.Event()
     tls_config=c.state.get('certificates')
     def load_tls():
         pair=(Path(tls_config['directory'])/'control'/'current').resolve(strict=True)
@@ -2487,8 +3939,12 @@ def serve(a):
 def master_install(a):
     if os.geteuid() != 0: raise SystemExit('master-install 需要 root 或 sudo')
     listen=validate_listen(a.listen); interval=validate_interval(a.reconcile_interval)
-    unit='''[Unit]\nDescription=emby-proxy multiline master\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nExecStart=/usr/local/sbin/emby-proxy controller serve --state %s --listen %s --reconcile-interval %s\nRestart=on-failure\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\n''' % (a.state,listen,interval)
-    unit_path=Path('/etc/systemd/system/emby-proxy-master.service'); backup=write_unit(unit_path,unit)
+    unit='''# MANAGED EMBY CONTROLLER\n[Unit]\nDescription=emby-proxy multiline master\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nExecStart=/usr/local/sbin/emby-proxy controller serve --state %s --listen %s --reconcile-interval %s\nRestart=on-failure\nRestartSec=5\nNoNewPrivileges=true\nPrivateTmp=true\nProtectHome=true\nRestrictSUIDSGID=true\nLockPersonality=true\nRestrictNamespaces=true\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nLimitNOFILE=4096\nTasksMax=128\nUMask=0077\n[Install]\nWantedBy=multi-user.target\n''' % (systemd_quote(a.state),systemd_quote(listen),interval)
+    unit_path=Path('/etc/systemd/system/emby-proxy-master.service')
+    had_unit=unit_path.exists() and not unit_path.is_symlink()
+    was_enabled=_systemd_probe('emby-proxy-master.service','is-enabled') if had_unit else False
+    was_active=_systemd_probe('emby-proxy-master.service','is-active') if had_unit else False
+    backup=write_unit(unit_path,unit)
     # 已运行的服务也必须载入新监听参数；任一步失败不能显示“已启动”。
     try:
         for command in (['systemctl','daemon-reload'], ['systemctl','enable','emby-proxy-master.service'], ['systemctl','restart','emby-proxy-master.service'], ['systemctl','is-active','--quiet','emby-proxy-master.service']):
@@ -2496,25 +3952,39 @@ def master_install(a):
     except Exception:
         restore_file(unit_path, backup)
         subprocess.run(['systemctl','daemon-reload'],check=False)
+        if had_unit:
+            _restore_systemd_state('emby-proxy-master.service', was_enabled, was_active)
+        else:
+            # A newly-created unit may already be enabled/started before a
+            # later systemd step fails.  Stop and disable it as part of the
+            # transaction; otherwise a failed install leaves an orphaned
+            # controller process after the unit file was removed.
+            _restore_systemd_state('emby-proxy-master.service', False, False)
         raise
     print('主控服务已启动：emby-proxy-master.service')
-def resolve_edge_ipv4(value):
+def resolve_edge_ip(value, address_family='ipv4'):
     """Run only on the edge, before consuming its single-use registration token."""
+    address_family = normalize_address_family(address_family)
+    version = 6 if address_family == 'ipv6' else 4
+    endpoint = 'https://api64.ipify.org' if version == 6 else 'https://api.ipify.org'
     if not value:
         try:
-            result=subprocess.run(['curl','-4','--noproxy','*','-fsS','--connect-timeout','4',
-                '--max-time','8','https://api.ipify.org'], capture_output=True, text=True,
+            result=subprocess.run(['curl','-'+str(version),'--noproxy','*','-fsS','--connect-timeout','4',
+                '--max-time','8',endpoint], capture_output=True, text=True,
                 check=True, timeout=10)
             value=result.stdout.strip()
         except (OSError, subprocess.SubprocessError):
-            raise RuntimeError('边缘公网 IPv4 自动检测失败；检查网络，或在原命令末尾加 --public-ip <边缘公网IPv4> 后重试，注册码未消耗。') from None
+            raise RuntimeError('边缘公网 IPv%s 自动检测失败；检查网络，或在原命令末尾加 --public-ip <边缘公网地址> 后重试，注册码未消耗。' % version) from None
     try:
-        ip=ipaddress.IPv4Address(value)
+        ip=(ipaddress.IPv6Address if version == 6 else ipaddress.IPv4Address)(value)
         if not ip.is_global or ip.is_multicast:
             raise ValueError('not a public unicast address')
     except ValueError:
-        raise RuntimeError('边缘需要有效的公网 IPv4；请用 --public-ip 指定本机入口地址，注册码未消耗。') from None
+        raise RuntimeError('边缘需要有效的公网 IPv%s；请用 --public-ip 指定本机入口地址，注册码未消耗。' % version) from None
     return str(ip)
+
+def resolve_edge_ipv4(value):
+    return resolve_edge_ip(value, 'ipv4')
 
 def detect_edge_engine():
     """Read-only preflight: never install a competing engine on an existing VPS."""
@@ -2537,9 +4007,10 @@ def detect_edge_engine():
 def node_install(a):
     if os.geteuid() != 0: raise SystemExit('node-install 需要 root 或 sudo')
     controller_url=validate_endpoint(a.controller_url, allow_http=True, label='主控 URL')
-    a.public_ip=resolve_edge_ipv4(a.public_ip)
+    address_family=normalize_address_family(getattr(a,'address_family','ipv4'))
+    a.public_ip=resolve_edge_ipv4(a.public_ip) if address_family == 'ipv4' else resolve_edge_ip(a.public_ip, address_family)
     detected_engine=detect_edge_engine()
-    print('边缘公网 IPv4：'+a.public_ip)
+    print('边缘公网 IPv%s：%s' % ('6' if address_family == 'ipv6' else '4', a.public_ip))
     print('本机引擎预检：'+(detected_engine or '未安装，将按主控配置安装'))
     node_file=Path('/etc/emby-proxy/multiline-node.json')
     if node_file.exists():
@@ -2547,9 +4018,9 @@ def node_install(a):
         except (OSError, ValueError): old={}
         if old.get('node_id') and (old.get('node_id') != a.node_id or old.get('controller','').rstrip('/') != a.controller_url.rstrip('/')):
             raise RuntimeError('本机已有边缘节点 %s；一台 VPS 只支持一个 node-id，请先卸载旧节点再注册。' % old.get('node_id'))
-    result=None; registered=False; node_backup=None; node_written=False; unit_backups=[]; certificate_before=None
+    result=None; registered=False; node_backup=None; node_written=False; unit_backups=[]; unit_created=[]; certificate_before=None
     try:
-        result=post_json(controller_url+'/enroll',{'entry_id':a.entry_id,'node_id':a.node_id,'name':a.name,'priority':a.priority,'quota_bytes':a.quota_bytes,'enroll_token':a.enroll_token,'public_ip':a.public_ip,'detected_engine':detected_engine,'version':'single-script-0.2'})
+        result=post_json(controller_url+'/enroll',{'entry_id':a.entry_id,'node_id':a.node_id,'name':a.name,'priority':a.priority,'quota_bytes':a.quota_bytes,'enroll_token':a.enroll_token,'public_ip':a.public_ip,'address_family':address_family,'detected_engine':detected_engine,'version':'single-script-0.2'})
         registered=True
         engine=result.get('engine','caddy'); domain=result['domain']
         # 兼容旧主控：旧版可能忽略预检字段，仍必须在执行安装后端前阻止冲突。
@@ -2559,7 +4030,7 @@ def node_install(a):
         log_root='/var/log/caddy' if engine == 'caddy' else '/var/log/nginx'
         access_log='%s/emby-proxy-%s-access.log' % (log_root, domain)
         offset=Path('/var/lib/emby-proxy/usage.offset')
-        state={'controller':controller_url,'entry_id':a.entry_id,'node_id':a.node_id,'node_token':result['node_token'],'domain':domain,'source':result['source'],'engine':engine,'public_ip':a.public_ip,'used_file':str(used),'access_log':access_log,'usage_offset_file':str(offset)}
+        state={'controller':controller_url,'entry_id':a.entry_id,'node_id':a.node_id,'node_token':result['node_token'],'domain':domain,'source':result['source'],'engine':engine,'public_ip':a.public_ip,'address_family':address_family,'used_file':str(used),'access_log':access_log,'usage_offset_file':str(offset),'telemetry_enabled':result.get('telemetry_enabled') is True}
         certificate_args=[]
         if result.get('certificate_managed'):
             state['certificate_directory']='/etc/emby-proxy-tls'
@@ -2574,17 +4045,20 @@ def node_install(a):
         if not backend.exists(): raise RuntimeError('未找到安装后端，请先用同一个 emby-proxy 脚本完成本机反代配置。')
         # 边缘节点的域名通常仍指向当前活动节点，不能因为 DNS 尚未切换就阻止预配置。
         # 只跳过安装阶段探测；参与选路前，心跳仍要求本机已有有效 HTTPS 证书。
-        setup_result=subprocess.run([str(backend),'--engine',state['engine'],'--domain',state['domain'],'--upstream',state['source'],'--skip-dns-check','--skip-verify']+certificate_args,check=False)
+        setup_result=subprocess.run([str(backend),'--engine',state['engine'],'--domain',state['domain'],'--upstream',state['source'],'--address-family',address_family,'--skip-dns-check','--skip-verify']+certificate_args,check=False)
         if setup_result.returncode != 0: raise RuntimeError('边缘反代预配置失败，请先修复本机 '+state['engine']+' 配置。')
         node_backup=backup_file(node_file); atomic_write(node_file,state); node_written=True; os.chmod(node_file,0o600)
-        service_unit='[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nTimeoutStartSec=25s\nExecStart=/usr/local/sbin/emby-proxy controller node --state /etc/emby-proxy/multiline-node.json\n'
+        service_unit='# MANAGED EMBY CONTROLLER\n[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nTimeoutStartSec=25s\nNoNewPrivileges=true\nPrivateTmp=true\nProtectHome=true\nRestrictSUIDSGID=true\nLockPersonality=true\nRestrictNamespaces=true\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nLimitNOFILE=2048\nTasksMax=32\nUMask=0077\nExecStart=/usr/local/sbin/emby-proxy controller node --state /etc/emby-proxy/multiline-node.json\n'
         # Some Debian/systemd combinations leave a oneshot timer with only
         # OnUnitInactiveSec at infinity after the first trigger.  A calendar
         # expression is deterministic for a 30-second heartbeat and keeps
         # working after a service restart or a long VPS suspend/resume.
-        timer_unit='[Unit]\n[Timer]\nOnCalendar=*-*-* *:*:00,30\nAccuracySec=1s\nPersistent=true\n[Install]\nWantedBy=timers.target\n'
-        unit_backups.append((Path('/etc/systemd/system/emby-proxy-node.service'), write_unit('/etc/systemd/system/emby-proxy-node.service',service_unit)))
-        unit_backups.append((Path('/etc/systemd/system/emby-proxy-node.timer'), write_unit('/etc/systemd/system/emby-proxy-node.timer',timer_unit)))
+        timer_unit='# MANAGED EMBY CONTROLLER\n[Unit]\n[Timer]\nUnit=emby-proxy-node.service\nOnCalendar=*-*-* *:*:00,30\nAccuracySec=1s\nPersistent=true\n[Install]\nWantedBy=timers.target\n'
+        service_path=Path('/etc/systemd/system/emby-proxy-node.service'); timer_path=Path('/etc/systemd/system/emby-proxy-node.timer')
+        if not service_path.exists(): unit_created.append('emby-proxy-node.service')
+        if not timer_path.exists(): unit_created.append('emby-proxy-node.timer')
+        unit_backups.append((service_path, write_unit(service_path,service_unit)))
+        unit_backups.append((timer_path, write_unit(timer_path,timer_unit)))
         # OnCalendar 不依赖 oneshot 服务的 active/inactive 状态，避免
         # 部分 systemd/虚拟化环境将下一次触发错误地显示为 infinity。
         for command in (['systemctl','daemon-reload'], ['systemctl','enable','emby-proxy-node.timer'], ['systemctl','restart','emby-proxy-node.timer']):
@@ -2605,6 +4079,11 @@ def node_install(a):
         for path,backup in reversed(unit_backups):
             restore_file(path,backup)
         if unit_backups: subprocess.run(['systemctl','daemon-reload'],check=False)
+        # If this was a first-time install, a failed enable/restart may have
+        # left a loaded timer or oneshot service behind after its unit file is
+        # restored/removed.  Stop and disable only units we created here.
+        for unit_name in unit_created:
+            _restore_systemd_state(unit_name,False,False)
         if node_written: restore_file(node_file,node_backup)
         if registered and result and result.get('node_token'):
             try: post_json(controller_url+'/revoke',{'node_id':a.node_id},result['node_token'])
@@ -2617,52 +4096,309 @@ def local_entry_health(st):
     if not domain or '/' in domain or ':' in domain or not shutil.which('curl'):
         return False
     url='https://%s/_emby_proxy_health' % domain
+    family=normalize_address_family(st.get('address_family','ipv4'))
+    resolve_ip='[::1]' if family == 'ipv6' else '127.0.0.1'
+    curl_family='-6' if family == 'ipv6' else '-4'
     try:
         result=subprocess.run([
-            'curl','--noproxy','*','-fsS','-o','/dev/null','--connect-timeout','3',
-            '--max-time','8','--resolve','%s:443:127.0.0.1' % domain,url
+            'curl',curl_family,'--noproxy','*','-fsS','-o','/dev/null','--connect-timeout','3',
+            '--max-time','8','--resolve','%s:443:%s' % (domain,resolve_ip),url
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
         return result.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 def _json_number(value):
-    try: return max(0, int(float(value)))
-    except (TypeError, ValueError): return 0
+    try:
+        parsed=float(value)
+        return max(0, int(parsed)) if math.isfinite(parsed) else 0
+    except (TypeError, ValueError, OverflowError): return 0
 def collect_usage(st):
-    """Accumulate response bytes from the managed JSON access log once per line."""
+    """Commit response bytes and log cursor together; used_bytes is a mirror.
+
+    Legacy two-integer cursors remain readable. New checkpoints also keep a
+    prefix fingerprint so compressed Caddy/Nginx rotations can be matched
+    after compression changes their inode. Never count archives predating
+    the last known file, or guess if that file has already expired.
+    """
+    import gzip
     used_path=Path(st.get('used_file','/var/lib/emby-proxy/used_bytes'))
     offset_path=Path(st.get('usage_offset_file',str(used_path)+'.offset'))
-    try: used=int(''.join(used_path.read_text().split()) or 0)
-    except (OSError, ValueError): used=0
     log_path=Path(st.get('access_log',''))
-    if not log_path.is_file(): return max(0, used)
+    lock_path=Path(str(offset_path)+'.lock'); lock_path.parent.mkdir(parents=True,exist_ok=True)
+    fd=open_private_lock(lock_path)
     try:
-        info=log_path.stat(); marker='%s %s' % (info.st_ino, info.st_size)
-        old=offset_path.read_text().split()
-        inode=int(old[0]); offset=int(old[1])
-        if inode != info.st_ino or offset < 0 or offset > info.st_size: offset=0
-    except (OSError, ValueError, IndexError):
-        inode=info.st_ino; offset=0
-    added=0; position=offset
-    try:
-        with log_path.open('rb') as stream:
-            stream.seek(offset)
-            for raw in stream:
-                position += len(raw)
+        if fcntl is not None: fcntl.flock(fd, fcntl.LOCK_EX)
+        try: used=int(''.join(used_path.read_text().split()) or 0)
+        except (OSError, ValueError): used=0
+        checkpoint={}
+        try:
+            raw=offset_path.read_text()
+            if raw.lstrip().startswith('{'):
+                checkpoint=json.loads(raw)
+                if not isinstance(checkpoint,dict) or checkpoint.get('version') != 2:
+                    raise ValueError('unsupported usage checkpoint')
+                used=max(0,int(checkpoint['used_bytes']))
+                old_inode=int(checkpoint['inode']); old_offset=int(checkpoint['offset'])
+            else:
+                old=raw.split(); old_inode=int(old[0]); old_offset=int(old[1])
+        except FileNotFoundError:
+            old_inode,old_offset=None,0
+        except (OSError, ValueError, IndexError, KeyError, TypeError) as exc:
+            # A corrupt durable cursor cannot safely be replayed from zero.
+            raise RuntimeError('usage checkpoint unreadable; restore its backup before retrying') from exc
+
+        def open_log(path):
+            return gzip.open(path,'rb') if str(path).endswith('.gz') else Path(path).open('rb')
+
+        def matches_checkpoint(stream):
+            length=int(checkpoint.get('prefix_length',0))
+            if length <= 0: return False
+            stream.seek(0)
+            if hashlib.sha256(stream.read(length)).hexdigest()!=checkpoint.get('prefix_sha256'):
+                return False
+            context_length=int(checkpoint.get('context_length',0))
+            context_hash=checkpoint.get('context_sha256')
+            if context_length <= 0 or not context_hash:
+                return True
+            context_offset=max(0,old_offset-context_length)
+            stream.seek(context_offset)
+            return hashlib.sha256(stream.read(context_length)).hexdigest()==context_hash
+
+        def consume(stream, start):
+            """Ignore bad JSON, keep unfinished lines, bound each line buffer."""
+            added=0; position=max(0,int(start))
+            stream.seek(position)
+            while True:
+                begin=stream.tell(); raw=stream.readline(1024*1024)
+                if not raw: break
+                # A concurrent writer may leave a line incomplete, and a
+                # malicious/invalid request line may be very large. Consume
+                # chunks until newline while retaining at most one bounded
+                # line in memory; leave EOF-without-newline for the next run.
+                parts=[raw]; total_length=len(raw)
+                while not raw.endswith(b'\n'):
+                    raw=stream.readline(1024*1024)
+                    if not raw:
+                        position=begin; break
+                    total_length += len(raw)
+                    if total_length <= 1024*1024: parts.append(raw)
+                if not raw:
+                    break
+                position=stream.tell()
+                if total_length > 1024*1024: continue
+                raw=b''.join(parts)
                 try: item=json.loads(raw.decode('utf-8'))
                 except (UnicodeDecodeError, json.JSONDecodeError): continue
+                if not isinstance(item,dict): continue
                 req=item.get('request') if isinstance(item.get('request'),dict) else {}
-                path=str(item.get('path') or req.get('uri') or '').split('?',1)[0]
-                if path.rstrip('/') == '/_emby_proxy_health': continue
+                path_value=str(item.get('path') or req.get('uri') or '').split('?',1)[0]
+                if path_value.rstrip('/') == '/_emby_proxy_health': continue
                 added += _json_number(item.get('bytes_sent', item.get('size', item.get('bytes', 0))))
-    except OSError:
-        return used
-    total=used + added
-    used_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp=used_path.with_suffix(used_path.suffix+'.tmp'); tmp.write_text(str(total)+'\n'); os.chmod(tmp,0o600); tmp.replace(used_path)
-    offset_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp=offset_path.with_suffix(offset_path.suffix+'.tmp'); tmp.write_text('%s %s\n' % (inode,position)); os.chmod(tmp,0o600); tmp.replace(offset_path)
-    return total
+            return added,position
+
+        def publish(path,text):
+            path.parent.mkdir(parents=True,exist_ok=True)
+            temporary_fd,temporary_name=tempfile.mkstemp(prefix='.'+path.name+'.',dir=str(path.parent))
+            temporary=Path(temporary_name)
+            try:
+                with os.fdopen(temporary_fd,'w') as stream:
+                    stream.write(text); stream.flush(); os.fsync(stream.fileno())
+                temporary.replace(path)
+                # Make the committed rename durable before publishing its mirror.
+                directory_fd=os.open(str(path.parent),os.O_RDONLY)
+                try: os.fsync(directory_fd)
+                finally: os.close(directory_fd)
+            finally:
+                if temporary.exists(): temporary.unlink()
+
+        if not log_path.is_file():
+            if checkpoint: publish(used_path,str(used)+'\n')
+            return max(0,used)
+        added=0
+        # fstat the descriptor we actually consume, not a pathname which the
+        # Web server may rename and replace between stat() and open().
+        with log_path.open('rb') as current:
+            info=os.fstat(current.fileno()); current_inode=int(info.st_ino)
+            same=old_inode==current_inode and (not checkpoint or int(checkpoint.get('device',info.st_dev))==info.st_dev)
+            if same and checkpoint.get('prefix_length') and not matches_checkpoint(current): same=False
+            if same:
+                start=old_offset if 0 <= old_offset <= info.st_size else 0
+                added,position=consume(current,start)
+            else:
+                archives=[]
+                numeric=re.compile(re.escape(log_path.name)+r'\.(\d+)(?:\.gz)?$')
+                timestamp=re.compile(re.escape(log_path.stem)+r'-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}(?:\.\d+)?)(?:\.log)(?:\.gz)?$')
+                for candidate in log_path.parent.iterdir():
+                    if candidate.is_symlink() or not candidate.is_file(): continue
+                    number=numeric.fullmatch(candidate.name); stamp=timestamp.fullmatch(candidate.name)
+                    if number: archives.append(((0,-int(number[1])),candidate))
+                    elif stamp: archives.append(((1,stamp[1]),candidate))
+                archives.sort(key=lambda item:item[0])
+                anchor=None
+                if old_inode is not None and old_offset >= 0:
+                    # Prefer identity; fingerprint is a fallback for gzip.
+                    for index,(_,candidate) in enumerate(archives):
+                        if int(candidate.stat().st_ino)==old_inode and not str(candidate).endswith('.gz'):
+                            anchor=index; break
+                    if anchor is None and checkpoint.get('prefix_length'):
+                        # The oldest matching archive is the one produced by
+                        # the rotation that replaced the tracked active file.
+                        # Later archives are additional complete log files and
+                        # are drained from byte zero below.
+                        for index in range(len(archives)):
+                            try:
+                                with open_log(archives[index][1]) as stream:
+                                    if matches_checkpoint(stream): anchor=index; break
+                            except (OSError, EOFError, gzip.BadGzipFile) as exc:
+                                raise RuntimeError('rotated usage log unreadable; retrying next heartbeat') from exc
+                    if anchor is not None:
+                        for index in range(anchor,len(archives)):
+                            try:
+                                with open_log(archives[index][1]) as stream:
+                                    value,_=consume(stream,old_offset if index==anchor else 0)
+                                    added+=value
+                            except (OSError, EOFError, gzip.BadGzipFile) as exc:
+                                # Never advance the checkpoint as if an archive
+                                # was read; retry the complete rotation on the
+                                # next heartbeat.
+                                raise RuntimeError('rotated usage log unreadable; retrying next heartbeat') from exc
+                value,position=consume(current,0); added+=value
+            current.seek(0); prefix=current.read(min(info.st_size,4096))
+            context_length=min(position,4096)
+            current.seek(max(0,position-context_length)); context=current.read(context_length)
+        total=max(0,used)+added
+        committed=dict(version=2,used_bytes=total,inode=current_inode,device=int(info.st_dev),offset=position,
+                       prefix_length=len(prefix),prefix_sha256=hashlib.sha256(prefix).hexdigest(),
+                       context_length=len(context),context_sha256=hashlib.sha256(context).hexdigest())
+        publish(offset_path,json.dumps(committed,sort_keys=True)+'\n')
+        publish(used_path,str(total)+'\n')
+        return total
+    finally:
+        if fcntl is not None: fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+def _access_timestamp(item):
+    """Return finite event time; malformed JSON must never break a heartbeat."""
+    if not isinstance(item,dict): return 0.0
+    try:
+        if item.get('ts') is not None:
+            value=float(item['ts'])
+        else:
+            stamp=str(item.get('time') or '')
+            if not stamp: return 0.0
+            value=datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp()
+        return value if math.isfinite(value) and value > 0 else 0.0
+    except (TypeError,ValueError,OverflowError,OSError): return 0.0
+
+def _metric_freshness(metric):
+    """Describe sampling freshness instead of presenting a stale snapshot as live."""
+    if not isinstance(metric,dict): return '无数据'
+    generated=_json_number(metric.get('generated_at'))
+    window=max(60,_json_number(metric.get('window_seconds')) or 300)
+    if not generated: return '时间未知'
+    age=max(0,now()-generated); label='约 %s 秒前' % age
+    if age > max(window*2,600): label += '，已过期'
+    if metric.get('truncated'): label += '，日志采样不完整'
+    return label
+
+def _metric_is_fresh(metric):
+    if not isinstance(metric,dict): return False
+    generated=_json_number(metric.get('generated_at'))
+    window=max(60,_json_number(metric.get('window_seconds')) or 300)
+    return bool(generated and 0 <= now()-generated <= max(window*2,600))
+
+def _access_header(request, name):
+    headers=request.get('headers') if isinstance(request.get('headers'),dict) else {}
+    for key,value in headers.items():
+        if str(key).lower() != name.lower(): continue
+        if isinstance(value,list): return str(value[0] if value else '')
+        return str(value)
+    return ''
+
+def _device_class(user_agent):
+    value=str(user_agent or '').lower()
+    if not value: return 'Unknown'
+    if any(item in value for item in ('smart-tv','smarttv','tizen','webos','roku','tv;')): return 'TV'
+    if any(item in value for item in ('iphone','ipad','ios')): return 'iOS'
+    if any(item in value for item in ('android','fire tv','androidtv')): return 'Android'
+    if any(item in value for item in ('windows phone','windows nt')): return 'Windows'
+    if any(item in value for item in ('macintosh','mac os')): return 'macOS'
+    if 'linux' in value: return 'Linux'
+    if any(item in value for item in ('emby','jellyfin')): return 'Emby/客户端'
+    if any(item in value for item in ('mozilla','chrome','safari','firefox','edge')): return '浏览器'
+    return 'Other'
+
+def collect_access_metrics(st, window=300, limit=5000):
+    """Build a bounded recent access summary for controller queries.
+
+    Raw request URLs are not sent to the controller. Only top client IPs,
+    coarse device classes, paths, bytes and status counters are reported.
+    """
+    log_path=Path(st.get('access_log',''))
+    try: window=max(60,min(int(window),3600))
+    except (TypeError,ValueError,OverflowError): window=300
+    stamp=time.time(); cutoff=stamp-window; rows=[]; truncated=False
+    # Do not call ``readlines()`` on a multi-gigabyte access log every 30s.
+    # The tail is deliberately bounded; an explicit flag makes the UI honest
+    # when a busy log has more recent rows than this sampling window can hold.
+    try: row_limit=max(1,min(int(limit),20000))
+    except (TypeError,ValueError,OverflowError): row_limit=5000
+    try: configured_max=int(st.get('access_log_max_bytes', 4*1024*1024))
+    except (TypeError,ValueError,OverflowError): configured_max=4*1024*1024
+    max_bytes=max(64*1024, min(configured_max, 16*1024*1024))
+    if log_path.is_file():
+        try:
+            with log_path.open('rb') as stream:
+                size=os.fstat(stream.fileno()).st_size
+                if size > max_bytes:
+                    stream.seek(size-max_bytes); raw=stream.read(max_bytes); truncated=True
+                    # The first line is usually a fragment of a record.
+                    if b'\n' in raw: raw=raw.split(b'\n',1)[1]
+                    else: raw=b''
+                else:
+                    raw=stream.read(max_bytes)
+            # Do not count an unterminated final event while the logger writes it.
+            if raw and not raw.endswith(b'\n'): raw=raw.rsplit(b'\n',1)[0] if b'\n' in raw else b''
+            split_rows=raw.splitlines()
+            if len(split_rows) > row_limit: truncated=True
+            rows=split_rows[-row_limit:]
+        except OSError:
+            rows=[]; truncated=False
+    totals={'requests':0,'bytes':0,'errors':0,'clients':{},'devices':{},'paths':{}}
+    future_cutoff=stamp+300
+    for raw in rows:
+        try: item=json.loads(raw.decode('utf-8'))
+        except (UnicodeDecodeError,json.JSONDecodeError): continue
+        if not isinstance(item,dict): continue
+        timestamp=_access_timestamp(item)
+        if timestamp < cutoff or timestamp > future_cutoff: continue
+        request=item.get('request') if isinstance(item.get('request'),dict) else {}
+        path=_metric_path(item.get('path') or request.get('uri') or '/')
+        if path.rstrip('/') == '/_emby_proxy_health': continue
+        client=_metric_client(request.get('remote_ip') or item.get('client') or request.get('client_ip') or '')
+        device=_device_class(_access_header(request,'user-agent') or item.get('user_agent'))
+        status=_json_number(item.get('status', 0)); size=_json_number(item.get('bytes_sent', item.get('size', item.get('bytes', 0))))
+        totals['requests']+=1; totals['bytes']+=size; totals['errors'] += int(status >= 400)
+        for bucket,key in (('clients',client),('devices',device),('paths',path[:256])):
+            if not key: continue
+            entry=totals[bucket].setdefault(key, {'requests':0,'bytes':0})
+            entry['requests']+=1; entry['bytes']+=size
+    def top(bucket, count=20):
+        return [dict(name=name, **value) for name,value in sorted(bucket.items(), key=lambda item:(-item[1]['bytes'],-item[1]['requests'],item[0]))[:count]]
+    return sanitize_metrics({'generated_at':now(),'window_seconds':int(window),'requests':totals['requests'],
+            'bytes':totals['bytes'],'errors':totals['errors'],'clients':top(totals['clients']),
+            'devices':top(totals['devices'],12),'paths':top(totals['paths'],20),
+            'sampled_rows':len(rows),'truncated':truncated})
+
+def telemetry_transport_secure(controller):
+    # A legacy HTTP controller can still receive liveness/usage, but access
+    # IPs/devices are sent only over TLS or numeric loopback on this machine.
+    try:
+        endpoint=urlparse(validate_endpoint(controller))
+        if endpoint.scheme == 'https': return True
+        return endpoint.scheme == 'http' and ipaddress.ip_address(endpoint.hostname).is_loopback
+    except (ValueError,RuntimeError): return False
+
 def node_once(a):
     st=json.loads(Path(a.state).read_text()); used=0
     used=collect_usage(st)
@@ -2673,27 +4409,50 @@ def node_once(a):
     if st.get('certificate_directory'):
         try: cert_status=json.loads((Path(st['certificate_directory'])/'status.json').read_text())
         except (OSError,ValueError): cert_status={'status':'unknown'}
-    result=post_json(st['controller']+'/heartbeat',{'node_id':st['node_id'],'used_bytes':used,'healthy':healthy,'public_ip':st.get('public_ip'),'event':'edge_heartbeat','version':'single-script-0.2','certificate_status':cert_status},st['node_token']); print(json.dumps(result,ensure_ascii=False))
+    payload={'node_id':st['node_id'],'used_bytes':used,'healthy':healthy,'public_ip':st.get('public_ip'),'address_family':st.get('address_family','ipv4'),'event':'edge_heartbeat','version':'single-script-0.2','certificate_status':cert_status}
+    # Access IP/device/path telemetry is opt-in via the controller's Telegram
+    # configuration. Do not read or transmit the log when it is disabled.
+    if st.get('telemetry_enabled') is True and telemetry_transport_secure(st.get('controller','')):
+        payload['metrics']=collect_access_metrics(st)
+    result=post_json(st['controller']+'/heartbeat',payload,st['node_token'])
+    if isinstance(result,dict) and 'telemetry_enabled' in result:
+        enabled=result.get('telemetry_enabled') is True
+        if enabled != bool(st.get('telemetry_enabled')):
+            with state_lock(a.state):
+                latest=json.loads(Path(a.state).read_text()); latest['telemetry_enabled']=enabled; atomic_write(a.state,latest)
+    print(json.dumps(result,ensure_ascii=False))
 def main():
     p=argparse.ArgumentParser(prog='emby-proxy controller'); sub=p.add_subparsers(dest='cmd',required=True)
     x=sub.add_parser('cert-setup'); x.add_argument('--state',required=True); x.add_argument('--control-domain',required=True); x.add_argument('--install-deps',action='store_true'); x.set_defaults(fn=cert_setup)
     x=sub.add_parser('https-proxy-setup'); x.add_argument('--state',required=True); x.add_argument('--control-domain',default=''); x.set_defaults(fn=https_proxy_setup)
     x=sub.add_parser('cert-renew'); x.add_argument('--state',required=True); x.set_defaults(fn=cert_renew)
     x=sub.add_parser('node-cert-sync'); x.add_argument('--state',default='/etc/emby-proxy/multiline-node.json'); x.set_defaults(fn=node_cert_sync)
-    x=sub.add_parser('init'); x.add_argument('--state',required=True); x.add_argument('--entry-id',default=''); x.add_argument('--domain',required=True); x.add_argument('--source',required=True); x.add_argument('--engine',default='caddy'); x.add_argument('--control-domain',default=''); x.add_argument('--zone-id'); x.add_argument('--record-id'); x.add_argument('--token-file'); x.add_argument('--force',action='store_true'); x.set_defaults(fn=init_state)
+    x=sub.add_parser('init'); x.add_argument('--state',required=True); x.add_argument('--entry-id',default=''); x.add_argument('--domain',required=True); x.add_argument('--source',required=True); x.add_argument('--engine',default='caddy'); x.add_argument('--address-family',choices=ADDRESS_FAMILIES,default='ipv4'); x.add_argument('--control-domain',default=''); x.add_argument('--zone-id'); x.add_argument('--record-id'); x.add_argument('--record-ids',default=''); x.add_argument('--token-file'); x.add_argument('--force',action='store_true'); x.set_defaults(fn=init_state)
     x=sub.add_parser('dnspod-configure'); x.add_argument('--state',required=True); x.add_argument('--token-file',required=True); x.add_argument('--apply',action='store_true'); x.set_defaults(fn=dnspod_configure)
-    x=sub.add_parser('dnspod-discover'); x.add_argument('--domain',required=True); x.add_argument('--token-file',required=True); x.set_defaults(fn=dnspod_discover)
+    x=sub.add_parser('dnspod-discover'); x.add_argument('--domain',required=True); x.add_argument('--token-file',required=True); x.add_argument('--record-type',choices=('A','AAAA'),default='A'); x.set_defaults(fn=dnspod_discover)
     x=sub.add_parser('set-lines'); x.add_argument('--state',required=True); x.add_argument('--route',action='append',default=[]); x.set_defaults(fn=set_dns_routes)
-    x=sub.add_parser('issue'); x.add_argument('--state',required=True); x.add_argument('--controller-url',default=''); x.add_argument('--node-id',default=''); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',default='',help='公网 IPv4；省略时在边缘检测 (auto-ip)'); x.set_defaults(fn=issue)
+    x=sub.add_parser('set-line-pool'); x.add_argument('--state',required=True); x.add_argument('--line',required=True); x.add_argument('--weight',action='append',default=[]); x.set_defaults(fn=set_dnspod_line_pool)
+    x=sub.add_parser('set-records'); x.add_argument('--state',required=True); x.add_argument('--record-ids',required=True); x.set_defaults(fn=set_cloudflare_records)
+    x=sub.add_parser('set-pool'); x.add_argument('--state',required=True); x.add_argument('--weight',action='append',default=[]); x.set_defaults(fn=set_pool_weights)
+    x=sub.add_parser('set-schedule'); x.add_argument('--state',required=True); x.add_argument('--provider',choices=('cloudflare','dnspod'),default=''); x.add_argument('--slot',action='append',default=[]); x.set_defaults(fn=set_schedule)
+    x=sub.add_parser('clear-schedule'); x.add_argument('--state',required=True); x.set_defaults(fn=clear_schedule)
+    x=sub.add_parser('issue'); x.add_argument('--state',required=True); x.add_argument('--controller-url',default=''); x.add_argument('--node-id',default=''); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--address-family',choices=ADDRESS_FAMILIES,default=''); x.add_argument('--public-ip',default='',help='公网地址；省略时在边缘检测 (auto-ip)'); x.set_defaults(fn=issue)
     x=sub.add_parser('serve'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=serve)
     x=sub.add_parser('master-install'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=master_install)
-    x=sub.add_parser('node-install', description='边缘安装：auto-ip / engine-preflight-cert-v1'); x.add_argument('--controller-url',required=True); x.add_argument('--entry-id',required=True); x.add_argument('--node-id',required=True); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--public-ip',default='',help='公网 IPv4；省略时在边缘检测 (auto-ip)'); x.add_argument('--enroll-token',required=True); x.set_defaults(fn=node_install)
+    x=sub.add_parser('telegram-config'); x.add_argument('--state',required=True); x.add_argument('--token-file',required=True); x.add_argument('--chat-ids',required=True); x.add_argument('--persist-token',default=''); x.add_argument('--test',action='store_true'); x.set_defaults(fn=telegram_configure)
+    x=sub.add_parser('telegram-test'); x.add_argument('--state',required=True); x.set_defaults(fn=telegram_test)
+    x=sub.add_parser('telegram-disable'); x.add_argument('--state',required=True); x.set_defaults(fn=telegram_disable)
+    x=sub.add_parser('telegram-status'); x.add_argument('--state',required=True); x.set_defaults(fn=telegram_status)
+    x=sub.add_parser('telegram-serve'); x.add_argument('--state',required=True); x.set_defaults(fn=telegram_serve)
+    x=sub.add_parser('node-install', description='边缘安装：auto-ip / address-family / engine-preflight-cert-v1'); x.add_argument('--controller-url',required=True); x.add_argument('--entry-id',required=True); x.add_argument('--node-id',required=True); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--address-family',choices=ADDRESS_FAMILIES,default='ipv4'); x.add_argument('--public-ip',default='',help='公网地址；省略时在边缘检测 (auto-ip)'); x.add_argument('--enroll-token',required=True); x.set_defaults(fn=node_install)
     x=sub.add_parser('node'); x.add_argument('--state',default='/etc/emby-proxy/multiline-node.json'); x.set_defaults(fn=node_once)
     x=sub.add_parser('status'); x.add_argument('--state',required=True); x.set_defaults(fn=lambda a: print(json.dumps(Controller(a.state).private_status(),ensure_ascii=False,indent=2)))
     x=sub.add_parser('reconcile'); x.add_argument('--state',required=True); x.set_defaults(fn=lambda a: print(json.dumps(Controller(a.state).reconcile(),ensure_ascii=False)))
     a=p.parse_args()
     try: a.fn(a)
-    except (RuntimeError, OSError, subprocess.CalledProcessError) as e:
+    except json.JSONDecodeError:
+        print('错误：状态或 API 响应不是有效 JSON。', file=sys.stderr); raise SystemExit(1)
+    except (RuntimeError, OSError, ValueError, KeyError, subprocess.CalledProcessError) as e:
         print('错误：'+str(e), file=sys.stderr); raise SystemExit(1)
 if __name__ == '__main__': main()
 PY
@@ -2719,21 +4478,26 @@ controller_cf_curl() {
 }
 
 controller_cf_discover_ids() {
-  local token_file="$1" domain="$2" zones zone_id record_id records
+  local token_file="$1" domain="$2" record_type="${3:-A}" zones zone_id record_id records
   zones="$(controller_cf_curl "$token_file" -G 'https://api.cloudflare.com/client/v4/zones' --data-urlencode 'per_page=1000')" || {
     warn "Cloudflare Zone 查询失败，请检查 Token 权限和网络。"; return 1;
   }
   zone_id="$(jq -r --arg domain "$domain" '[((.result // [])[] as $z | select($domain == $z.name or ($domain|endswith("." + $z.name))) | $z)] | sort_by(.name|length) | last | .id // empty' <<<"$zones")"
   [[ -n "$zone_id" ]] || { warn "没有找到 $domain 对应的 Cloudflare Zone。"; return 1; }
-  records="$(controller_cf_curl "$token_file" -G "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records" --data-urlencode 'type=A' --data-urlencode "name=$domain" --data-urlencode 'per_page=100')" || {
+  records="$(controller_cf_curl "$token_file" -G "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records" --data-urlencode "name=$domain" --data-urlencode 'per_page=100')" || {
     warn "Cloudflare DNS 记录查询失败，请检查 Token 是否有 Zone DNS Read/Edit 权限。"; return 1;
   }
-  record_id="$(jq -r --arg domain "$domain" '[((.result // [])[]) | select(.type=="A" and .name==$domain)] | first.id // empty' <<<"$records")"
+  if jq -e --arg domain "$domain" --arg type "$record_type" '.result // [] | any(.[]; .name==$domain and ((.type=="A" or .type=="AAAA" or .type=="CNAME") and .type!=$type))' <<<"$records" >/dev/null 2>&1; then
+    warn "$domain 存在冲突的 A/AAAA/CNAME 记录；当前地址类型为 $record_type，为避免双栈绕过切换请先人工处理。"; return 1
+  fi
+  record_id="$(jq -r --arg domain "$domain" --arg type "$record_type" '[((.result // [])[]) | select(.type==$type and .name==$domain)] | first.id // empty' <<<"$records")"
   [[ -n "$record_id" ]] || {
-    warn "没有找到 $domain 的 A 记录，请先在 Cloudflare DNS 中创建一条 A 记录（建议灰云），再重试。"
+    warn "没有找到 $domain 的 $record_type 记录，请先在 Cloudflare DNS 中创建一条记录（建议灰云），再重试。"
     return 1
   }
-  printf '%s\t%s' "$zone_id" "$record_id"
+  local record_ids
+  record_ids="$(jq -r --arg domain "$domain" --arg type "$record_type" '[((.result // [])[]) | select(.type==$type and .name==$domain) | .id] | join(",")' <<<"$records")"
+  printf '%s\t%s\t%s' "$zone_id" "$record_id" "$record_ids"
 }
 
 # 字段级重试：q/EOF 取消当前向导；默认值和自动生成值不额外提问。
@@ -2823,7 +4587,7 @@ controller_default_engine() {
 }
 
 controller_init_menu() {
-  local state entry_id domain control_domain source engine zone_id record_id token_file answer cf_token discovered token_candidate force=0
+  local state entry_id domain control_domain source engine address_family record_type zone_id record_id record_ids token_file answer cf_token discovered token_candidate force=0
   state="$(controller_state_path)"
   ui_section "1 / 3  配置主控入口"
   printf '只配置一次域名和源站；入口 ID 自动生成。任一问题输入 q 取消。\n'
@@ -2847,19 +4611,22 @@ controller_init_menu() {
   engine="$(jq -r '.engine // empty' "$state" 2>/dev/null || true)"
   [[ "$engine" == caddy || "$engine" == nginx ]] || engine="$(controller_default_engine)"
   info "边缘统一使用 ${engine}；如需指定其他引擎，请使用 CLI 的 --engine 参数。"
-  printf '\nCloudflare 主备切换在此配置；使用 DNSPod 请选 n，建好入口后进入菜单 10 配置运营商线路。\n'
+  address_family="$(jq -r '.address_family // "ipv4"' "$state" 2>/dev/null || printf ipv4)"
+  ui_read_field address_family "边缘地址类型（ipv4/ipv6）" "$address_family" ui_valid_address_family || return 0
+  [[ "$address_family" == ipv6 ]] && record_type=AAAA || record_type=A
+  printf '\nCloudflare 主备切换在此配置（当前地址类型：%s）；使用 DNSPod 请选 n，建好入口后进入菜单 10 配置运营商线路。\n' "$record_type"
   token_file="$STATE_HOME/cf.token"
   local cf_default=n
   [[ -s "$token_file" ]] && cf_default=y
-  ui_read_field answer "启用 Cloudflare A 记录切换？y/n" "$cf_default" ui_valid_yes_no || return 0
-  local -a args=(init --state "$state" --entry-id "$entry_id" --domain "$domain" --source "$source" --engine "$engine")
+  ui_read_field answer "启用 Cloudflare ${record_type} 记录切换？y/n" "$cf_default" ui_valid_yes_no || return 0
+  local -a args=(init --state "$state" --entry-id "$entry_id" --domain "$domain" --source "$source" --engine "$engine" --address-family "$address_family")
   [[ -z "$control_domain" ]] || args+=(--control-domain "$control_domain")
   (( force == 1 )) && args+=(--force)
   if [[ "$answer" =~ ^[Yy]$ ]]; then
     if [[ -s "$token_file" ]]; then
       info "检测到已有 Cloudflare Token，自动沿用本地 600 权限文件。"
       chmod 600 "$token_file" || return 1
-      discovered="$(controller_cf_discover_ids "$token_file" "$domain")" || {
+      discovered="$(controller_cf_discover_ids "$token_file" "$domain" "$record_type")" || {
         warn "已有 Token 无法查询 Cloudflare。删除 ${token_file} 后重试即可重新录入。"
         return 1
       }
@@ -2872,18 +4639,18 @@ controller_init_menu() {
       token_candidate="$(mktemp "$STATE_HOME/.cf-token.XXXXXX")" || return 1
       chmod 600 "$token_candidate"
       printf '%s\n' "$cf_token" >"$token_candidate"; unset cf_token
-      if ! discovered="$(controller_cf_discover_ids "$token_candidate" "$domain")"; then
+      if ! discovered="$(controller_cf_discover_ids "$token_candidate" "$domain" "$record_type")"; then
         rm -f "$token_candidate"
         return 1
       fi
       mv -f "$token_candidate" "$token_file" || { rm -f "$token_candidate"; return 1; }
     fi
-    IFS=$'\t' read -r zone_id record_id <<<"$discovered"
-    info "已自动获取 zone_id=${zone_id}，record_id=${record_id}"
-    args+=(--zone-id "$zone_id" --record-id "$record_id" --token-file "$token_file")
+    IFS=$'\t' read -r zone_id record_id record_ids <<<"$discovered"
+    info "已自动获取 zone_id=${zone_id}，记录数=$(awk -F, '{print NF}' <<<"$record_ids")"
+    args+=(--zone-id "$zone_id" --record-id "$record_id" --record-ids "$record_ids" --token-file "$token_file")
   fi
   controller_cli "${args[@]}" || return 1
-  printf '\n入口：%s\n访问域名：https://%s\n主控域名：%s\n下一步：先让主控域名 A 记录指向主控 VPS，再选 8 配置 HTTPS；DNSPod 先选 10 接入 DNS。\n' "$entry_id" "$domain" "${control_domain:-稍后配置}"
+  printf '\n入口：%s\n访问域名：https://%s\n主控域名：%s\n下一步：先让主控域名 %s 记录指向主控 VPS，再选 8 配置 HTTPS；DNSPod 先选 10 接入 DNS。\n' "$entry_id" "$domain" "${control_domain:-稍后配置}" "$record_type"
 }
 
 controller_generate_node_id() {
@@ -2971,9 +4738,23 @@ controller_read_quota() {
 }
 
 ui_valid_optional_ipv4() { [[ -z "$1" ]] || ui_valid_ipv4 "$1"; }
+ui_valid_ipv6() {
+  python3 - "$1" <<'PY'
+import ipaddress, sys
+try:
+    value = ipaddress.IPv6Address(sys.argv[1])
+    if not value.is_global or value.is_multicast: raise ValueError
+except ValueError:
+    raise SystemExit(1)
+PY
+}
+ui_valid_optional_ipv6() { [[ -z "$1" ]] || { ui_valid_ipv6 "$1" || { warn "IPv6 格式无效，且必须是公网 IPv6。"; return 1; }; }; }
+ui_valid_address_family() {
+  [[ "$1" == ipv4 || "$1" == ipv6 ]] || { warn "地址类型只能填写 ipv4 或 ipv6。"; return 1; }
+}
 
 controller_issue_menu() {
-  local state name priority quota quota_input public_ip controller_url saved_url control_domain status expected advanced
+  local state name priority quota quota_input public_ip controller_url saved_url control_domain status expected advanced address_family
   state="$(controller_require_state)" || return 1
   ui_section "3 / 3  添加边缘节点"
   printf '填写节点信息，生成命令后复制到对应 VPS 执行。输入 q 取消。\n'
@@ -3018,19 +4799,27 @@ controller_issue_menu() {
   name=""
   priority=100
   quota_input=0
-  info "默认：名称和 ID 自动生成 · 优先级 100 · 配额不限额；公网 IP 在边缘 VPS 执行时检测。"
+  address_family="$(jq -r '.address_family // "ipv4"' "$state")"
+  info "入口地址类型固定为 ${address_family}；同一入口的所有边缘节点必须使用相同地址类型。"
+  ui_read_field address_family "边缘地址类型（ipv4/ipv6）" "$address_family" ui_valid_address_family || return 0
+  [[ "$address_family" == "$(jq -r '.address_family // "ipv4"' "$state")" ]] || { warn "该入口已固定地址类型，不能为单个节点混用。"; return 1; }
+  info "默认：名称和 ID 自动生成 · 优先级 100 · 配额不限额；公网地址在边缘 VPS 执行时检测。"
   ui_read_field advanced "是否设置线路名称、优先级、配额或指定 IP？y/n" n ui_valid_yes_no || return 0
   if [[ "$advanced" =~ ^[Yy]$ ]]; then
     ui_read_field name "线路名称（留空自动生成）" "" || return 0
     ui_read_field priority "优先级（数字越大越优先）" 100 ui_valid_priority || return 0
     controller_read_quota quota_input || return 0
-    ui_read_field public_ip "指定边缘公网 IPv4（留空在边缘自动检测）" "" ui_valid_optional_ipv4 || return 0
+    if [[ "$address_family" == ipv6 ]]; then
+      ui_read_field public_ip "指定边缘公网 IPv6（留空在边缘自动检测）" "" ui_valid_optional_ipv6 || return 0
+    else
+      ui_read_field public_ip "指定边缘公网 IPv4（留空在边缘自动检测）" "" ui_valid_optional_ipv4 || return 0
+    fi
   fi
   quota="$(controller_parse_quota "$quota_input")" || return 1
   local quota_display="$quota_input"
   [[ "$quota" != 0 ]] || quota_display="不限额"
-  printf '\n线路：%s · 优先级：%s · 配额：%s（%s bytes）\nIPv4：%s\n\n' "${name:-自动生成}" "$priority" "$quota_display" "$quota" "${public_ip:-在边缘 VPS 自动检测}"
-  local -a args=(issue --state "$state" --controller-url "$controller_url" --name "$name" --priority "$priority" --quota-bytes "$quota")
+  printf '\n线路：%s · 地址类型：%s · 优先级：%s · 配额：%s（%s bytes）\n公网地址：%s\n\n' "${name:-自动生成}" "$address_family" "$priority" "$quota_display" "$quota" "${public_ip:-在边缘 VPS 自动检测}"
+  local -a args=(issue --state "$state" --controller-url "$controller_url" --name "$name" --priority "$priority" --quota-bytes "$quota" --address-family "$address_family")
   [[ -z "$public_ip" ]] || args+=(--public-ip "$public_ip")
   controller_cli "${args[@]}" || return 1
   printf '\n复制上面整条命令到边缘 VPS 执行（含一次性注册码，请勿公开）。\n完成后选 4 查看节点是否收到心跳；选 6 排查主控日志。\n'
@@ -3045,6 +4834,10 @@ controller_master_menu() {
   unit_path="/etc/systemd/system/emby-proxy-master.service"
   [[ -f "$unit_path" ]] || unit_path="$(systemctl show --property=FragmentPath --value emby-proxy-master.service 2>/dev/null || true)"
   if [[ -n "$unit_path" && -f "$unit_path" ]]; then
+    if ! grep -Fq -- "controller serve --state \"$state\"" "$unit_path"; then
+      warn "已有主控 unit 使用其他状态文件；为避免启动错误入口，本次不启动。请先选 7 重建主控服务，或人工核对 $unit_path。"
+      return 1
+    fi
     info "保留已有监听地址和检查间隔，只启动服务，不改写配置。需要修改请选择 7。"
     systemctl start emby-proxy-master.service || return 1
     systemctl is-active --quiet emby-proxy-master.service || return 1
@@ -3077,7 +4870,7 @@ controller_status_menu() {
       elif . >= 1073741824 then ((. / 1073741824 * 100 | floor) / 100 | tostring) + " GiB"
       elif . >= 1048576 then ((. / 1048576 * 100 | floor) / 100 | tostring) + " MiB"
       else (tostring) + " B" end;
-    "\n访问域名：https://\(.domain)\n固定源站：\(.source)\n当前记录节点：\(.active_node // "尚未切换")\n下一候选节点：\(.selected_node // "无可用节点")\n",
+    "\n访问域名：https://\(.domain)\n地址类型：\(.address_family // "ipv4")\n固定源站：\(.source)\n当前记录节点：\(.active_node // "尚未切换")\n活动节点池：" + ((.active_nodes // []) | join(", ")) + "\n下一候选节点：\(.selected_node // "无可用节点")\n",
     "DNS 提供商：" + (.dns.provider // "未配置"),
     ((.selected_lines // {} | to_entries)[] | .key as $line | .value as $p |
       "线路 " + $line + "：候选 " + ($p.selected_node // "无可用节点") +
@@ -3087,11 +4880,14 @@ controller_status_menu() {
     "DNS 状态：" + (if (.dns_confirmed_at // 0) == 0 then "尚未回读确认"
       else "最近确认 IP " + (.confirmed_dns_ip // "未知") end),
     "自动证书：" + (if .certificates then "已启用 · 主控 " + .certificates.control_domain else "未启用（选 8 配置）" end),
+    (if .routing.mode == "weighted" then "权重策略：" + ((.routing.weights // {}) | to_entries | map(.key + "=" + (.value|tostring)) | join(", ")) else empty end),
+    (if ((.routing.schedule // []) | length) > 0 then "Cloudflare 定时档位：" + ((.routing.schedule | map(.start) | join(", "))) else empty end),
+    (if ((.dns.schedule // []) | length) > 0 then "DNSPod 定时档位：" + ((.dns.schedule | map(.start) | join(", "))) else empty end),
     (if .last_reconcile_reason == "dns_unconfirmed" then "提醒：DNS 未确认，本轮不标记切换成功；下一轮重试。"
       elif .selected_node == null then "提醒：无可用节点，保留原 DNS 记录不代表该节点可用。" else empty end),
     ((.nodes // {} | to_entries | sort_by(-(.value.priority // 0)))[] |
       .value as $n |
-      "  \($n.name // .key) [\(.key)] · 优先级 \($n.priority // 0)",
+      "  \($n.name // .key) [\(.key)] · 地址族 " + ($n.address_family // "ipv4") + " · 优先级 \($n.priority // 0)",
       "    状态：" + (if ((now | floor) - ($n.last_seen // 0)) > 90 then "心跳过期"
         elif (($n.quota_bytes // 0) > 0 and ($n.used_bytes // 0) >= $n.quota_bytes) then "配额已用完"
         elif $n.status == "recovering" then "恢复观察中（成功 " + (($n.success_streak // 0) | tostring) + " 次）"
@@ -3115,15 +4911,74 @@ controller_reconcile_menu() {
   controller_cli reconcile --state "$state"
 }
 
+controller_pool_menu() {
+  local state provider token_file discovered zone_id first ids answer weights_input item record_type
+  local -a args=()
+  state="$(controller_require_state)" || return 1
+  provider="$(jq -r '.dns.provider // empty' "$state")"
+  [[ "$provider" == cloudflare ]] || { warn "多节点权重模式当前需要 Cloudflare。"; return 1; }
+  ui_section "Cloudflare 多节点权重"
+  record_type="$(jq -r '.dns.record_type // (if .address_family == "ipv6" then "AAAA" else "A" end)' "$state")"
+  printf '同名 %s 记录会按权重复制到记录池；这是 DNS 近似分配，受 TTL 和客户端缓存影响。\n' "$record_type"
+  printf '当前记录池：%s 条\n' "$(jq -r '(.dns.record_ids // ([.dns.record_id] | map(select(. != null)))) | length' "$state")"
+  ui_read_field answer "重新从 Cloudflare 发现同名 ${record_type} 记录？y/n" y ui_valid_yes_no || return 0
+  if [[ "$answer" =~ ^[Yy]$ ]]; then
+    token_file="$(jq -r '.dns.token_file // empty' "$state")"
+    [[ -s "$token_file" ]] || { warn "Cloudflare Token 文件不可用。"; return 1; }
+    discovered="$(controller_cf_discover_ids "$token_file" "$(jq -r '.domain' "$state")" "$record_type")" || return 1
+    IFS=$'\t' read -r zone_id first ids <<<"$discovered"
+    controller_cli set-records --state "$state" --record-ids "$ids" || return 1
+  fi
+  (( $(jq -r '(.dns.record_ids // ([.dns.record_id] | map(select(. != null)))) | length' "$state") >= 2 )) || {
+    warn "至少需要两条同名 Cloudflare ${record_type} 记录；请先在 DNS 控制台创建后重新发现。"; return 1;
+  }
+  printf '\n已注册节点：\n'
+  jq -r '(.nodes // {}) | to_entries[] | "  " + .key + " · " + (.value.name // .key) + " · 优先级 " + ((.value.priority // 0)|tostring)' "$state"
+  ui_read_field weights_input "输入权重（例如 edge-a=80,edge-b=20）" "" || return 0
+  IFS=',' read -r -a items <<<"$weights_input"
+  ((${#items[@]} > 0)) || { warn "至少输入一个节点权重。"; return 1; }
+  args=(set-pool --state "$state")
+  for item in "${items[@]}"; do args+=(--weight "$item"); done
+  controller_cli "${args[@]}"
+}
+
+controller_schedule_menu() {
+  local state provider schedule_input slot
+  local -a args=() slots=()
+  state="$(controller_require_state)" || return 1
+  provider="$(jq -r '.dns.provider // empty' "$state")"
+  ui_section "定时调度策略"
+  if [[ "$provider" == cloudflare ]]; then
+    printf '按主控服务器本地时间切换 Cloudflare 权重档位。格式：HH:MM|节点=权重\n'
+    printf '示例：00:00|edge-a=80,edge-b=20;08:00|edge-a=20,edge-b=80\n'
+  elif [[ "$provider" == dnspod ]]; then
+    printf '按主控服务器本地时间切换 DNSPod 线路节点。格式：HH:MM|线路=节点\n'
+    printf '示例：00:00|电信=edge-a,联通=edge-b;12:00|电信=edge-b,联通=edge-a\n'
+  else
+    warn "请先配置 Cloudflare 或 DNSPod。"; return 1
+  fi
+  ui_read_field schedule_input "请输入时间档位（分号分隔，输入 0 清除，q 取消）" "" || return 0
+  if [[ "$schedule_input" == 0 ]]; then
+    controller_cli clear-schedule --state "$state"
+    return $?
+  fi
+  IFS=';' read -r -a slots <<<"$schedule_input"
+  ((${#slots[@]} > 0)) || { warn "至少需要一个时间档位。"; return 1; }
+  args=(set-schedule --state "$state" --provider "$provider")
+  for slot in "${slots[@]}"; do args+=(--slot "$slot"); done
+  controller_cli "${args[@]}"
+}
+
 controller_dnspod_setup_menu() {
   local state domain current token candidate answer
   state="$(controller_require_state)" || return 1
   domain="$(jq -r .domain "$state")"
   ui_section "DNSPod 接入 · 不清空节点"
   printf '入口：%s\n' "$domain"
+  printf '地址类型：%s（DNSPod 将只接管对应的 %s 记录）\n' "$(jq -r '.address_family // "ipv4"' "$state")" "$(jq -r 'if (.address_family // "ipv4") == "ipv6" then "AAAA" else "A" end' "$state")"
   printf '先在 DNSPod 添加/验证此子域名，再在父域设置控制台给出的 NS。\n'
-  printf 'DNSPod 为同一主机建立 默认/电信/联通/移动 各一条启用的 A 记录；不设权重或其他监控。\n'
-  printf '脚本只接管这四条记录；不会修改父域 NS，也不会删除其他网站记录。\n'
+  printf 'DNSPod 为同一主机建立 默认/电信/联通/移动 各一条或多条启用的 %s 记录；同一线路多条记录可在菜单 5 配置权重。\n' "$(jq -r 'if (.address_family // "ipv4") == "ipv6" then "AAAA" else "A" end' "$state")"
+  printf '脚本只接管这四条线路；不会修改父域 NS，也不会删除其他网站记录。\n'
   printf '首版使用 DNSPod ID,Token（不是腾讯云 SecretId/SecretKey），仅留主控。\n'
   current="$(jq -r 'if .dns.provider == "dnspod" then .dns.token_file else empty end' "$state")"
   if [[ -n "$current" && -s "$current" ]]; then
@@ -3162,6 +5017,24 @@ controller_dnspod_setup_menu() {
   return 0
 }
 
+controller_dnspod_pool_menu() {
+  local state line count weights_input item
+  local -a args=() items=()
+  state="$(controller_require_state)" || return 1
+  [[ "$(jq -r '.dns.provider // empty' "$state")" == dnspod ]] || { warn "请先接入 DNSPod。"; return 1; }
+  ui_section "DNSPod 同线路多节点权重"
+  ui_read_field line "线路（默认/电信/联通/移动）" 默认 || return 0
+  case "$line" in 默认|电信|联通|移动) ;; *) warn "线路必须是 默认、电信、联通或移动。"; return 1 ;; esac
+  count="$(jq -r --arg line "$line" '(.dns.line_records[$line] // []) | if type == "array" then length else 1 end' "$state")"
+  (( count >= 2 )) || { warn "${line} 线路当前只有一条 $(jq -r 'if (.address_family // "ipv4") == "ipv6" then "AAAA" else "A" end' "$state") 记录，请先在 DNSPod 创建多条同线路记录，再重新接入/刷新配置。"; return 1; }
+  printf '线路 %s 当前有 %s 条记录。格式：edge-a=80,edge-b=20\n' "$line" "$count"
+  ui_read_field weights_input "请输入节点权重" "" || return 0
+  IFS=',' read -r -a items <<<"$weights_input"
+  args=(set-line-pool --state "$state" --line "$line")
+  for item in "${items[@]}"; do args+=(--weight "$item"); done
+  controller_cli "${args[@]}"
+}
+
 controller_dnspod_menu() {
   local choice
   while true; do
@@ -3169,7 +5042,8 @@ controller_dnspod_menu() {
     ui_item 1 "接入/检查 DNSPod" "自动查找区域/记录，预览后确认；保留节点"
     ui_item 2 "设置线路节点" "默认/电信/联通/移动；0 自动选路"
     ui_item 3 "查看线路状态" "每条线路的候选、已确认节点和故障"
-    ui_item 4 "立即同步线路" "只改已接管的四条 A 记录"
+    ui_item 4 "立即同步线路" "只改已接管的四条 $(jq -r 'if (.address_family // "ipv4") == "ipv6" then "AAAA" else "A" end' "$(controller_state_path)") 记录"
+    ui_item 5 "同线路多节点权重" "同一运营商多条 $(jq -r 'if (.address_family // "ipv4") == "ipv6" then "AAAA" else "A" end' "$(controller_state_path)") 记录"
     ui_item 0 "返回上一级" "q 也可返回"
     ui_prompt; IFS= read -r choice || return 0
     case "$choice" in
@@ -3177,6 +5051,134 @@ controller_dnspod_menu() {
       2) menu_run controller_lines_menu ;;
       3) menu_run controller_status_menu ;;
       4) menu_run controller_reconcile_menu ;;
+      5) menu_run controller_dnspod_pool_menu ;;
+      0|q|Q) return ;;
+      *) warn "请输入有效序号。" ;;
+    esac
+  done
+}
+
+controller_telegram_install() {
+  local state unit unit_name backup state_backup unit_exists=0 was_active=0 was_enabled=0 state_arg state_dir_arg
+  state="$(controller_require_state)" || return 1
+  [[ "$(jq -r '.telegram.enabled // false' "$state")" == true ]] || { warn "请先配置 Telegram Bot。"; return 1; }
+  unit="$TELEGRAM_UNIT"
+  # 只接管带有本项目标记的 unit，避免覆盖管理员或第三方同名服务。
+  if [[ -f "$unit" ]]; then
+    grep -Fx '# MANAGED EMBY TELEGRAM BOT' "$unit" >/dev/null 2>&1 || {
+      warn "已有 $unit 不是 emby-proxy 托管文件，拒绝覆盖。请先人工处理或改用其他服务名。"
+      return 1
+    }
+    unit_exists=1
+    backup="${unit}.bak-$(date -u +%Y%m%d-%H%M%S)"
+    local backup_suffix=1
+    while [[ -e "$backup" ]]; do
+      backup="${unit}.bak-$(date -u +%Y%m%d-%H%M%S)-${backup_suffix}"
+      ((backup_suffix+=1))
+    done
+    install -m 0644 "$unit" "$backup"
+    info "旧 Telegram 服务单元已备份：$backup"
+  fi
+  unit_name="$(basename -- "$unit")"
+  state_backup="$(mktemp /tmp/emby-proxy-telegram-state.XXXXXX)" || return 1
+  install -m 0600 "$state" "$state_backup"
+  systemctl is-active --quiet "$unit_name" 2>/dev/null && was_active=1
+  systemctl is-enabled --quiet "$unit_name" 2>/dev/null && was_enabled=1
+  # systemd 的 ExecStart/ReadWritePaths 使用双引号语法；显式转义路径，
+  # 这样自定义状态目录包含空格或引号时也不会拆成多个参数。
+  state_arg="${state//\\/\\\\}"
+  state_arg="${state_arg//\"/\\\"}"
+  # '%' starts a systemd specifier even inside quoted arguments; preserve a
+  # literal percent in custom state paths by doubling it.
+  state_arg="${state_arg//%/%%}"
+  state_arg="${state_arg//$'\n'/\\n}"
+  state_dir_arg="$(dirname "$state")"
+  state_dir_arg="${state_dir_arg//\\/\\\\}"
+  state_dir_arg="${state_dir_arg//\"/\\\"}"
+  state_dir_arg="${state_dir_arg//%/%%}"
+  state_dir_arg="${state_dir_arg//$'\n'/\\n}"
+  cat >"$unit" <<EOF
+# MANAGED EMBY TELEGRAM BOT
+[Unit]
+Description=emby-proxy Telegram notification bot
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/emby-proxy controller telegram-serve --state="$state_arg"
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths="$state_dir_arg"
+[Install]
+WantedBy=multi-user.target
+EOF
+  if ! systemctl daemon-reload || ! systemctl enable "$unit_name" ||
+     ! systemctl restart "$unit_name" ||
+     ! systemctl is-active --quiet "$unit_name"; then
+    warn "Telegram 服务启动/重启失败，正在恢复旧 unit 和配置。"
+    systemctl stop "$unit_name" >/dev/null 2>&1 || true
+    if (( unit_exists )); then
+      install -m 0644 "$backup" "$unit"
+    else
+      rm -f "$unit"
+    fi
+    install -m 0600 "$state_backup" "$state"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    (( was_enabled )) || systemctl disable "$unit_name" >/dev/null 2>&1 || true
+    if (( was_active )); then
+      systemctl start "$unit_name" >/dev/null 2>&1 || warn "旧 Telegram 服务恢复失败，请手动检查 systemctl。"
+    fi
+    rm -f "$state_backup"
+    return 1
+  fi
+  rm -f "$state_backup"
+  ok "Telegram Bot 服务已启动：emby-proxy-telegram.service"
+}
+
+controller_telegram_menu() {
+  local state choice token chat_ids answer temp status enabled unit_name
+  state="$(controller_require_state)" || return 1
+  unit_name="$(basename -- "$TELEGRAM_UNIT")"
+  while true; do
+    ui_header "Telegram 通知与查询" "只允许白名单 Chat ID；控制器主动轮询 Telegram，不开放入站端口"
+    enabled="$(jq -r '.telegram.enabled // false' "$state" 2>/dev/null || printf false)"
+    printf '当前状态：%s\n' "$([[ "$enabled" == true ]] && printf '已启用' || printf '未启用')"
+    [[ "$enabled" == true ]] && jq -r '"允许 Chat ID：" + ((.telegram.chat_ids // []) | join(", "))' "$state"
+    ui_item 1 "配置/更新 Bot" "输入 Token、允许的 Chat ID，并发送测试消息"
+    ui_item 2 "发送测试消息" "验证 Token、网络和 Chat 权限"
+    ui_item 3 "安装/重启 Bot 服务" "systemd 后台轮询，节点状态变化时通知"
+    ui_item 4 "查看服务日志" "最近 80 行"
+    ui_item 5 "停用 Bot" "停止轮询，不删除 Token 备份"
+    ui_item 0 "返回上一级" "q 也可返回"
+    ui_prompt; IFS= read -r choice || return 0
+    case "$choice" in
+      1)
+        printf 'Telegram Bot Token（输入隐藏，q 取消）：'; IFS= read -r -s token || return 0; printf '\n'
+        [[ "$token" =~ ^[qQ]$ ]] && continue
+        [[ "$token" =~ ^[0-9]{6,20}:[A-Za-z0-9_-]{20,200}$ ]] || { unset token; warn "Token 格式无效。"; continue; }
+        ui_read_field chat_ids "允许的 Chat ID（数字，多个用逗号分隔）" "$(jq -r '(.telegram.chat_ids // []) | join(",")' "$state")" || continue
+        [[ "$chat_ids" =~ ^-?[0-9]{3,30}(,-?[0-9]{3,30})*$ ]] || { unset token; warn "Chat ID 必须是数字，可用逗号分隔多个。"; continue; }
+        temp="$(mktemp "$(dirname "$state")/.telegram-token.XXXXXX")" || continue; chmod 600 "$temp"; printf '%s\n' "$token" >"$temp"; unset token
+        if controller_cli telegram-config --state "$state" --token-file "$temp" --chat-ids "$chat_ids" --test; then
+          rm -f "$temp"
+          ui_read_field answer "现在安装并启动 Telegram 服务？y/n" y ui_valid_yes_no || continue
+          [[ "$answer" =~ ^[Yy]$ ]] && menu_run controller_telegram_install || true
+        else
+          rm -f "$temp"
+        fi
+        ;;
+      2) menu_run controller_cli telegram-test --state "$state" ;;
+      3) menu_run controller_telegram_install ;;
+      4) systemctl --no-pager -n 80 status "$unit_name" || true ;;
+      5)
+        controller_cli telegram-disable --state "$state" || continue
+        systemctl disable --now "$unit_name" >/dev/null 2>&1 || true
+        ok "Telegram Bot 已停用。"
+        ;;
       0|q|Q) return ;;
       *) warn "请输入有效序号。" ;;
     esac
@@ -3244,20 +5246,21 @@ controller_menu_summary() {
 }
 
 controller_cert_menu() {
-  local state domain answer provider
+  local state domain answer provider record_type
   state="$(controller_require_state)" || return 1
   provider="$(jq -r '.dns.provider // empty' "$state")"
+  record_type="$(jq -r 'if (.address_family // "ipv4") == "ipv6" then "AAAA" else "A" end' "$state")"
   domain="$(jq -r '.certificates.control_domain // .control_domain // ("control." + .domain)' "$state")"
-  ui_read_field domain "独立主控域名（A 记录需提前指向主控 VPS）" "$domain" ui_valid_domain || return 0
+  ui_read_field domain "独立主控域名（${record_type} 记录需提前指向主控 VPS）" "$domain" ui_valid_domain || return 0
   if [[ "$provider" == cloudflare ]]; then
     ui_section "自动证书 · Cloudflare DNS-01"
     warn "将安装 Certbot/Cloudflare 插件、申请证书，并让主控直接监听 HTTPS 19090。"
-    info "不改业务 A 记录、不接管已有 80/443 服务。请放行 TCP 19090；已有 HTTP 节点需重新接入 HTTPS。"
+    info "不改业务 ${record_type} 记录、不接管已有 80/443 服务。请放行 TCP 19090；已有 HTTP 节点需重新接入 HTTPS。"
     info "证书私钥在同一入口节点间共享。续期每 12 小时检查，边缘每小时同步。"
   else
     ui_section "自动 HTTPS · Caddy HTTP-01"
     warn "Caddy 将在 443 终止 HTTPS，并反代到本机 127.0.0.1:19090；不会把主控端口暴露公网。"
-    info "适用于 DNSPod 或其他 DNS：只需让主控域名 A 记录指向本机，并放行 TCP 80/443。Caddy 自动申请和续期证书。"
+    info "适用于 DNSPod 或其他 DNS：只需让主控域名 ${record_type} 记录指向本机，并放行 TCP 80/443。Caddy 自动申请和续期证书。"
   fi
   info "不会覆盖非脚本托管的 Caddy 站点；修改前会自动备份配置，校验失败会恢复。"
   ui_read_field answer "确认配置并启动主控？y/n" n ui_valid_yes_no || return 0
@@ -3285,6 +5288,9 @@ controller_menu() {
     ui_item 4 "节点状态与用量" "心跳、配额、当前节点"
     ui_item 5 "立即同步 DNS" "优先级选路，不中转媒体"
     ui_item 10 "DNSPod 运营商线路" "DNSPod：默认/电信/联通/移动"
+    ui_item 11 "Cloudflare 多节点权重" "多条 $(jq -r 'if (.address_family // "ipv4") == "ipv6" then "AAAA" else "A" end' "$(controller_state_path)") 记录、权重和健康摘除"
+    ui_item 12 "定时调度策略" "按时间切换 Cloudflare 权重或 DNSPod 线路"
+    ui_item 13 "Telegram 通知与查询" "节点、流量、访问 IP、设备和源站"
     ui_item 6 "服务状态与日志" "排查主控启动问题"
     ui_item 7 "高级主控参数" "监听地址、检查间隔；通常无需修改"
     ui_item 9 "同步本机边缘证书" "立即领取最新版本，失败保留旧证书"
@@ -3298,6 +5304,9 @@ controller_menu() {
       4) menu_run controller_status_menu ;;
       5) menu_run controller_reconcile_menu ;;
       10) controller_dnspod_menu ;;
+      11) menu_run controller_pool_menu ;;
+      12) menu_run controller_schedule_menu ;;
+      13) menu_run controller_telegram_menu ;;
       6) menu_run controller_logs_menu ;;
       7) menu_run controller_master_advanced_menu ;;
       8) menu_run controller_cert_menu ;;

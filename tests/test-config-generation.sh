@@ -18,6 +18,34 @@ assert_count() {
 
 EMBY_PROXY_LIB_ONLY=1 source "$SCRIPT"
 
+# Managed destinations must never follow a symlink into an unrelated file.
+# This is exercised directly because a full service install needs root and a
+# live Caddy/Nginx daemon, while the guard itself is independent of either.
+symlink_victim="$TMP_DIR/unrelated-config"
+printf 'keep\n' >"$symlink_victim"
+ln -s "$symlink_victim" "$TMP_DIR/Caddyfile"
+if EMBY_PROXY_LIB_ONLY=1 SCRIPT_UNDER_TEST="$SCRIPT" LINK_TARGET="$TMP_DIR/Caddyfile" bash -c '
+  set --; source "$SCRIPT_UNDER_TEST"; managed_target_is_safe "$LINK_TARGET" Caddyfile
+' >/dev/null 2>&1; then
+  fail "Caddyfile 符号链接未被拒绝"
+fi
+[[ "$(cat "$symlink_victim")" == keep ]] || fail "Caddyfile 符号链接检查改写了目标"
+
+ln -s "$symlink_victim" "$TMP_DIR/nginx.conf"
+if EMBY_PROXY_LIB_ONLY=1 SCRIPT_UNDER_TEST="$SCRIPT" LINK_TARGET="$TMP_DIR/nginx.conf" bash -c '
+  set --; source "$SCRIPT_UNDER_TEST"; managed_target_is_safe "$LINK_TARGET" Nginx配置
+' >/dev/null 2>&1; then
+  fail "Nginx 配置符号链接未被拒绝"
+fi
+
+mkdir -p "$TMP_DIR/managed-parent-real"
+ln -s "$TMP_DIR/managed-parent-real" "$TMP_DIR/managed-parent"
+if EMBY_PROXY_LIB_ONLY=1 SCRIPT_UNDER_TEST="$SCRIPT" LINK_TARGET="$TMP_DIR/managed-parent/site.conf" bash -c '
+  set --; source "$SCRIPT_UNDER_TEST"; managed_target_is_safe "$LINK_TARGET" 管理文件
+' >/dev/null 2>&1; then
+  fail "管理文件的符号链接父目录未被拒绝"
+fi
+
 # 域名冲突检测按完整 token 匹配，不能把 a.example.com 错认成 ba.example.com。
 domain_pattern="$(domain_token_regex 'a.example.com')"
 printf '%s\n' 'ba.example.com {' | grep -E "$domain_pattern" >/dev/null && fail "域名 token 匹配出现子串误判"
@@ -36,15 +64,28 @@ set_domain() {
 # Nginx：正式配置固定上游、拒绝伪造 XFF，并为每个域名使用唯一变量。
 set_domain one.example.com
 one_nginx_id="$NGINX_ID"
+ADDRESS_FAMILY=ipv4
 write_nginx_https_config "$TMP_DIR/nginx-one.conf"
 write_nginx_http_config "$TMP_DIR/nginx-one-acme.conf"
 assert_contains "$TMP_DIR/nginx-one.conf" 'proxy_set_header X-Forwarded-For $remote_addr;'
 assert_contains "$TMP_DIR/nginx-one.conf" '"ts":$msec'
+assert_contains "$TMP_DIR/nginx-one.conf" '"user_agent":"$http_user_agent"'
 assert_not_contains "$TMP_DIR/nginx-one.conf" '$proxy_add_x_forwarded_for'
 assert_contains "$TMP_DIR/nginx-one.conf" "\$emby_connection_upgrade_${one_nginx_id}"
 assert_contains "$TMP_DIR/nginx-one.conf" '"~*^/a(?:/|$)" $upstream_http_location;'
 assert_contains "$TMP_DIR/nginx-one.conf" "add_header Location \$emby_proxy_location_${one_nginx_id}_1 always;"
 assert_not_contains "$TMP_DIR/nginx-one.conf" 'proxy_pass $'
+assert_not_contains "$TMP_DIR/nginx-one.conf" 'listen [::]:443 ssl http2;'
+assert_not_contains "$TMP_DIR/nginx-one-acme.conf" 'listen [::]:80;'
+
+ADDRESS_FAMILY=ipv6
+write_nginx_https_config "$TMP_DIR/nginx-one-ipv6.conf"
+write_nginx_http_config "$TMP_DIR/nginx-one-ipv6-acme.conf"
+assert_contains "$TMP_DIR/nginx-one-ipv6.conf" 'listen [::]:443 ssl http2;'
+assert_not_contains "$TMP_DIR/nginx-one-ipv6.conf" 'listen 443 ssl http2;'
+assert_contains "$TMP_DIR/nginx-one-ipv6-acme.conf" 'listen [::]:80;'
+assert_not_contains "$TMP_DIR/nginx-one-ipv6-acme.conf" 'listen 80;'
+ADDRESS_FAMILY=""
 
 # TCP 80 只处理共享 ACME 与 HTTPS 跳转；不能暴露明文 Emby。
 assert_contains "$TMP_DIR/nginx-one-acme.conf" '# MANAGED EMBY ACME: one.example.com'
@@ -96,7 +137,11 @@ build_candidate_config "$TMP_DIR/Caddyfile.empty" "$TMP_DIR/Caddyfile.one"
 set_domain two.example.com
 ROUTE_URLS=("https://origin-two.example.net" "http://10.0.0.4:8096")
 ROUTE_HOSTS=("origin-two.example.net" "10.0.0.4")
+ADDRESS_FAMILY=ipv6
 build_candidate_config "$TMP_DIR/Caddyfile.one" "$TMP_DIR/Caddyfile.two"
+assert_contains "$TMP_DIR/Caddyfile.two" 'bind ::'
+assert_not_contains "$TMP_DIR/Caddyfile.two" 'bind 0.0.0.0'
+ADDRESS_FAMILY=""
 set_domain one.example.com
 ROUTE_URLS=("https://origin-one-new.example.net" "http://10.0.0.5:8096")
 ROUTE_HOSTS=("origin-one-new.example.net" "10.0.0.5")
@@ -112,6 +157,12 @@ assert_contains "$TMP_DIR/Caddyfile.final" 'header_down Location "^/a(?:/(.*))?$
 assert_contains "$TMP_DIR/Caddyfile.final" 'header_down Location "^emby-proxy-prefix-preserved://(.*)$" "/a/$1"'
 assert_contains "$TMP_DIR/Caddyfile.final" 'header_down Content-Location "^emby-proxy-prefix-preserved://(.*)$" "/a/$1"'
 assert_not_contains "$TMP_DIR/Caddyfile.final" 'reverse_proxy {'
+assert_contains "$TMP_DIR/Caddyfile.final" 'request>headers>X-Emby-Authorization delete'
+assert_contains "$TMP_DIR/Caddyfile.final" 'request>headers>Authorization delete'
+assert_contains "$TMP_DIR/Caddyfile.final" 'log_append path "{http.request.uri.path}"'
+assert_contains "$TMP_DIR/Caddyfile.final" 'request>uri delete'
+assert_not_contains "$TMP_DIR/Caddyfile.final" 'replace bearer REDACTED'
+assert_not_contains "$TMP_DIR/Caddyfile.final" 'replace X-Emby-Authorization REDACTED'
 
 # 上游 IPv6 仍可作为域名 HTTPS 入口的固定源站。
 parse_upstream 'https://[2001:db8::20]:8443'

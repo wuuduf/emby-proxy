@@ -45,6 +45,7 @@ readonly END_MARKER="# END MANAGED EMBY REVERSE PROXY"
 readonly NGINX_LEGACY_CONFIG="/etc/nginx/conf.d/emby-proxy-managed.conf"
 readonly NGINX_ACME_ROOT="/var/www/emby-proxy-acme"
 readonly NGINX_HASH_CONFIG="${EMBY_PROXY_NGINX_HASH_CONFIG:-/etc/nginx/conf.d/00-emby-proxy-hash.conf}"
+readonly NGINX_RENEW_HOOK="${EMBY_PROXY_NGINX_RENEW_HOOK:-/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh}"
 readonly HEALTH_PATH="/_emby_proxy_health"
 readonly MANAGER_COMMAND_URL="${EMBY_PROXY_MANAGER_URL:-https://raw.githubusercontent.com/wuuduf/emby-proxy/main/emby-proxy}"
 readonly MANAGER_HOME="${EMBY_PROXY_STATE_HOME:-/etc/emby-proxy}"
@@ -59,6 +60,7 @@ ENTRY_WIZARD=0
 SKIP_DNS_CHECK=0
 SKIP_VERIFY=0
 TLS_DIRECTORY=""
+ADDRESS_FAMILY=""
 ACCESS_SCHEME=""
 HTTPS_PORT=""
 DOMAIN_ENTRY_TYPE=""
@@ -113,6 +115,67 @@ warn()  { printf '%s[提醒]%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
 error() { printf '%s[错误]%s %s\n' "$RED" "$RESET" "$*" >&2; }
 die()   { error "$*"; exit 1; }
 
+# Never follow a user-controlled symlink when writing a managed file.  The
+# installer may share a host with hand-maintained Caddy/Nginx configuration;
+# treating a symlink as the target would otherwise let a typo overwrite an
+# unrelated file outside the managed configuration tree.
+managed_target_is_safe() {
+  local target="$1" label="${2:-目标文件}" parent
+  [[ -n "$target" ]] || die "$label 路径为空，拒绝自动修改。"
+  [[ ! -L "$target" ]] || die "$label 是符号链接，拒绝自动修改：$target"
+  if [[ -e "$target" && ! -f "$target" ]]; then
+    die "$label 不是普通文件，拒绝自动修改：$target"
+  fi
+  # The destination itself may not exist yet, so also inspect every existing
+  # parent.  Otherwise a symlink such as /etc/emby-proxy/sites.d could still
+  # redirect a later mkdir/install outside the managed tree.
+  parent="$(dirname -- "$target")"
+  while [[ "$parent" != "/" && -n "$parent" ]]; do
+    if [[ -L "$parent" ]]; then
+      # macOS exposes /etc, /tmp and /var as stable links into /private;
+      # these platform links are not a user-controlled redirect.  Keep the
+      # strict refusal for every other parent symlink (Debian normally has
+      # none of these links).
+      local resolved_parent=""
+      resolved_parent="$(readlink -f "$parent" 2>/dev/null || true)"
+      case "$parent:$resolved_parent" in
+        /etc:/private/etc|/tmp:/private/tmp|/var:/private/var) ;;
+        *) die "$label 的父目录是符号链接，拒绝自动修改：$parent" ;;
+      esac
+    fi
+    if [[ -e "$parent" && ! -d "$parent" ]]; then
+      die "$label 的父路径不是目录，拒绝自动修改：$parent"
+    fi
+    [[ "$parent" != "." ]] || break
+    parent="$(dirname -- "$parent")"
+  done
+}
+
+# --tls-directory is a privileged input: the Caddy branch changes ownership
+# and permissions on both the directory and its key. Restrict it to the
+# certificate trees this project owns or Certbot manages, and verify the
+# resolved PEM files before any chmod/chown can follow a symlink elsewhere.
+validate_tls_directory() {
+  local dir="$1" real file resolved
+  [[ -n "$dir" ]] || return 0
+  [[ -d "$dir" ]] || die "证书目录不存在：$dir"
+  real="$(readlink -f -- "$dir" 2>/dev/null || true)"
+  case "$real" in
+    /etc/emby-proxy|/etc/emby-proxy/*|/etc/emby-proxy-tls|/etc/emby-proxy-tls/*|\
+    /etc/letsencrypt/live/*|/etc/letsencrypt/archive/*) ;;
+    *) die "证书目录必须位于脚本托管或 Certbot 目录下，拒绝修改：$dir" ;;
+  esac
+  for file in fullchain.pem privkey.pem; do
+    file="$dir/$file"
+    [[ -f "$file" ]] || die "外部证书不完整：$file"
+    resolved="$(readlink -f -- "$file" 2>/dev/null || true)"
+    case "$resolved" in
+      "$real"/*|/etc/emby-proxy/*|/etc/emby-proxy-tls/*|/etc/letsencrypt/live/*|/etc/letsencrypt/archive/*) ;;
+      *) die "证书文件解析到受管目录之外，拒绝修改：$file" ;;
+    esac
+  done
+}
+
 is_interactive() { [[ "${EMBY_PROXY_FORCE_INTERACTIVE:-0}" == "1" || -t 0 ]]; }
 ui_rule() { printf '%s%s%s\n' "$DIM" '────────────────────────────────────────────────────────────' "$RESET"; }
 ui_step() {
@@ -142,6 +205,7 @@ usage() {
       --domain-mode MODE    域名入口：subdomain、port 或 path
       --skip-dns-check      仅用于边缘节点预配置：暂不要求域名当前指向本 VPS
       --skip-verify         仅用于边缘节点预配置：配置成功后不等待本机 HTTPS 验证
+      --address-family MODE 边缘监听地址族：ipv4 或 ipv6；省略时双栈
       --tls-directory DIR  使用已校验的外部证书目录（fullchain.pem / privkey.pem）
   -p, --path PATH           主源站的访问路径，默认 /；已有 Caddy 域名必须填写非根路径
   -u, --upstream ADDRESS    Emby 源站域名或 URL，可带端口
@@ -175,6 +239,9 @@ while (($#)); do
       SKIP_DNS_CHECK=1; shift ;;
     --skip-verify)
       SKIP_VERIFY=1; shift ;;
+    --address-family)
+      [[ $# -ge 2 && ( "$2" == ipv4 || "$2" == ipv6 ) ]] || die "地址类型只能是 ipv4 或 ipv6。"
+      ADDRESS_FAMILY="$2"; shift 2 ;;
     --tls-directory)
       [[ $# -ge 2 && "$2" =~ ^/[A-Za-z0-9_./-]+$ && "$2" != *..* ]] || die "证书目录必须是安全的绝对路径。"
       TLS_DIRECTORY="$2"; shift 2 ;;
@@ -205,6 +272,7 @@ require_root() {
     [[ -n "$PROXY_DOMAIN" ]] && sudo_args+=(--domain "$PROXY_DOMAIN")
     [[ -n "$HTTPS_PORT" ]] && sudo_args+=(--https-port "$HTTPS_PORT")
     [[ -n "$DOMAIN_ENTRY_TYPE" ]] && sudo_args+=(--domain-mode "$DOMAIN_ENTRY_TYPE")
+    [[ -n "$ADDRESS_FAMILY" ]] && sudo_args+=(--address-family "$ADDRESS_FAMILY")
     [[ -n "$PRIMARY_ROUTE_INPUT" ]] && sudo_args+=(--path "$PRIMARY_ROUTE_INPUT")
     [[ -n "$UPSTREAM_INPUT" ]] && sudo_args+=(--upstream "$UPSTREAM_INPUT")
     local route_spec
@@ -953,6 +1021,7 @@ persist_site_state() {
   command -v jq >/dev/null 2>&1 || { warn "缺少 jq，无法写入管理索引；反代配置本身已经生效。"; return 0; }
   site_id="$(site_state_id)"
   state_file="$MANAGER_HOME/sites.d/${site_id}.json"
+  managed_target_is_safe "$state_file" "管理索引"
   temp="$(mktemp /tmp/emby-proxy-state.XXXXXX)"
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   created_at="$now"
@@ -981,12 +1050,13 @@ persist_site_state() {
     --arg id "$site_id" --arg engine "$PROXY_ENGINE" \
     --arg domain "$PROXY_DOMAIN" \
     --arg listen_port "$HTTPS_PORT" --arg public_url "$PUBLIC_BASE_URL" \
-    --arg entry_type "$DOMAIN_ENTRY_TYPE" --arg tls_directory "$TLS_DIRECTORY" \
+    --arg entry_type "$DOMAIN_ENTRY_TYPE" --arg address_family "$ADDRESS_FAMILY" --arg tls_directory "$TLS_DIRECTORY" \
     --arg managed_kind "$managed_kind" --arg config_file "$config_file" \
     --arg created_at "$created_at" --arg updated_at "$now" --argjson routes "$routes_json" \
     '{schema_version:$schema_version,id:$id,engine:$engine,domain:$domain,
       listen_port:($listen_port|if .=="" then null else tonumber end),entry_type:$entry_type,public_url:$public_url,
       managed_kind:$managed_kind,config_file:$config_file,created_at:$created_at,updated_at:$updated_at,routes:$routes}
+      + (if $address_family=="" then {} else {address_family:$address_family} end)
       + (if $tls_directory=="" then {} else {tls_directory:$tls_directory} end)' \
     >"$temp"
   if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
@@ -1279,7 +1349,7 @@ map \$http_upgrade \$emby_connection_upgrade_$NGINX_ID {
 # 不记录查询参数，避免 api_key/token 落盘；每条请求仍记录状态、字节数与耗时。
 log_format emby_proxy_${NGINX_ID}_v1 escape=json
     '{"ts":\$msec,"time":"\$time_iso8601","client":"\$remote_addr","method":"\$request_method",'
-    '"host":"\$host","path":"\$uri","status":\$status,"bytes_sent":\$body_bytes_sent,'
+    '"host":"\$host","path":"\$uri","user_agent":"\$http_user_agent","status":\$status,"bytes_sent":\$body_bytes_sent,'
     '"request_time":\$request_time,"upstream_time":"\$upstream_response_time",'
     '"upstream_status":"\$upstream_status","upstream":"\$upstream_addr"}';
 
@@ -1340,13 +1410,15 @@ EOF
 }
 
 write_nginx_http_config() {
-  local target="$1"
+  local target="$1" listen_v4="" listen_v6=""
+  [[ "$ADDRESS_FAMILY" != ipv6 ]] && listen_v4='    listen 80;'
+  [[ "$ADDRESS_FAMILY" != ipv4 ]] && listen_v6='    listen [::]:80;'
   cat >"$target" <<EOF
 # MANAGED EMBY ACME: $PROXY_DOMAIN
 # 由 $SCRIPT_NAME 自动管理；同一域名的多个 HTTPS 端口共享此 ACME/HTTP 入口。
 server {
-    listen 80;
-    listen [::]:80;
+$listen_v4
+$listen_v6
     server_name $PROXY_DOMAIN;
 
     access_log off;
@@ -1371,7 +1443,9 @@ EOF
 }
 
 write_nginx_https_config() {
-  local target="$1" i
+  local target="$1" i listen_v4="" listen_v6=""
+  [[ "$ADDRESS_FAMILY" != ipv6 ]] && listen_v4="    listen $HTTPS_PORT ssl http2;"
+  [[ "$ADDRESS_FAMILY" != ipv4 ]] && listen_v6="    listen [::]:$HTTPS_PORT ssl http2;"
   {
     cat <<EOF
 # 由 $SCRIPT_NAME 自动管理，请勿在此文件中混入其他站点。
@@ -1380,8 +1454,8 @@ EOF
     emit_nginx_http_prelude
     cat <<EOF
 server {
-    listen $HTTPS_PORT ssl http2;
-    listen [::]:$HTTPS_PORT ssl http2;
+$listen_v4
+$listen_v6
     server_name $PROXY_DOMAIN;
 
     access_log $NGINX_ACCESS_LOG emby_proxy_${NGINX_ID}_v1;
@@ -1518,11 +1592,22 @@ check_nginx_domain_conflict() {
 }
 
 apply_nginx_config() {
-  local timestamp candidate acme_candidate cert_dir
+  local timestamp candidate acme_candidate cert_dir renew_hook renew_candidate
   timestamp="$(date +%Y%m%d-%H%M%S)"
+  cert_dir="${TLS_DIRECTORY:-/etc/letsencrypt/live/$PROXY_DOMAIN}"
+  renew_hook="$NGINX_RENEW_HOOK"
+  managed_target_is_safe "$NGINX_CONFIG" "Nginx 入口配置"
+  managed_target_is_safe "$NGINX_ACME_CONFIG" "Nginx ACME 配置"
+  managed_target_is_safe "$NGINX_HASH_CONFIG" "Nginx 哈希容量配置"
+  managed_target_is_safe "$NGINX_LEGACY_CONFIG" "旧版 Nginx 配置"
+  managed_target_is_safe "$renew_hook" "Certbot Nginx 续期钩子"
+  if [[ -f "$renew_hook" ]] &&
+    ! grep -Fx '# MANAGED EMBY-PROXY: Nginx renew hook' "$renew_hook" >/dev/null 2>&1 &&
+    ! cmp -s "$renew_hook" <(printf '%s\n' '#!/bin/sh' 'systemctl reload nginx'); then
+    die "Certbot Nginx 续期钩子已存在且不是脚本托管：$renew_hook；为避免覆盖其他证书任务，请先人工合并或移走该文件。"
+  fi
   candidate="$(mktemp /tmp/emby-nginx.XXXXXX.conf)"
   acme_candidate="$(mktemp /tmp/emby-nginx-acme.XXXXXX.conf)"
-  cert_dir="${TLS_DIRECTORY:-/etc/letsencrypt/live/$PROXY_DOMAIN}"
   if [[ -n "$TLS_DIRECTORY" && ( ! -s "$cert_dir/fullchain.pem" || ! -s "$cert_dir/privkey.pem" ) ]]; then
     die "集中证书不存在，请先同步证书，不会回退到 HTTP-01 申请。"
   fi
@@ -1597,11 +1682,15 @@ apply_nginx_config() {
   rm -f "$candidate" "$acme_candidate"
 
   mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-  cat >/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh <<'EOF'
+  renew_candidate="$(mktemp /tmp/emby-nginx-renew-hook.XXXXXX)"
+  cat >"$renew_candidate" <<'EOF'
 #!/bin/sh
+# MANAGED EMBY-PROXY: Nginx renew hook
 systemctl reload nginx
 EOF
-  chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+  chmod 0755 "$renew_candidate"
+  install -o root -g root -m 0755 "$renew_candidate" "$renew_hook"
+  rm -f "$renew_candidate"
   if systemctl list-unit-files --type=timer 2>/dev/null | grep -q '^certbot.timer'; then
     if ! systemctl enable --now certbot.timer >/dev/null; then
       warn "无法启用 certbot.timer；证书当前可用，但请检查：systemctl status certbot.timer"
@@ -1824,6 +1913,11 @@ build_candidate_config() {
   {
     printf '\n%s\n' "$domain_begin"
     printf '%s {\n' "$site_address"
+    if [[ "$ADDRESS_FAMILY" == ipv4 ]]; then
+      printf '    bind 0.0.0.0\n'
+    elif [[ "$ADDRESS_FAMILY" == ipv6 ]]; then
+      printf '    bind ::\n'
+    fi
     [[ -z "$TLS_DIRECTORY" ]] || printf '    tls %s/fullchain.pem %s/privkey.pem\n' "$TLS_DIRECTORY" "$TLS_DIRECTORY"
     cat <<EOF
     log {
@@ -1834,15 +1928,17 @@ build_candidate_config() {
             roll_keep_for 720h
         }
         # Emby token 常在查询参数或自定义头中；日志保留路径、字节数和耗时，但隐藏凭据。
+        log_append path "{http.request.uri.path}"
         format filter {
-            request>uri query {
-                replace api_key REDACTED
-                replace ApiKey REDACTED
-                replace token REDACTED
-                replace access_token REDACTED
-            }
+            # 删除整个 URI，避免未列入白名单的查询参数（或大小写变体）
+            # 把 Emby token 写入磁盘日志；path 由上面的安全字段保留。
+            request>uri delete
             request>headers>X-Emby-Token delete
             request>headers>X-MediaBrowser-Token delete
+            request>headers>X-Emby-Authorization delete
+            request>headers>Authorization delete
+            request>headers>ApiKey delete
+            request>headers>api_key delete
             wrap json
         }
     }
@@ -1935,6 +2031,7 @@ configure_firewall() {
 apply_existing_caddy_routes() {
   local timestamp candidate target="$CADDY_EXISTING_SITE_FILE"
   timestamp="$(date +%Y%m%d-%H%M%S)"
+  managed_target_is_safe "$target" "已有 Caddy 站点配置"
   [[ -f "$target" ]] || die "已有 Caddy 站点文件不存在：$target"
   BACKUP_FILE="${target}.bak-${timestamp}"
   cp -a "$target" "$BACKUP_FILE"
@@ -1969,6 +2066,8 @@ apply_config() {
     return
   fi
   timestamp="$(date +%Y%m%d-%H%M%S)"
+  managed_target_is_safe "$CADDYFILE" "Caddyfile"
+  managed_target_is_safe "$CADDY_ACCESS_LOG" "Caddy 访问日志"
   mkdir -p /etc/caddy
   if id caddy >/dev/null 2>&1; then
     install -d -o caddy -g caddy -m 0750 "$(dirname "$CADDY_ACCESS_LOG")"
@@ -2111,6 +2210,7 @@ EOF
 
 main() {
   require_root
+  [[ -z "$TLS_DIRECTORY" ]] || validate_tls_directory "$TLS_DIRECTORY"
   acquire_operation_lock
   printf '%sEmby 一键反向代理配置器（域名 HTTPS，Caddy / Nginx）%s\n\n' "$BOLD" "$RESET"
   check_platform

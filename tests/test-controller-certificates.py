@@ -181,12 +181,17 @@ class Certificates(unittest.TestCase):
         path=self.root/'Caddyfile'
         path.write_text('existing.example.com {\n\trespond "ok"\n}\n\n'
                         'control.example.com {\n\n reverse_proxy 127.0.0.1:19090\n}\n')
-        backup=ns['update_controller_caddyfile']('control.example.com',path)
+        with self.assertRaisesRegex(RuntimeError, '未标记'):
+            ns['update_controller_caddyfile']('control.example.com',path)
+        self.assertNotIn('BEGIN MANAGED',path.read_text())
+        marked=self.root/'marked.Caddyfile'
+        marked.write_text(ns['controller_caddy_block']('control.example.com').replace('    reverse_proxy', '  reverse_proxy'))
+        backup=ns['update_controller_caddyfile']('control.example.com',marked)
         self.assertIsNotNone(backup)
-        text=path.read_text()
+        text=marked.read_text()
         self.assertIn('# BEGIN MANAGED EMBY PROXY CONTROLLER: control.example.com',text)
         self.assertEqual(text.count('control.example.com {'),1)
-        self.assertIsNone(ns['update_controller_caddyfile']('control.example.com',path))
+        self.assertIsNone(ns['update_controller_caddyfile']('control.example.com',marked))
         conflict=self.root/'conflict.Caddyfile'
         conflict.write_text('control.example.com {\n reverse_proxy 127.0.0.1:9000\n}\n')
         with self.assertRaises(RuntimeError):

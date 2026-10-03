@@ -12,6 +12,19 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_jq() { jq -e "$2" "$1" >/dev/null || fail "$1 不满足 jq 条件：$2"; }
 assert_arg() { grep -Fx -- "$2" "$1" >/dev/null || fail "$1 缺少参数：$2"; }
 
+# The global shell lock must not follow a user-created symlink or truncate its
+# target while acquiring the manager mutex.
+lock_victim="$TMP_DIR/lock-victim"; printf 'keep\n' >"$lock_victim"
+ln -s "$lock_victim" "$TMP_DIR/emby-proxy.lock"
+mkdir -p "$TMP_DIR/bin"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$TMP_DIR/bin/flock"; chmod +x "$TMP_DIR/bin/flock"
+if PATH="$TMP_DIR/bin:$PATH" EMBY_PROXY_LOCK_FILE="$TMP_DIR/emby-proxy.lock" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  set --; source "$MANAGER_UNDER_TEST"; acquire_lock
+' 2>/dev/null; then
+  fail "符号链接锁文件未被拒绝"
+fi
+[[ "$(cat "$lock_victim")" == keep ]] || fail "符号链接锁文件改写了目标"
+
 EMBY_PROXY_LIB_ONLY=1 INSTALLER_UNDER_TEST="$INSTALLER" bash -c '
   set -- --manager-only
   source "$INSTALLER_UNDER_TEST"
@@ -160,6 +173,17 @@ assert_arg "$TMP_DIR/backend-port.args" 'port'
 assert_arg "$TMP_DIR/backend-port.args" '--https-port'
 assert_arg "$TMP_DIR/backend-port.args" '18443'
 
+# IPv6 入口重放时必须把固定地址族继续传给安装后端。
+jq '.address_family="ipv6"' "$TMP_DIR/state/sites.d/domain-one.example.com.json" >"$TMP_DIR/state/sites.d/domain-ipv6.example.com.json"
+FAKE_ARGS_OUT="$TMP_DIR/backend-ipv6.args" EMBY_PROXY_BACKEND="$TMP_DIR/fake-backend" \
+EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  set --
+  source "$MANAGER_UNDER_TEST"
+  run_backend_for_state "$EMBY_PROXY_STATE_HOME/sites.d/domain-ipv6.example.com.json"
+' || fail "IPv6 状态转后端失败"
+assert_arg "$TMP_DIR/backend-ipv6.args" '--address-family'
+assert_arg "$TMP_DIR/backend-ipv6.args" 'ipv6'
+
 FAKE_ARGS_OUT="$TMP_DIR/route-add.args" EMBY_PROXY_BACKEND="$TMP_DIR/fake-backend" \
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
   set --
@@ -188,7 +212,7 @@ EMBY_PROXY_STATE_HOME="$TMP_DIR/persisted" EMBY_PROXY_LIB_ONLY=1 INSTALLER_UNDER
 assert_jq "$TMP_DIR/persisted/sites.d/domain-persist.example.com.json" '.schema_version==2 and .engine=="caddy" and (.routes|length)==1 and (keys|length)==12'
 
 # 管理器启动时按当前白名单整理旧索引，移除已经废弃的多余字段。
-jq '.schema_version=1 | .obsolete="remove-me"' \
+jq '.schema_version=1 | .address_family="ipv6" | .tls_directory="/etc/emby-proxy-tls/example" | .obsolete="remove-me"' \
   "$TMP_DIR/persisted/sites.d/domain-persist.example.com.json" >"$TMP_DIR/persisted/old.json"
 mv "$TMP_DIR/persisted/old.json" "$TMP_DIR/persisted/sites.d/domain-persist.example.com.json"
 EMBY_PROXY_STATE_HOME="$TMP_DIR/persisted" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
@@ -196,7 +220,7 @@ EMBY_PROXY_STATE_HOME="$TMP_DIR/persisted" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER
   source "$MANAGER_UNDER_TEST"
   normalize_state_registry
 ' || fail "管理索引整理失败"
-assert_jq "$TMP_DIR/persisted/sites.d/domain-persist.example.com.json" '.schema_version==2 and (has("obsolete")|not) and (keys|length)==12'
+assert_jq "$TMP_DIR/persisted/sites.d/domain-persist.example.com.json" '.schema_version==2 and .address_family=="ipv6" and .tls_directory=="/etc/emby-proxy-tls/example" and (has("obsolete")|not) and (keys|length)==14'
 
 # 删除只能移除精确托管片段，必须保留手工站点和其他独立入口。
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_CADDYFILE="$TMP_DIR/caddy/Caddyfile" \
