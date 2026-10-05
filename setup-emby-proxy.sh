@@ -1927,11 +1927,9 @@ build_candidate_config() {
             roll_keep 5
             roll_keep_for 720h
         }
-        # Emby token 常在查询参数或自定义头中；日志保留路径、字节数和耗时，但隐藏凭据。
-        log_append path "{http.request.uri.path}"
         format filter {
             # 删除整个 URI，避免未列入白名单的查询参数（或大小写变体）
-            # 把 Emby token 写入磁盘日志；path 由上面的安全字段保留。
+            # 避免把 Emby token 写入磁盘日志；path 由站点级 log_append 安全保留。
             request>uri delete
             request>headers>X-Emby-Token delete
             request>headers>X-MediaBrowser-Token delete
@@ -1942,6 +1940,10 @@ build_candidate_config() {
             wrap json
         }
     }
+
+    # log_append 是站点级指令，不能嵌套在 log { ... } 中（Caddy 2.11+）。
+    # 保留不含查询串的路径，同时避免把 Emby token 写入访问日志。
+    log_append path "{http.request.uri.path}"
 
     handle $HEALTH_PATH {
         respond "ok" 200

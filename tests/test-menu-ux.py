@@ -77,22 +77,30 @@ class MenuUX(unittest.TestCase):
         self.assertNotIn('ARG:--node-id', r.stdout)
         self.assertIn('边缘 VPS', r.stdout)
 
-    def test_issue_uses_saved_controller_domain_when_url_missing(self):
+    def test_issue_requires_saved_https_controller(self):
         self.data['control_domain'] = 'control.example.com'
         self.state.write_text(json.dumps(self.data))
-        r = self.run_menu('curl() { [[ "$*" == *"http://control.example.com:19090/status"* ]] || return 99; '
-                          "printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
-                          'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_issue_menu', '\n\n')
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn('ARG:http://control.example.com:19090\n', r.stdout)
+        r = self.run_menu('controller_cli() { echo SHOULD_NOT_ISSUE; }; controller_issue_menu', '')
+        self.assertNotIn('SHOULD_NOT_ISSUE', r.stdout)
+        self.assertIn('HTTPS 地址尚未准备好', r.stderr)
 
-    def test_issue_advanced_quota_and_ip_retry(self):
+    def test_issue_rejects_http_controller_even_when_saved(self):
+        self.data['controller_url'] = 'http://control.example.com:19090'
+        self.state.write_text(json.dumps(self.data))
+        r = self.run_menu('controller_cli() { echo SHOULD_NOT_ISSUE; }; controller_issue_menu', '')
+        self.assertNotIn('SHOULD_NOT_ISSUE', r.stdout)
+        self.assertIn('不是 HTTPS', r.stderr)
+
+    def test_issue_uses_saved_contract_and_quota_only(self):
+        self.data['controller_url'] = 'https://control.example.com'
+        self.state.write_text(json.dumps(self.data))
         r = self.run_menu("curl() { printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
                           'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_issue_menu',
-                          'https://control.example.com\n\ny\n香港线路\n50\nnope\n5\ninvalid\n1.5\n999.2.3.4\n192.0.2.10\n')
+                          '香港线路\n5\n1.5\n')
         self.assertEqual(r.returncode, 0, r.stderr)
-        for arg in ['香港线路', '50', '1649267441664', '192.0.2.10']:
+        for arg in ['香港线路', '1649267441664']:
             self.assertIn('ARG:' + arg + '\n', r.stdout)
+        self.assertNotIn('ARG:--public-ip', r.stdout)
 
     def test_quota_unit_then_number(self):
         for choice, unit, amount, expected in [
@@ -120,13 +128,15 @@ class MenuUX(unittest.TestCase):
         self.assertIn('RESULT:0', r.stdout)
         self.assertIn('最终配额：不限额', r.stdout)
 
-    def test_issue_advanced_unlimited_still_reads_ip(self):
+    def test_issue_unlimited_does_not_ask_for_ip(self):
+        self.data['controller_url'] = 'https://control.example.com'
+        self.state.write_text(json.dumps(self.data))
         r = self.run_menu("curl() { printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
                           'controller_cli() { printf "ARG:%s\\n" "$@"; }; controller_issue_menu',
-                          'https://control.example.com\n\ny\n线路\n100\n0\n192.0.2.10\n')
+                          '线路\n0\n')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('ARG:--quota-bytes\nARG:0\n', r.stdout)
-        self.assertIn('ARG:--public-ip\nARG:192.0.2.10\n', r.stdout)
+        self.assertNotIn('ARG:--public-ip', r.stdout)
 
     def test_quota_invalid_quantity_retries(self):
         r = self.run_menu('controller_read_quota result; echo "RESULT:$result"',
@@ -135,31 +145,37 @@ class MenuUX(unittest.TestCase):
         self.assertIn('RESULT:2B', r.stdout)
 
     def test_quota_cancel_does_not_issue_token(self):
+        self.data['controller_url'] = 'https://control.example.com'
+        self.state.write_text(json.dumps(self.data))
         for quota_input in ['q\n', '4\nq\n', '4\n', '']:
             r = self.run_menu("curl() { printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
                               'controller_cli() { echo SHOULD_NOT_ISSUE; }; controller_issue_menu',
-                              'https://control.example.com\n\ny\n线路\n100\n' + quota_input)
+                              '线路\n' + quota_input)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertNotIn('SHOULD_NOT_ISSUE', r.stdout)
 
     def test_issue_cancel_creates_no_token(self):
+        self.data['controller_url'] = 'https://control.example.com'
+        self.state.write_text(json.dumps(self.data))
         r = self.run_menu("curl() { printf '{\"entry_id\":\"domain-test.example.com\"}'; }; "
                           'controller_cli() { echo SHOULD_NOT_ISSUE; }; controller_issue_menu',
-                          'https://control.example.com\nq\n')
+                          'q\n')
         self.assertNotIn('SHOULD_NOT_ISSUE', r.stdout)
 
     def test_wrong_controller_does_not_issue(self):
+        self.data['controller_url'] = 'https://control.example.com'
+        self.state.write_text(json.dumps(self.data))
         r = self.run_menu('curl() { printf \'{"entry_id":"domain-other.example.com"}\'; }; '
-                          'controller_cli() { echo SHOULD_NOT_ISSUE; }; controller_issue_menu',
-                          'https://control.example.com\n192.0.2.10\n\n\n\n')
+                          'controller_cli() { echo SHOULD_NOT_ISSUE; }; controller_issue_menu', '')
         self.assertNotIn('SHOULD_NOT_ISSUE', r.stdout)
         self.assertIn('入口不匹配', r.stderr)
 
     def test_unreachable_controller_does_not_issue(self):
-        r = self.run_menu('curl() { return 7; }; controller_cli() { echo SHOULD_NOT_ISSUE; }; controller_issue_menu',
-                          'https://control.example.com\n192.0.2.10\n\n\n\n')
+        self.data['controller_url'] = 'https://control.example.com'
+        self.state.write_text(json.dumps(self.data))
+        r = self.run_menu('curl() { return 7; }; controller_cli() { echo SHOULD_NOT_ISSUE; }; controller_issue_menu', '')
         self.assertNotIn('SHOULD_NOT_ISSUE', r.stdout)
-        self.assertIn('选择 2', r.stderr)
+        self.assertIn('无法访问主控', r.stderr)
 
     def test_eof_returns_from_main_and_controller(self):
         for menu in ['main_menu', 'controller_menu']:
@@ -175,6 +191,7 @@ class MenuUX(unittest.TestCase):
         self.assertIn('新增', r.stdout)
 
     def test_controller_order(self):
+        self.state.unlink()
         r = self.run_menu('controller_init_menu() { echo STEP_INIT; }; '
                           'controller_master_menu() { echo STEP_START; }; '
                           'controller_issue_menu() { echo STEP_ENROLL; }; '
@@ -182,6 +199,44 @@ class MenuUX(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertLess(r.stdout.index('STEP_INIT'), r.stdout.index('STEP_START'))
         self.assertLess(r.stdout.index('STEP_START'), r.stdout.index('STEP_ENROLL'))
+
+    def test_quickstart_failure_keeps_state_and_reports_one_next_step(self):
+        self.state.unlink()
+        r = self.run_menu('controller_init_menu() { return 1; }; controller_quickstart_menu', '')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(self.state.exists())
+        self.assertIn('入口尚未配置', r.stderr)
+        self.assertIn('下一步：配置业务域名', r.stdout)
+
+    def test_quickstart_existing_state_resumes_at_certificate(self):
+        self.data['dns'] = {'provider': 'cloudflare'}
+        self.state.write_text(json.dumps(self.data))
+        before = self.state.read_bytes()
+        r = self.run_menu('controller_cert_menu() { return 1; }; controller_quickstart_menu', '')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(before, self.state.read_bytes())
+        self.assertIn('入口已保存', r.stdout)
+        self.assertIn('主控 HTTPS 尚未完成', r.stderr)
+        self.assertIn('下一步：配置主控 HTTPS', r.stdout)
+
+    def test_quickstart_provider_step_offers_action(self):
+        self.state.write_text(json.dumps(self.data))
+        r = self.run_menu('controller_dnspod_setup_menu() { echo DNSPOD_SETUP; }; '
+                          'controller_quickstart_menu', '1\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('DNSPOD_SETUP', r.stdout)
+        self.assertIn('DNS Provider 尚未接入', r.stderr)
+
+    def test_controller_menu_labels_start_and_resume(self):
+        self.state.unlink()
+        started = self.run_menu('controller_quickstart_menu() { echo QUICK; }; controller_menu', '1\nq\n')
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertIn('开始部署', started.stdout)
+        self.assertIn('QUICK', started.stdout)
+        self.state.write_text(json.dumps(self.data))
+        resumed = self.run_menu('controller_quickstart_menu() { echo QUICK; }; controller_menu', '1\nq\n')
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertIn('继续部署', resumed.stdout)
 
     def test_master_defaults_no_status_question(self):
         r = self.run_menu('controller_cli() { printf "ARG:%s\\n" "$@"; }; '

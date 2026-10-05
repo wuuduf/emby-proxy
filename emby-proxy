@@ -4603,7 +4603,7 @@ controller_init_menu() {
   ui_read_field source "Emby 源站（域名或 URL，可带端口）" "" ui_valid_source || return 0
   [[ "$source" == *://* ]] || source="https://$source"
   while true; do
-    ui_read_field control_domain "独立主控域名（可选，留空稍后配置）" "" ui_valid_optional_domain || return 0
+    ui_read_field control_domain "独立主控域名" "control.${domain}" ui_valid_optional_domain || return 0
     control_domain="$(printf '%s' "$control_domain" | tr '[:upper:]' '[:lower:]')"
     [[ -z "$control_domain" || "$control_domain" != "$domain" ]] && break
     warn "主控域名不能与业务入口域名相同，请重新输入或留空。"
@@ -4754,67 +4754,53 @@ ui_valid_address_family() {
 }
 
 controller_issue_menu() {
-  local state name priority quota quota_input public_ip controller_url saved_url control_domain status expected advanced address_family
+  local state name priority quota quota_input public_ip controller_url saved_url control_domain status expected address_family node_count default_name
   state="$(controller_require_state)" || return 1
-  ui_section "3 / 3  添加边缘节点"
-  printf '填写节点信息，生成命令后复制到对应 VPS 执行。输入 q 取消。\n'
-  printf '主控 URL 示例：https://control.example.com；必须先配置好 HTTPS 入口。\n'
+  ui_section "添加边缘节点"
+  printf '只填写节点备注和配额；主控 URL、引擎、地址族和公网 IP 自动沿用/检测。输入 q 取消。\n'
+  printf '公网节点注册只使用 HTTPS 主控地址；未完成 HTTPS 时请先返回快速部署。\n'
   saved_url="$(jq -r '.controller_url // empty' "$state")"
   control_domain="$(jq -r '.control_domain // empty' "$state")"
   if [[ -z "$saved_url" && -n "$control_domain" ]]; then
     if jq -e '.certificates != null' "$state" >/dev/null 2>&1; then
       saved_url="https://${control_domain}:19090"
-    else
-      saved_url="http://${control_domain}:19090"
     fi
-    info "已沿用初始化时设置的主控域名：${saved_url}"
+    [[ -z "$saved_url" ]] || info "已沿用初始化时设置的主控域名：${saved_url}"
   fi
   if [[ -n "$saved_url" ]]; then
     controller_url="$saved_url"
-    info "沿用上次验证通过的主控 URL：${controller_url}（如失效会要求重新填写）"
+    info "沿用已保存的主控 URL：${controller_url}"
   else
-    ui_read_field controller_url "边缘能访问的主控 URL（不是播放域名）" "" ui_valid_url || return 0
+    warn "主控 HTTPS 地址尚未准备好；请先选择 1 开始/继续部署，完成证书和主控服务。"
+    return 1
   fi
   controller_url="${controller_url%/}"
+  [[ "$controller_url" == https://* ]] || {
+    warn "当前主控地址不是 HTTPS，拒绝生成公网节点注册码；请先完成主控证书配置。"
+    return 1
+  }
   info "正在检查主控连通性与入口身份……"
   status="$(curl -fsS --connect-timeout 5 --max-time 10 "$controller_url/status" 2>/dev/null)" || {
-    if [[ -n "$saved_url" ]]; then
-      warn "已记忆的主控 URL 无法访问，请填写新的可达 URL。"
-      ui_read_field controller_url "边缘能访问的主控 URL（不是播放域名）" "" ui_valid_url || return 0
-      controller_url="${controller_url%/}"
-      status="$(curl -fsS --connect-timeout 5 --max-time 10 "$controller_url/status" 2>/dev/null)" || {
-        warn "无法访问主控。请先选择 2 启动服务；确认 HTTPS 入口及防火墙已配置。127.0.0.1 不能供其他 VPS 访问。"
-        return 1
-      }
-    else
-      warn "无法访问主控。请先选择 2 启动服务；确认 HTTPS 入口及防火墙已配置。127.0.0.1 不能供其他 VPS 访问。"
-      return 1
-    fi
+    warn "无法访问主控。请先确认主控 HTTPS、DNS 和防火墙；127.0.0.1 不能供其他 VPS 访问。"
+    return 1
   }
   expected="$(jq -r '.entry_id' "$state")"
   jq -e --arg entry "$expected" '.entry_id == $entry' <<<"$status" >/dev/null 2>&1 || {
     warn "主控响应无效或入口不匹配。请检查 URL 是否指向当前入口的控制器，而非播放网站。"; return 1;
   }
   public_ip=""
-  name=""
-  priority=100
-  quota_input=0
   address_family="$(jq -r '.address_family // "ipv4"' "$state")"
   info "入口地址类型固定为 ${address_family}；同一入口的所有边缘节点必须使用相同地址类型。"
-  ui_read_field address_family "边缘地址类型（ipv4/ipv6）" "$address_family" ui_valid_address_family || return 0
-  [[ "$address_family" == "$(jq -r '.address_family // "ipv4"' "$state")" ]] || { warn "该入口已固定地址类型，不能为单个节点混用。"; return 1; }
-  info "默认：名称和 ID 自动生成 · 优先级 100 · 配额不限额；公网地址在边缘 VPS 执行时检测。"
-  ui_read_field advanced "是否设置线路名称、优先级、配额或指定 IP？y/n" n ui_valid_yes_no || return 0
-  if [[ "$advanced" =~ ^[Yy]$ ]]; then
-    ui_read_field name "线路名称（留空自动生成）" "" || return 0
-    ui_read_field priority "优先级（数字越大越优先）" 100 ui_valid_priority || return 0
-    controller_read_quota quota_input || return 0
-    if [[ "$address_family" == ipv6 ]]; then
-      ui_read_field public_ip "指定边缘公网 IPv6（留空在边缘自动检测）" "" ui_valid_optional_ipv6 || return 0
-    else
-      ui_read_field public_ip "指定边缘公网 IPv4（留空在边缘自动检测）" "" ui_valid_optional_ipv4 || return 0
-    fi
-  fi
+  node_count="$(jq -r '((.nodes // {}) | length) + ((.enroll_tokens // {}) | length)' "$state" 2>/dev/null || printf 0)"
+  [[ "$node_count" =~ ^[0-9]+$ ]] || node_count=0
+  default_name="边缘节点 $((node_count + 1))"
+  name="$default_name"
+  priority=$((100 - node_count * 10))
+  (( priority > 0 )) || priority=1
+  quota_input=0
+  ui_read_field name "节点备注" "$default_name" || return 0
+  controller_read_quota quota_input || return 0
+  info "自动设置：节点 ID 由主控生成 · 优先级 ${priority} · 公网 ${address_family} 在边缘 VPS 检测。"
   quota="$(controller_parse_quota "$quota_input")" || return 1
   local quota_display="$quota_input"
   [[ "$quota" != 0 ]] || quota_display="不限额"
@@ -5246,12 +5232,17 @@ controller_menu_summary() {
 }
 
 controller_cert_menu() {
-  local state domain answer provider record_type
+  local state domain answer provider record_type saved_url
   state="$(controller_require_state)" || return 1
   provider="$(jq -r '.dns.provider // empty' "$state")"
   record_type="$(jq -r 'if (.address_family // "ipv4") == "ipv6" then "AAAA" else "A" end' "$state")"
   domain="$(jq -r '.certificates.control_domain // .control_domain // ("control." + .domain)' "$state")"
-  ui_read_field domain "独立主控域名（${record_type} 记录需提前指向主控 VPS）" "$domain" ui_valid_domain || return 0
+  saved_url="$(jq -r '.controller_url // empty' "$state")"
+  if [[ -n "$saved_url" && "$saved_url" == https://* ]]; then
+    info "沿用已验证的主控地址：${saved_url}"
+  else
+    ui_read_field domain "独立主控域名（${record_type} 记录需提前指向主控 VPS）" "$domain" ui_valid_domain || return 0
+  fi
   if [[ "$provider" == cloudflare ]]; then
     ui_section "自动证书 · Cloudflare DNS-01"
     warn "将安装 Certbot/Cloudflare 插件、申请证书，并让主控直接监听 HTTPS 19090。"
@@ -5274,13 +5265,130 @@ controller_cert_menu() {
   fi
 }
 
-controller_menu() {
-  local choice
+# 首次/中断后的统一向导外壳。底层 init、证书和 systemd 操作仍沿用旧
+# 函数，故 CLI 协议与已有状态格式不变；这里只根据当前事实选择下一步。
+controller_quickstart_phase() {
+  local state="$(controller_state_path)" provider controller_url front_proxy
+  if [[ ! -f "$state" ]]; then
+    printf 'entry'
+    return 0
+  fi
+  provider="$(jq -r '.dns.provider // empty' "$state" 2>/dev/null || true)"
+  if [[ -z "$provider" ]]; then
+    printf 'provider'
+    return 0
+  fi
+  controller_url="$(jq -r '.controller_url // empty' "$state" 2>/dev/null || true)"
+  front_proxy="$(jq -r '.controller_front_proxy // empty' "$state" 2>/dev/null || true)"
+  if [[ "$provider" == cloudflare ]]; then
+    jq -e '.certificates != null' "$state" >/dev/null 2>&1 || {
+      printf 'certificate'
+      return 0
+    }
+  elif [[ "$controller_url" != https://* || "$front_proxy" != caddy ]]; then
+    printf 'certificate'
+    return 0
+  fi
+  if ! systemctl is-active --quiet emby-proxy-master.service 2>/dev/null; then
+    printf 'master'
+    return 0
+  fi
+  if [[ "$(jq -r '(.nodes // {}) | length' "$state" 2>/dev/null || printf 0)" == 0 ]]; then
+    printf 'node'
+    return 0
+  fi
+  printf 'ready'
+}
+
+controller_quickstart_next_step() {
+  case "${1:-entry}" in
+    entry) printf '下一步：配置业务域名、固定源站和 DNS 提供商。\n' ;;
+    provider) printf '下一步：接入 Cloudflare 或 DNSPod；未接入 Provider 不会生成公网节点命令。\n' ;;
+    certificate) printf '下一步：配置主控 HTTPS；完成后边缘才能安全注册。\n' ;;
+    master) printf '下一步：启动主控服务并确认主控 URL 可从边缘访问。\n' ;;
+    node) printf '下一步：添加边缘节点；复制命令到每台边缘 VPS。\n' ;;
+    ready) printf '下一步：查看节点状态，确认 DNS 已回读，再配置流量策略。\n' ;;
+    *) printf '下一步：运行控制器诊断。\n' ;;
+  esac
+}
+
+controller_quickstart_menu() {
+  local state phase provider_choice
+  state="$(controller_state_path)"
   while true; do
-    ui_header "多线路控制器 · 实验版" "1 配置入口 → 8 自动证书/HTTPS → 3 接入节点"
+    phase="$(controller_quickstart_phase)"
+    ui_header "多线路控制器 · 快速部署" "可恢复向导 · 已完成的输入不会清空"
+    case "$phase" in
+      entry)
+        printf '首次部署只需完成：业务域名、固定源站、DNS 提供商和地址族。\n'
+        printf '任一步输入 q 或遇到错误都会保留已写入的状态，不会创建半成品节点。\n\n'
+        if ! ( controller_init_menu ); then
+          warn "入口配置没有完成；已保留原状态。"
+        fi
+        [[ -f "$state" ]] || { warn "入口尚未配置，已保留当前系统不变。"; controller_quickstart_next_step entry; return 0; }
+        continue
+        ;;
+      provider)
+        printf '入口已保存，但还没有接入 DNS Provider。\n'
+        ui_item 1 "接入 DNSPod" "检查 NS 和线路记录"
+        ui_item 2 "返回菜单" "稍后从 DNS 与流量策略进入"
+        ui_prompt
+        IFS= read -r provider_choice || return 0
+        case "$provider_choice" in
+          1) menu_run controller_dnspod_setup_menu ;;
+          2|q|Q) controller_quickstart_next_step provider; return 0 ;;
+          *) warn "请输入 1 或 2。"; controller_quickstart_next_step provider; return 0 ;;
+        esac
+        [[ "$(controller_quickstart_phase)" == provider ]] && { warn "DNS Provider 尚未接入，已保留入口状态。"; controller_quickstart_next_step provider; return 0; }
+        continue
+        ;;
+      certificate)
+        printf '入口已保存；主控 HTTPS 尚未配置。证书方式会按 DNS 提供商自动选择。\n'
+        if ! ( controller_cert_menu ); then
+          warn "主控 HTTPS 配置失败；已保留入口状态。"
+        fi
+        [[ "$(controller_quickstart_phase)" == certificate ]] && { warn "主控 HTTPS 尚未完成，未继续创建节点。"; controller_quickstart_next_step certificate; return 0; }
+        continue
+        ;;
+      master)
+        printf '主控 HTTPS 已配置；主控服务当前未运行。\n'
+        if ! ( controller_master_menu ); then
+          warn "主控服务启动失败；已保留入口和证书状态。"
+        fi
+        systemctl is-active --quiet emby-proxy-master.service 2>/dev/null || {
+          warn "主控服务仍未运行，未继续生成节点命令。"; controller_quickstart_next_step master; return 0;
+        }
+        continue
+        ;;
+      node)
+        printf '主控已就绪，还没有边缘节点。\n'
+        if ! ( controller_issue_menu ); then
+          warn "边缘节点尚未添加；已保留主控状态。"
+        fi
+        controller_quickstart_next_step "$(controller_quickstart_phase)"
+        return 0
+        ;;
+      ready)
+        printf '入口、证书、主控和至少一个节点已配置。\n'
+        controller_quickstart_next_step ready
+        return 0
+        ;;
+    esac
+  done
+}
+
+controller_menu() {
+  local choice quick_label quick_hint
+  while true; do
+    ui_header "多线路控制器 · 实验版" "1 开始/继续部署 → 8 自动证书/HTTPS → 3 接入节点"
     controller_menu_summary
-    ui_section "首次配置 · 按顺序完成"
-    ui_item 1 "配置主控入口" "域名、固定源站；DNSPod 随后选 10"
+    ui_section "推荐流程"
+    if [[ -f "$(controller_state_path)" ]]; then
+      quick_label="继续部署"; quick_hint="从当前阶段继续，不清空已完成配置"
+    else
+      quick_label="开始部署"; quick_hint="按阶段完成入口、HTTPS、主控和节点"
+    fi
+    ui_item 1 "$quick_label" "$quick_hint"
     ui_item 8 "配置自动证书" "主控 HTTPS、签发续期、边缘领取"
     ui_item 3 "添加边缘节点" "生成一条安装命令"
     ui_section "日常管理"
@@ -5298,7 +5406,7 @@ controller_menu() {
     ui_item 0 "返回上一级" "q 也可返回"
     ui_prompt; IFS= read -r choice || return 0
     case "$choice" in
-      1) menu_run controller_init_menu ;;
+      1) menu_run controller_quickstart_menu ;;
       2) menu_run controller_master_menu ;;
       3) menu_run controller_issue_menu ;;
       4) menu_run controller_status_menu ;;
