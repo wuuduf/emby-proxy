@@ -222,6 +222,16 @@ EMBY_PROXY_STATE_HOME="$TMP_DIR/persisted" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER
 ' || fail "管理索引整理失败"
 assert_jq "$TMP_DIR/persisted/sites.d/domain-persist.example.com.json" '.schema_version==2 and .address_family=="ipv6" and .tls_directory=="/etc/emby-proxy-tls/example" and (has("obsolete")|not) and (keys|length)==14'
 
+# A new installation's transaction proof must survive the manager startup
+# normalization before node-cleanup invokes the real deletion command.
+jq '.registration_transaction="0123456789abcdef0123456789abcdef"' \
+  "$TMP_DIR/persisted/sites.d/domain-persist.example.com.json" >"$TMP_DIR/persisted/transaction.json"
+mv "$TMP_DIR/persisted/transaction.json" "$TMP_DIR/persisted/sites.d/domain-persist.example.com.json"
+EMBY_PROXY_STATE_HOME="$TMP_DIR/persisted" EMBY_PROXY_MANAGER_LIB_ONLY=1 MANAGER_UNDER_TEST="$MANAGER" bash -c '
+  set --; source "$MANAGER_UNDER_TEST"; normalize_state_registry
+' || fail "整理索引丢失安装事务"
+assert_jq "$TMP_DIR/persisted/sites.d/domain-persist.example.com.json" '.registration_transaction=="0123456789abcdef0123456789abcdef" and (keys|length)==15'
+
 # 删除只能移除精确托管片段，必须保留手工站点和其他独立入口。
 EMBY_PROXY_STATE_HOME="$TMP_DIR/state" EMBY_PROXY_CADDYFILE="$TMP_DIR/caddy/Caddyfile" \
 EMBY_PROXY_NGINX_CONF_DIR="$TMP_DIR/nginx" EMBY_PROXY_MANAGER_LIB_ONLY=1 \

@@ -59,6 +59,7 @@ BOOTSTRAP_MENU=0
 ENTRY_WIZARD=0
 SKIP_DNS_CHECK=0
 SKIP_VERIFY=0
+NODE_PREFLIGHT=0
 TLS_DIRECTORY=""
 ADDRESS_FAMILY=""
 ACCESS_SCHEME=""
@@ -205,6 +206,7 @@ usage() {
       --domain-mode MODE    域名入口：subdomain、port 或 path
       --skip-dns-check      仅用于边缘节点预配置：暂不要求域名当前指向本 VPS
       --skip-verify         仅用于边缘节点预配置：配置成功后不等待本机 HTTPS 验证
+      --node-preflight      边缘注册前只读预检；不安装软件、不改配置、不 reload
       --address-family MODE 边缘监听地址族：ipv4 或 ipv6；省略时双栈
       --tls-directory DIR  使用已校验的外部证书目录（fullchain.pem / privkey.pem）
   -p, --path PATH           主源站的访问路径，默认 /；已有 Caddy 域名必须填写非根路径
@@ -239,6 +241,8 @@ while (($#)); do
       SKIP_DNS_CHECK=1; shift ;;
     --skip-verify)
       SKIP_VERIFY=1; shift ;;
+    --node-preflight)
+      NODE_PREFLIGHT=1; shift ;;
     --address-family)
       [[ $# -ge 2 && ( "$2" == ipv4 || "$2" == ipv6 ) ]] || die "地址类型只能是 ipv4 或 ipv6。"
       ADDRESS_FAMILY="$2"; shift 2 ;;
@@ -269,6 +273,7 @@ require_root() {
     [[ -n "$PROXY_ENGINE" ]] && sudo_args+=(--engine "$PROXY_ENGINE")
     (( MANAGER_ONLY )) && sudo_args+=(--manager-only)
     (( ENTRY_WIZARD )) && sudo_args+=(--entry-wizard)
+    (( NODE_PREFLIGHT )) && sudo_args+=(--node-preflight)
     [[ -n "$PROXY_DOMAIN" ]] && sudo_args+=(--domain "$PROXY_DOMAIN")
     [[ -n "$HTTPS_PORT" ]] && sudo_args+=(--https-port "$HTTPS_PORT")
     [[ -n "$DOMAIN_ENTRY_TYPE" ]] && sudo_args+=(--domain-mode "$DOMAIN_ENTRY_TYPE")
@@ -1051,12 +1056,14 @@ persist_site_state() {
     --arg domain "$PROXY_DOMAIN" \
     --arg listen_port "$HTTPS_PORT" --arg public_url "$PUBLIC_BASE_URL" \
     --arg entry_type "$DOMAIN_ENTRY_TYPE" --arg address_family "$ADDRESS_FAMILY" --arg tls_directory "$TLS_DIRECTORY" \
+    --arg registration_transaction "${EMBY_PROXY_REGISTRATION_TRANSACTION:-}" \
     --arg managed_kind "$managed_kind" --arg config_file "$config_file" \
     --arg created_at "$created_at" --arg updated_at "$now" --argjson routes "$routes_json" \
     '{schema_version:$schema_version,id:$id,engine:$engine,domain:$domain,
       listen_port:($listen_port|if .=="" then null else tonumber end),entry_type:$entry_type,public_url:$public_url,
       managed_kind:$managed_kind,config_file:$config_file,created_at:$created_at,updated_at:$updated_at,routes:$routes}
       + (if $address_family=="" then {} else {address_family:$address_family} end)
+      + (if $registration_transaction=="" then {} else {registration_transaction:$registration_transaction} end)
       + (if $tls_directory=="" then {} else {tls_directory:$tls_directory} end)' \
     >"$temp"
   if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
@@ -2210,8 +2217,49 @@ EOF
   return 1
 }
 
+preflight_node_configuration() {
+  local scratch
+  # No apt, manager writes, firewall changes, certificates or reload here.
+  [[ -n "$PROXY_ENGINE" && -n "$PROXY_DOMAIN" && -n "$UPSTREAM_INPUT" ]] || die "边缘预检需提供引擎、域名和固定源站。"
+  prompt_inputs
+  prepare_routes
+  check_port_conflicts
+  managed_target_is_safe "$MANAGER_HOME/sites.d/domain-${PROXY_DOMAIN}.json" "边缘管理索引"
+  [[ ! -e "$MANAGER_HOME/sites.d/domain-${PROXY_DOMAIN}.json" ]] || die "本机已有同名入口；边缘注册不会接管或覆盖它，请先确认并卸载旧节点。"
+  if [[ "$PROXY_ENGINE" == caddy ]]; then
+    managed_target_is_safe "$CADDYFILE" "Caddyfile"
+    managed_target_is_safe "$CADDY_ACCESS_LOG" "Caddy 访问日志"
+    caddy_domain_is_script_managed && die "本机已有同名 Caddy 托管入口；请先确认原用途，注册码未消耗。"
+    check_caddy_domain_conflict
+    scratch="$(mktemp -d /tmp/emby-node-preflight.XXXXXX)"
+    (
+      trap 'rm -rf "$scratch"' EXIT
+      [[ ! -f "$CADDYFILE" ]] || cp "$CADDYFILE" "$scratch/source"
+      [[ -f "$scratch/source" ]] || : >"$scratch/source"
+      build_candidate_config "$scratch/source" "$scratch/Caddyfile"
+      if command -v caddy >/dev/null 2>&1; then
+        # adapt parses the candidate but does not provision log files or ACME.
+        caddy adapt --config "$scratch/Caddyfile" --adapter caddyfile >/dev/null
+      else
+        warn "Caddy 尚未安装；应用阶段安装后仍须 validate，失败不会启用节点。"
+      fi
+    ) || return 1
+  else
+    managed_target_is_safe "$NGINX_CONFIG" "Nginx 入口"
+    managed_target_is_safe "$NGINX_ACME_CONFIG" "Nginx ACME 入口"
+    [[ ! -e "$NGINX_CONFIG" ]] || die "本机已有同名 Nginx 入口；边缘注册不会接管它。"
+    check_nginx_domain_conflict
+  fi
+  ok "边缘只读预检通过；未安装软件、未修改现有配置或服务，注册码尚未消耗。"
+}
+
 main() {
   require_root
+  if (( NODE_PREFLIGHT )); then
+    check_platform
+    preflight_node_configuration
+    return
+  fi
   [[ -z "$TLS_DIRECTORY" ]] || validate_tls_directory "$TLS_DIRECTORY"
   acquire_operation_lock
   printf '%sEmby 一键反向代理配置器（域名 HTTPS，Caddy / Nginx）%s\n\n' "$BOLD" "$RESET"

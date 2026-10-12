@@ -181,12 +181,13 @@ normalize_state_registry() {
   while IFS= read -r file; do
     jq -e 'type=="object" and (.routes|type=="array")' "$file" >/dev/null 2>&1 || continue
     temp="$(mktemp /tmp/emby-proxy-state-normalize.XXXXXX)"
-    jq '{
+    jq '. as $state | {
       schema_version:2,
       id,engine,domain,listen_port,entry_type,public_url,managed_kind,config_file,
       address_family,tls_directory,
       created_at,updated_at,routes
-    }' "$file" >"$temp"
+    } + (if ($state.registration_transaction // "" | test("^[0-9a-f]{32}$"))
+      then {registration_transaction:$state.registration_transaction} else {} end)' "$file" >"$temp"
     if cmp -s "$file" "$temp"; then
       rm -f "$temp"
     else
@@ -1632,7 +1633,7 @@ service_menu() {
 
 controller_cli() {
   command -v python3 >/dev/null 2>&1 || die "多线路功能需要 python3。"
-  python3 - "$@" <<'PY'
+  EMBY_PROXY_MANAGER_BIN="$MANAGER_BIN" python3 - "$@" <<'PY'
 import argparse, copy, grp, hashlib, ipaddress, json, math, os, re, secrets, shlex, shutil, socket, ssl, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.request
 from contextlib import contextmanager
@@ -1654,6 +1655,16 @@ RECOVERY_SECONDS = 60
 SWITCH_COOLDOWN = 180
 def now(): return int(time.time())
 def digest(v): return hashlib.sha256(v.encode()).hexdigest()
+def token_matches(stored_hash, token):
+    """Compare node credentials without making token validity observable."""
+    if not isinstance(token, str): return False
+    return secrets.compare_digest(str(stored_hash or ''), digest(token))
+def manager_binary():
+    value=os.environ.get('EMBY_PROXY_MANAGER_BIN','/usr/local/sbin/emby-proxy').strip()
+    path=Path(value)
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError('未找到可用于清理的 emby-proxy 管理命令；请先修复管理器安装，恢复记录已保留。')
+    return str(path)
 def atomic_write(path, data):
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
     # A fixed ``.tmp`` is both observable and racy when a heartbeat and the
@@ -1823,6 +1834,10 @@ def bounded_json_response(response, limit=1048576):
     if not isinstance(result,dict): raise ValueError('invalid response')
     return result
 
+class ControllerHTTPError(RuntimeError):
+    def __init__(self,code):
+        self.code=code; super().__init__('主控返回 HTTP %s。' % code)
+
 def post_json(url, payload, token=''):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type':'application/json'}, method='POST')
     if token: req.add_header('Authorization', 'Bearer ' + token)
@@ -1832,7 +1847,7 @@ def post_json(url, payload, token=''):
         code=int(getattr(e,'code',0) or 0)
         try: e.close()
         except OSError: pass
-        raise RuntimeError('主控返回 HTTP %s。' % code) from None
+        raise ControllerHTTPError(code) from None
     except (urllib.error.URLError, OSError, ValueError):
         raise RuntimeError('无法连接主控或响应格式无效。') from None
 
@@ -2181,7 +2196,7 @@ def node_cert_sync(a):
         raise
     print('证书已同步：'+version[:12])
 
-def install_certificate_timer(name, arguments, interval):
+def install_certificate_timer(name, arguments, interval, transaction=''):
     # State paths become systemd arguments, not shell fragments or specifiers.
     if any(not re.fullmatch(r'[A-Za-z0-9_./:-]+',str(v)) for v in arguments):
         raise RuntimeError('定时任务参数包含不支持的字符。')
@@ -2190,6 +2205,8 @@ def install_certificate_timer(name, arguments, interval):
         '# MANAGED EMBY CERTIFICATE\n[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nUMask=0077\nTimeoutStartSec=1200\nExecStart='+command+'\n'),
         (Path('/etc/systemd/system/'+name+'.timer'),
         '# MANAGED EMBY CERTIFICATE\n[Unit]\n[Timer]\nOnBootSec=2min\nOnUnitInactiveSec='+interval+'\nRandomizedDelaySec=60\n[Install]\nWantedBy=timers.target\n')]
+    if transaction:
+        units=[(path,'# REGISTRATION TRANSACTION: '+transaction+'\n'+content) for path,content in units]
     backups=[]; created=[]
     try:
         for path,content in units:
@@ -2407,6 +2424,65 @@ class Controller:
         self.state = json.loads(self.path.read_text())
         self.state.setdefault('schema_version', 1); self.state.setdefault('address_family', 'ipv4'); self.state.setdefault('enroll_tokens', {}); self.state.setdefault('nodes', {}); self.state.setdefault('active_node', None); self.state.setdefault('active_nodes', [])
     def save(self): atomic_write(self.path, self.state)
+    def pending_ticket(self, credential):
+        if not isinstance(credential,str) or not re.fullmatch(r'[A-Za-z0-9_-]{24,128}',credential):
+            return None,None
+        for nid,ticket in self.state['enroll_tokens'].items():
+            if (isinstance(ticket,dict) and ticket.get('protocol') == 2 and
+                    secrets.compare_digest(str(ticket.get('token','')),credential) and
+                    ticket_status(ticket) == 'pending'):
+                return nid,ticket
+        return None,None
+    def prepare(self, b, secure=False):
+        """Read-only contract lookup; no lease, token consumption or node creation."""
+        with self.lock, state_lock(self.path):
+            self.reload()
+            if not secure: return 403, {'error':'ticket_requires_https'}
+            nid,ticket=self.pending_ticket(b.get('ticket'))
+            if not ticket: return 403, {'error':'invalid_or_expired_enroll_token'}
+            if ticket.get('revision') != registration_revision(self.state):
+                return 409, {'error':'entry_changed_reissue_ticket'}
+            if nid in self.state['nodes']: return 409, {'error':'node_already_registered'}
+            plan=registration_contract(self.state)
+            plan.update({key:ticket[key] for key in ('node_id','name','priority','quota_bytes','revision','expires_at')})
+            plan['certificate_managed']=bool(self.state.get('certificates'))
+            return 200,plan
+    def commit(self, b, secure=False):
+        with self.lock, state_lock(self.path):
+            self.reload()
+            if not secure: return 403, {'error':'ticket_requires_https'}
+            nid,ticket=self.pending_ticket(b.get('ticket'))
+            if not ticket: return 403, {'error':'invalid_or_expired_enroll_token'}
+            if ticket.get('revision') != registration_revision(self.state) or b.get('revision') != ticket['revision']:
+                return 409, {'error':'entry_changed_reissue_ticket'}
+            if nid in self.state['nodes']: return 409, {'error':'node_already_registered'}
+            if b.get('detected_engine') not in ('',self.state.get('engine','caddy')):
+                return 409, {'error':'engine_conflict_registration_not_consumed'}
+            if b.get('address_family') != ticket['address_family']:
+                return 409, {'error':'address_family_conflict_registration_not_consumed'}
+            try:
+                public_ip=validate_node_public_ip(b.get('public_ip'),ticket['address_family'])
+                if not public_ip: raise ValueError('public_ip_required')
+            except ValueError as error: return 400, {'error':str(error)}
+            token=b.get('node_token')
+            if not isinstance(token,str) or not re.fullmatch(r'[A-Za-z0-9_-]{32,128}',token):
+                return 400, {'error':'invalid_installation_token'}
+            # The edge durably saves this secret BEFORE commit. If the HTTP
+            # response is lost it can still authenticate a failure/revoke,
+            # without making a consumed enrollment credential reusable.
+            item={'name':ticket['name'],'priority':ticket['priority'],'quota_bytes':ticket['quota_bytes'],
+                  'public_ip':public_ip,'address_family':ticket['address_family'],'used_bytes':0,
+                  'healthy':False,'status':'provisioning','registration_status':'provisioning',
+                  'last_seen':now(),'token_hash':digest(token),'version':'ticket-v2'}
+            self.state['nodes'][nid]=item
+            self.state['enroll_tokens'].pop(nid,None)
+            task=safe_ticket(ticket); task.update(status='provisioning',updated_at=now())
+            self.state.setdefault('registration_tasks',{})[nid]=task
+            self.save()
+            result=registration_contract(self.state)
+            result.update(node_token=token,node_id=nid,certificate_managed=bool(self.state.get('certificates')),
+                          telemetry_enabled=(self.state.get('telegram') or {}).get('enabled') is True)
+            return 200,result
     def enroll(self, b, secure=False):
         with self.lock, state_lock(self.path):
             self.reload()
@@ -2416,12 +2492,16 @@ class Controller:
             node, reg = str(b.get('node_id','')), str(b.get('enroll_token',''))
             if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', node): return 400, {'error':'invalid_node_id'}
             pending=self.state['enroll_tokens'].get(node)
+            if isinstance(pending,dict) and pending.get('protocol') == 2:
+                # Never let an old client bypass the ticket-bound policy or
+                # the prepare/preflight/commit sequence through /enroll.
+                return 409, {'error':'ticket_v2_requires_prepare_and_commit_upgrade_edge'}
             expected=pending.get('token') if isinstance(pending,dict) else pending
             issued=pending.get('issued_at') if isinstance(pending,dict) else None
             if issued is not None and now() - int(issued) > ENROLL_TTL:
                 self.state['enroll_tokens'].pop(node,None); self.save()
                 return 403, {'error':'invalid_or_expired_enroll_token'}
-            if not node or expected != reg: return 403, {'error':'invalid_or_expired_enroll_token'}
+            if not node or not isinstance(expected,str) or not secrets.compare_digest(expected, reg): return 403, {'error':'invalid_or_expired_enroll_token'}
             detected = b.get('detected_engine', '')
             if detected and detected != self.state.get('engine','caddy'):
                 return 409, {'error':'engine_conflict: 边缘已有 %s，主控要求 %s；请使用引擎一致的节点，注册码未消耗。' % (detected, self.state.get('engine','caddy'))}
@@ -2452,7 +2532,7 @@ class Controller:
         with self.lock, state_lock(self.path):
             self.reload()
             node = self.state['nodes'].get(str(b.get('node_id','')))
-            if not node or node.get('token_hash') != digest(token): return 403, {'error':'invalid_node_token'}
+            if not node or not token_matches(node.get('token_hash'), token): return 403, {'error':'invalid_node_token'}
             try:
                 node_family = normalize_address_family(node.get('address_family', self.state.get('address_family','ipv4')))
                 reported_family = normalize_address_family(b.get('address_family', node_family))
@@ -2503,16 +2583,55 @@ class Controller:
             metrics=sanitize_metrics(b.get('metrics')) if telemetry_enabled else None
             if metrics is not None: node['metrics']=metrics
             else: node.pop('metrics',None)
+            nid=str(b.get('node_id',''))
+            task=self.state.get('registration_tasks',{}).get(nid)
+            if task and node.get('registration_status') == 'installed':
+                task.update(status='ready' if node.get('healthy') else 'observing',updated_at=stamp)
             selected = self.select(); self.save(); return 200, {'selected_node':selected, 'accepted_used_bytes':used,
                                                                   'telemetry_enabled':telemetry_enabled}
+    def registration_result(self, b, token):
+        with self.lock, state_lock(self.path):
+            self.reload(); nid=str(b.get('node_id','')); node=self.state['nodes'].get(nid)
+            task=self.state.get('registration_tasks',{}).get(nid,{})
+            pending=self.state['enroll_tokens'].get(nid)
+            # A request can fail before commit reaches the server. The edge's
+            # private receipt retains the original ticket so cleanup can prove
+            # it was NOT consumed (including an expired, still-unused ticket).
+            if (not node and b.get('success') is not True and isinstance(pending,dict) and
+                    pending.get('protocol') == 2 and isinstance(b.get('ticket'),str) and
+                    secrets.compare_digest(digest(pending.get('token','')),digest(b['ticket']))):
+                return 200, {'node_id':nid,'status':ticket_status(pending)}
+            if not node and task.get('status') == 'failed_cleaned' and secrets.compare_digest(task.get('cleanup_token_hash',''),digest(token)):
+                return 200, {'node_id':nid,'status':'failed_cleaned'}
+            if not node or not secrets.compare_digest(node.get('token_hash',''),digest(token)):
+                return 403, {'error':'invalid_node_token'}
+            success=b.get('success') is True
+            if success and node.get('registration_status') == 'installed':
+                return 200, {'node_id':nid,'status':task.get('status','observing')}
+            if (node.get('registration_status') not in ('provisioning','failed','installed') or
+                    (success and node.get('registration_status') == 'failed')):
+                return 409, {'error':'registration_already_completed'}
+            node.update(registration_status='installed' if success else 'failed',healthy=False,
+                        status='recovering' if success else 'registration_failed',success_streak=0,failure_streak=0)
+            node.pop('recovery_since',None)
+            task=self.state.setdefault('registration_tasks',{}).setdefault(nid,{'node_id':nid})
+            task.update(status='observing' if success else 'needs_cleanup',updated_at=now())
+            # Errors are deliberately generic; never persist API payloads/tokens.
+            task['last_error']='' if success else '边缘安装未完成；需先清理本机，再清理主控注册。'
+            self.save(); return 200, {'node_id':nid,'status':task['status']}
     def revoke(self, b, token):
         with self.lock, state_lock(self.path):
             self.reload()
             node_id = str(b.get('node_id',''))
             node = self.state['nodes'].get(node_id)
-            if not node or node.get('token_hash') != digest(token): return 403, {'error':'invalid_node_token'}
+            task=self.state.get('registration_tasks',{}).get(node_id,{})
+            if not node and task.get('status') == 'failed_cleaned' and secrets.compare_digest(task.get('cleanup_token_hash',''),digest(token)):
+                return 200, {'revoked_node':node_id}
+            if not node or not token_matches(node.get('token_hash'), token): return 403, {'error':'invalid_node_token'}
             self.state['nodes'].pop(node_id, None)
             self.state['enroll_tokens'].pop(node_id, None)
+            task=self.state.get('registration_tasks',{}).get(node_id)
+            if task: task.update(status='failed_cleaned',updated_at=now(),cleanup_token_hash=digest(token))
             if self.state.get('active_node') == node_id: self.state['active_node'] = None
             self.state['active_nodes']=[nid for nid in self.state.get('active_nodes',[]) if nid != node_id]
             self.save()
@@ -2523,7 +2642,8 @@ class Controller:
         quota = int(node.get('quota_bytes', 0))
         online = now() - int(node.get('last_seen', 0)) <= HEARTBEAT_TTL
         within = quota <= 0 or int(node.get('used_bytes', 0)) < quota
-        return bool(node.get('healthy') and online and within and
+        return bool(node.get('registration_status','installed') == 'installed' and
+                    node.get('healthy') and online and within and
                     (nid == current or node.get('status') != 'suspect'))
     def select(self):
         out=[]; current=self.state.get('active_node')
@@ -2940,6 +3060,7 @@ class Controller:
     def private_status(self):
         with self.lock, state_lock(self.path):
             self.reload(); result=copy.deepcopy(self.state); result['selected_node']=self.select()
+            result['registration_tasks']=registration_tasks(self.state)
             if self.weighted_pool_enabled():
                 result['selected_nodes']=[nid for _,nid in self.weighted_pool_assignments()]
             if (self.state.get('dns') or {}).get('provider') == 'dnspod':
@@ -3613,6 +3734,11 @@ class Handler(BaseHTTPRequestHandler):
                 except (ValueError,TypeError): secure=False
             if path == '/certificate':
                 code,result=self.server.controller.certificate(b,self.headers.get('Authorization','').removeprefix('Bearer ').strip(),secure=secure)
+            elif path == '/enroll/prepare': code,result=self.server.controller.prepare(b,secure=secure)
+            elif path == '/enroll/commit': code,result=self.server.controller.commit(b,secure=secure)
+            elif path == '/enroll/result':
+                if not secure: code,result=403,{'error':'ticket_requires_https'}
+                else: code,result=self.server.controller.registration_result(b,self.headers.get('Authorization','').removeprefix('Bearer ').strip())
             elif path == '/enroll':
                 if self.server.controller.state.get('certificates') and not secure:
                     code,result=403,{'error':'managed_certificates_require_https_registration'}
@@ -3828,9 +3954,68 @@ def auto_node_id(state, public_ip):
     base='edge-'+re.sub(r'[^A-Za-z0-9]+','-',str(public_ip).strip()).strip('-').lower()
     base=base if base != 'edge-' else 'edge-node'
     candidate=base; suffix=2
-    while candidate in state.get('nodes',{}) or candidate in state.get('enroll_tokens',{}):
+    while (candidate in state.get('nodes',{}) or candidate in state.get('enroll_tokens',{}) or
+           candidate in state.get('registration_tasks',{})):
         candidate='%s-%s' % (base,suffix); suffix+=1
     return candidate
+
+def registration_contract(state):
+    return {key:state.get(key, 'ipv4' if key == 'address_family' else 'caddy' if key == 'engine' else '')
+            for key in ('entry_id','domain','source','engine','address_family')}
+
+def registration_revision(state):
+    return digest(json.dumps(registration_contract(state),sort_keys=True,separators=(',',':')))
+
+def ticket_status(ticket):
+    if not isinstance(ticket,dict): return 'legacy'
+    status=ticket.get('status','pending')
+    if status == 'pending' and now() >= int(ticket.get('expires_at',int(ticket.get('issued_at',now()))+ENROLL_TTL)):
+        return 'expired'
+    return status
+def registration_status_label(status):
+    return {'pending':'待领取','expired':'已过期','provisioning':'安装中/待确认',
+            'observing':'健康观察中','ready':'已就绪','needs_cleanup':'安装失败，待清理',
+            'failed_cleaned':'失败已清理，可重新签发','revoked':'已撤销'}.get(status,status)
+
+def safe_ticket(ticket):
+    # Explicit allowlist: private CLI/status must never expose a reusable credential.
+    keys=('ticket_id','node_id','name','priority','quota_bytes','address_family','engine',
+          'issued_at','expires_at','updated_at','last_error','generation','controller_url','public_ip')
+    result={key:ticket[key] for key in keys if key in ticket} if isinstance(ticket,dict) else {}
+    result['status']=ticket_status(ticket)
+    result['status_label']=registration_status_label(result['status'])
+    return result
+
+def registration_tasks(state):
+    tasks={nid:safe_ticket(task) for nid,task in state.get('registration_tasks',{}).items()}
+    for nid,ticket in state.get('enroll_tokens',{}).items():
+        tasks[nid]=dict(safe_ticket(ticket),node_id=nid)
+    return tasks
+
+def print_registration_command(ticket):
+    values=['sudo','ep','controller','node-install','--controller-url',ticket['controller_url'],
+            '--ticket',ticket['token']]
+    if ticket.get('public_ip'): values += ['--public-ip',ticket['public_ip']]
+    bootstrap_url=os.environ.get('EMBY_PROXY_BOOTSTRAP_URL','https://raw.githubusercontent.com/wuuduf/emby-proxy/main/setup-emby-proxy.sh')
+    command=' '.join(shlex.quote(str(v)) for v in values)
+    # Test the real protocol capability, not merely the presence of node-install.
+    bootstrap='tmp=$(mktemp) && trap \'rm -f "$tmp"\' EXIT && curl -fsSL %s -o "$tmp" && sudo bash "$tmp" --manager-only && sudo ep controller node-install --help 2>&1 | grep -q -- "--ticket"' % shlex.quote(bootstrap_url)
+    print("(command -v ep >/dev/null 2>&1 && sudo ep controller node-install --help 2>&1 | grep -q -- '--ticket') || (bash -c %s) && %s" % (shlex.quote(bootstrap), command))
+    print('节点：%s · 票据只能使用一次，签发后 15 分钟失效；预检失败可用同一命令重试。' % ticket['node_id'])
+
+def registration_controller_url(state, value=''):
+    controller_url=str(value or state.get('controller_url') or '').strip()
+    if not controller_url:
+        control_domain=state.get('certificates',{}).get('control_domain') or state.get('control_domain','')
+        if control_domain:
+            controller_url='https://%s%s' % (control_domain,'' if state.get('controller_front_proxy') == 'caddy' else ':19090')
+    if not controller_url:
+        raise RuntimeError('请填写 --controller-url，或先在入口配置中设置独立主控域名。')
+    controller_url=validate_endpoint(controller_url,allow_http=False,label='票据主控 HTTPS URL')
+    if state.get('certificates') and urlparse(controller_url).hostname != state['certificates']['control_domain']:
+        raise RuntimeError('请使用已配置的主控 HTTPS 域名生成注册码。')
+    return controller_url
+
 def issue(a):
     path=Path(a.state)
     with state_lock(path):
@@ -3842,41 +4027,83 @@ def issue(a):
             raise RuntimeError('该入口已固定使用 %s，不能为单个节点混用 %s。' % (configured_family, address_family))
         # 菜单首次验证通过后会把地址保存到状态；CLI 省略参数时优先沿用
         # 该值，避免 DNSPod/Caddy HTTPS 主控被错误降级成旧的 HTTP 回退地址。
-        controller_url=str(getattr(a,'controller_url','') or '').strip()
-        if not controller_url:
-            controller_url=str(state.get('controller_url') or '').strip()
-        if not controller_url:
-            control_domain=state.get('certificates',{}).get('control_domain') or state.get('control_domain','')
-            if control_domain:
-                scheme='https' if state.get('certificates') else 'http'
-                controller_url='%s://%s:19090' % (scheme, control_domain)
-        if not controller_url:
-            raise RuntimeError('请填写 --controller-url，或先在入口配置中设置独立主控域名。')
-        controller_url=validate_endpoint(controller_url, allow_http=True, label='主控 URL')
-        if state.get('certificates'):
-            validate_endpoint(controller_url,allow_http=False,label='证书主控地址')
-            if urlparse(controller_url).hostname != state['certificates']['control_domain']:
-                raise RuntimeError('请使用已配置的主控 HTTPS 域名生成注册码。')
+        controller_url=registration_controller_url(state,getattr(a,'controller_url',''))
         node_id=(a.node_id or '').strip() or auto_node_id(state,a.public_ip)
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', node_id):
             raise RuntimeError('节点 ID 只能包含字母、数字、点、下划线、连字符或冒号。')
+        if node_id in state['nodes']:
+            raise RuntimeError('节点已注册，不能覆盖；请先清理失败注册或卸载旧节点。')
+        if node_id in state['enroll_tokens'] or node_id in state.get('registration_tasks',{}):
+            raise RuntimeError('节点已有注册票据；请使用 ticket-show / ticket-reissue / ticket-revoke 管理。')
+        priority,quota=validate_node_limits(a.priority,a.quota_bytes)
+        stamp=now()
         token=secrets.token_urlsafe(24)
-        state['enroll_tokens'][node_id]={'token':token,'issued_at':now(),'address_family':address_family}
+        ticket=dict(registration_contract(state),token=token,ticket_id=secrets.token_hex(16),
+                    protocol=2,node_id=node_id,name=''.join(c for c in str(a.name or node_id)[:128] if ord(c)>=32 and ord(c)!=127).strip() or node_id,priority=priority,
+                    quota_bytes=quota,public_ip=str(a.public_ip or ''),controller_url=controller_url,
+                    issued_at=stamp,expires_at=stamp+ENROLL_TTL,updated_at=stamp,status='pending',
+                    generation=1,revision=registration_revision(state))
+        state['enroll_tokens'][node_id]=ticket
+        state.setdefault('registration_tasks',{})[node_id]=safe_ticket(ticket)
         state['controller_url']=controller_url
         backup_file(path)
         atomic_write(path,state)
-    values=['sudo','ep','controller','node-install','--controller-url',controller_url,'--entry-id',state['entry_id'],'--node-id',node_id,'--name',a.name or node_id,'--priority',str(a.priority),'--quota-bytes',str(a.quota_bytes),'--address-family',address_family]
-    if a.public_ip: values += ['--public-ip',a.public_ip]
-    values += ['--enroll-token',token]
-    # 边缘 VPS 可以是全新机器或旧版管理器；命令先确保当前管理器具备 node-install，再注册。
-    # 旧管理器必须升级到带引擎预检的协议，再使用本次注册码。
-    bootstrap_url=os.environ.get('EMBY_PROXY_BOOTSTRAP_URL','https://raw.githubusercontent.com/wuuduf/emby-proxy/main/setup-emby-proxy.sh')
-    command=' '.join(shlex.quote(str(v)) for v in values)
-    # 旧版管理器可能已经包含早期 engine-preflight 标记，却还不认识
-    # IPv4/IPv6 的 --address-family；能力探测必须检查真实参数。
-    bootstrap='tmp=$(mktemp) && trap \'rm -f "$tmp"\' EXIT && curl -fsSL %s -o "$tmp" && sudo bash "$tmp" --manager-only && sudo ep controller node-install --help 2>&1 | grep -q -- "--address-family"' % shlex.quote(bootstrap_url)
-    print("(command -v ep >/dev/null 2>&1 && sudo ep controller node-install --help 2>&1 | grep -q -- '--address-family') || (bash -c %s) && %s" % (shlex.quote(bootstrap), command))
-    print("提示：注册码只能使用一次，签发后 15 分钟失效。")
+    print_registration_command(ticket)
+
+def ticket_show(a):
+    with state_lock(a.state):
+        state=json.loads(Path(a.state).read_text())
+        ticket=state.get('enroll_tokens',{}).get(a.node_id)
+        if not isinstance(ticket,dict) or ticket.get('protocol') != 2:
+            raise RuntimeError('没有可显示的新协议票据；旧票据请重新生成节点命令。')
+        if ticket_status(ticket) != 'pending': raise RuntimeError('票据已过期；请重新签发。')
+        if ticket.get('revision') != registration_revision(state):
+            raise RuntimeError('入口配置已改变；请重新签发票据。')
+    print_registration_command(ticket)
+
+def ticket_revoke(a):
+    with state_lock(a.state):
+        path=Path(a.state); state=json.loads(path.read_text())
+        if a.node_id in state.get('nodes',{}):
+            raise RuntimeError('节点已消费票据；不能用撤销票据代替卸载或失败清理。')
+        ticket=state.get('enroll_tokens',{}).get(a.node_id)
+        if ticket is None: raise RuntimeError('没有待领取的票据。')
+        backup_file(path)
+        task=dict(safe_ticket(ticket),node_id=a.node_id,status='revoked',updated_at=now())
+        state.setdefault('registration_tasks',{})[a.node_id]=task
+        state['enroll_tokens'].pop(a.node_id); atomic_write(path,state)
+    print('已撤销票据；原命令失效，未修改边缘服务。')
+
+def ticket_reissue(a):
+    with state_lock(a.state):
+        path=Path(a.state); state=json.loads(path.read_text())
+        if a.node_id in state.get('nodes',{}):
+            raise RuntimeError('节点仍存在；请先清理失败注册，不能直接替换正在运行的节点。')
+        previous=state.get('enroll_tokens',{}).get(a.node_id) or state.get('registration_tasks',{}).get(a.node_id)
+        if not isinstance(previous,dict) or not all(key in previous for key in ('priority','quota_bytes','controller_url')):
+            raise RuntimeError('旧票据缺少绑定配置，请重新添加节点。')
+        ticket=dict(safe_ticket(previous),**registration_contract(state))
+        ticket['controller_url']=registration_controller_url(state, state.get('controller_url') or previous['controller_url'])
+        ticket.update(protocol=2,node_id=a.node_id,token=secrets.token_urlsafe(24),ticket_id=secrets.token_hex(16),
+                      issued_at=now(),expires_at=now()+ENROLL_TTL,updated_at=now(),status='pending',
+                      generation=int(previous.get('generation',0))+1,revision=registration_revision(state),last_error='')
+        backup_file(path)
+        state.setdefault('enroll_tokens',{})[a.node_id]=ticket
+        state.setdefault('registration_tasks',{})[a.node_id]=safe_ticket(ticket)
+        atomic_write(path,state)
+    print_registration_command(ticket)
+
+def registration_cleanup(a):
+    """Local controller operator action, never an unauthenticated HTTP delete."""
+    with state_lock(a.state):
+        path=Path(a.state); state=json.loads(path.read_text()); node=state.get('nodes',{}).get(a.node_id)
+        if not node or node.get('registration_status') != 'failed':
+            raise RuntimeError('只允许清理明确上报安装失败的注册；运行中或待确认节点不会删除。')
+        backup_file(path); state['nodes'].pop(a.node_id)
+        state.setdefault('registration_tasks',{}).setdefault(a.node_id,{'node_id':a.node_id}).update(
+            status='failed_cleaned',updated_at=now(),cleanup_token_hash=node.get('token_hash',''))
+        atomic_write(path,state)
+    print('主控失败注册已清理；不会删除边缘文件，请先在边缘运行 ep controller node-cleanup。')
 def validate_interval(value):
     try: interval=int(value)
     except (TypeError, ValueError): raise RuntimeError('主控检查间隔必须是整数。')
@@ -4005,6 +4232,175 @@ def detect_edge_engine():
     return choices[0] if choices else ''
 
 def node_install(a):
+    if getattr(a,'ticket',''):
+        if os.geteuid() != 0: raise RuntimeError('node-install 需要 root 或 sudo')
+        with state_lock('/etc/emby-proxy/node-install'):
+            return node_install_ticket(a)
+    # Long-form v1 commands remain available only for previously issued v1 tokens.
+    for key in ('entry_id','node_id','name','priority','enroll_token'):
+        if getattr(a,key,None) in (None,''): raise RuntimeError('旧版安装命令缺少 --'+key.replace('_','-'))
+    return node_install_legacy(a)
+
+def edge_install_preflight(a,plan):
+    for command in ('bash','curl','systemctl','ss'):
+        if not shutil.which(command): raise RuntimeError('预检缺少 %s；请重新安装管理器补齐依赖，注册码未消耗。' % command)
+    for target in ('/etc/emby-proxy/multiline-node.json','/etc/emby-proxy/node-install-recovery.json'):
+        path=Path(target)
+        if path.exists() or path.is_symlink():
+            raise RuntimeError('本机已有节点或待清理安装；先检查 ep controller node-cleanup 或卸载旧节点，注册码未消耗。')
+    for unit in ('emby-proxy-node.service','emby-proxy-node.timer','emby-proxy-cert-sync.service','emby-proxy-cert-sync.timer'):
+        target=Path('/etc/systemd/system')/unit
+        if target.exists() or target.is_symlink():
+            raise RuntimeError('本机已有 %s；为避免覆盖原任务，先检查/清理旧安装，注册码未消耗。' % unit)
+        try:
+            loaded=subprocess.run(['systemctl','show','--property=LoadState','--value',unit],
+                                  capture_output=True,text=True,timeout=5,check=False)
+        except (OSError,subprocess.SubprocessError):
+            raise RuntimeError('无法检查现有服务单元；请先确认 systemd 正常，注册码未消耗。') from None
+        # Units may be provided by /usr/lib, generators, or a still-loaded
+        # transient instance. Checking /etc files alone would shadow them.
+        if loaded.stdout.strip() != 'not-found':
+            raise RuntimeError('现有服务单元 %s 已加载或无法确认归属；不会覆盖它，注册码未消耗。' % unit)
+    backend=Path('/usr/local/lib/emby-proxy/setup-emby-proxy.sh')
+    if not backend.is_file() or backend.is_symlink(): raise RuntimeError('预检未找到可信安装后端；请更新管理器，注册码未消耗。')
+    try:
+        help_result=subprocess.run(['bash',str(backend),'--help'],capture_output=True,text=True,check=False,timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        raise RuntimeError('无法执行安装后端预检；请确认后端脚本可读且依赖完整，注册码未消耗。') from None
+    if help_result.returncode != 0:
+        raise RuntimeError('安装后端帮助检查失败；请先更新或修复后端脚本，注册码未消耗。')
+    if '--node-preflight' not in help_result.stdout:
+        raise RuntimeError('安装后端版本过旧；请更新管理器与后端后重试，注册码未消耗。')
+    detected=detect_edge_engine()
+    if detected and detected != plan['engine']:
+        raise RuntimeError('边缘已有 %s，主控要求 %s；不会改装竞争引擎，注册码未消耗。' % (detected,plan['engine']))
+    result=subprocess.run(['bash',str(backend),'--node-preflight','--engine',plan['engine'],
+        '--domain',plan['domain'],'--domain-mode','subdomain','--upstream',plan['source'],
+        '--address-family',plan['address_family']],check=False)
+    if result.returncode: raise RuntimeError('边缘预检失败；修复系统、端口、源站或同名站点后，用原命令重试，注册码未消耗。')
+    return detected
+
+def cleanup_edge_receipt(receipt):
+    """Remove only files/units belonging to this failed install; retain receipt on any failure."""
+    if receipt.get('kind') != 'emby-proxy-install-recovery-v1' or not re.fullmatch(r'[0-9a-f]{32}',receipt.get('transaction','')):
+        raise RuntimeError('安装恢复记录无效，拒绝清理。')
+    nid=receipt['node_id']; domain=receipt['domain']; transaction=receipt['transaction']
+    if not re.fullmatch(r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]*',domain):
+        raise RuntimeError('恢复记录域名无效。')
+    controller_url=validate_endpoint(receipt['controller'],allow_http=False,label='恢复主控地址')
+    failure={'node_id':nid,'success':False,'ticket':receipt.get('enroll_ticket','')}
+    try: post_json(controller_url+'/enroll/result',failure,receipt['node_token'])
+    except RuntimeError: pass  # Continue local cleanup even while the controller is unreachable.
+    state_path=Path('/etc/emby-proxy/multiline-node.json')
+    if state_path.is_symlink(): raise RuntimeError('节点状态是符号链接，拒绝清理。')
+    if state_path.exists():
+        local=json.loads(state_path.read_text())
+        if local.get('registration_transaction') != transaction:
+            raise RuntimeError('本机节点已改变，拒绝删除其他安装。')
+    # Stop/remove only units stamped with this transaction, never by name alone.
+    changed=False
+    for unit in ('emby-proxy-node.timer','emby-proxy-node.service','emby-proxy-cert-sync.timer','emby-proxy-cert-sync.service'):
+        target=Path('/etc/systemd/system')/unit
+        if target.is_symlink(): raise RuntimeError('恢复目标是符号链接，拒绝清理：'+unit)
+        if not target.exists(): continue
+        if '# REGISTRATION TRANSACTION: '+transaction not in target.read_text():
+            raise RuntimeError('服务单元归属不匹配，已保留：'+unit)
+        subprocess.run(['systemctl','disable','--now',unit],check=True)
+        target.unlink(); changed=True
+    if changed: subprocess.run(['systemctl','daemon-reload'],check=True)
+    site=Path('/etc/emby-proxy/sites.d')/('domain-'+domain+'.json')
+    if site.is_symlink(): raise RuntimeError('站点索引是符号链接，拒绝清理。')
+    if site.exists():
+        indexed=json.loads(site.read_text())
+        expected_config='/etc/caddy/Caddyfile' if receipt['engine'] == 'caddy' else '/etc/nginx/conf.d/emby-proxy-'+domain+'.conf'
+        if (indexed.get('registration_transaction') != transaction or indexed.get('managed_kind') != 'standalone' or
+                indexed.get('domain') != domain or indexed.get('engine') != receipt['engine'] or
+                indexed.get('config_file') != expected_config or indexed.get('routes') != [{'path':'/','upstream':receipt['source']}]):
+            raise RuntimeError('站点已改变或并非本次安装创建，已保留配置，请人工检查。')
+        subprocess.run([manager_binary(),'delete','domain-'+domain],input='y\n',text=True,check=True)
+    else:
+        target=Path('/etc/caddy/Caddyfile' if receipt['engine'] == 'caddy' else '/etc/nginx/conf.d/emby-proxy-'+domain+'.conf')
+        if target.exists() and (receipt['engine'] != 'caddy' or '# BEGIN MANAGED EMBY REVERSE PROXY: '+domain in target.read_text()):
+            raise RuntimeError('检测到无索引的同名反代配置；已保留恢复记录，请人工核对后清理，不能猜测归属。')
+    state_path.unlink(missing_ok=True)
+    for name,present in receipt.get('usage_files_present',{}).items():
+        if name in ('used_bytes','usage.offset') and present is False:
+            target=Path('/var/lib/emby-proxy')/name
+            if target.is_symlink(): raise RuntimeError('计数文件是符号链接，拒绝清理。')
+            target.unlink(missing_ok=True)
+    # Cached valid certificates and backups are intentionally retained. They
+    # may be shared or referenced by a valid backend; no broad rm of TLS trees.
+    receipt['local_cleaned']=True
+    atomic_write('/etc/emby-proxy/node-install-recovery.json',receipt)
+    result=post_json(controller_url+'/enroll/result',failure,receipt['node_token'])
+    if result.get('status') not in ('pending','expired'):
+        post_json(controller_url+'/revoke',{'node_id':nid},receipt['node_token'])
+
+def node_cleanup(a):
+    if os.geteuid() != 0: raise RuntimeError('node-cleanup 需要 root 或 sudo。')
+    with state_lock('/etc/emby-proxy/node-install'):
+        path=Path('/etc/emby-proxy/node-install-recovery.json')
+        if path.is_symlink(): raise RuntimeError('恢复记录是符号链接，拒绝清理。')
+        if not path.exists():
+            print('没有待清理的边缘安装；运行中的节点不会删除。'); return
+        receipt=json.loads(path.read_text())
+        if receipt.get('status') == 'completed':
+            path.unlink(); print('已移除完成记录；保留正在运行的节点。'); return
+        cleanup_edge_receipt(receipt); path.unlink()
+    print('本次失败安装已清理。主控票据仍待领取时可用原命令重试；已消费或过期则重新签发。证书缓存和备份保留。')
+
+def node_install_ticket(a):
+    controller_url=validate_endpoint(a.controller_url,allow_http=False,label='票据主控地址')
+    # Lookup is authenticated by the ticket and remains read-only.
+    try: plan=post_json(controller_url+'/enroll/prepare',{'ticket':a.ticket})
+    except ControllerHTTPError as error:
+        if error.code in (404,405):
+            raise RuntimeError('主控未提供新注册接口；请先升级主控并重启 emby-proxy-master.service，同时核对主控 URL；本机未应用配置。') from None
+        if error.code in (403,410):
+            raise RuntimeError('票据无效或已过期；请回主控菜单 14 查看任务并重新签发，本机未应用配置。') from None
+        if error.code == 409:
+            raise RuntimeError('主控入口或注册任务已变化；请回主控菜单 14 检查，不能覆盖已注册节点，本机未应用配置。') from None
+        raise
+    for key in ('entry_id','node_id','domain','source','engine','address_family','revision','name','priority','quota_bytes'):
+        if key not in plan: raise RuntimeError('主控缺少票据协议字段；请先升级主控，注册码未消耗。')
+    if plan['engine'] not in ('caddy','nginx'): raise RuntimeError('主控引擎无效，注册码未消耗。')
+    family=normalize_address_family(plan['address_family'])
+    public_ip=resolve_edge_ipv4(a.public_ip) if family == 'ipv4' else resolve_edge_ip(a.public_ip,family)
+    detected=edge_install_preflight(a,plan)
+    token=secrets.token_urlsafe(32); transaction=secrets.token_hex(16)
+    receipt=dict(plan,kind='emby-proxy-install-recovery-v1',transaction=transaction,
+                 controller=controller_url,node_token=token,enroll_ticket=a.ticket,status='commit_pending',local_cleaned=False)
+    receipt['usage_files_present']={name:(Path('/var/lib/emby-proxy')/name).exists() for name in ('used_bytes','usage.offset')}
+    receipt_path=Path('/etc/emby-proxy/node-install-recovery.json')
+    atomic_write(receipt_path,receipt)  # Durable before commit; survives a lost response or a killed shell.
+    try:
+        try:
+            result=post_json(controller_url+'/enroll/commit',dict(ticket=a.ticket,revision=plan['revision'],
+                             public_ip=public_ip,address_family=family,detected_engine=detected,node_token=token))
+        except ControllerHTTPError as error:
+            if 400 <= error.code < 500:
+                receipt_path.unlink(); raise
+            raise
+        receipt['status']='provisioning'; atomic_write(receipt_path,receipt)
+        args=argparse.Namespace(controller_url=controller_url,entry_id=plan['entry_id'],node_id=plan['node_id'],
+            name=plan['name'],priority=plan['priority'],quota_bytes=plan['quota_bytes'],address_family=family,
+            public_ip=public_ip,enroll_token='',registration=result,transaction=transaction)
+        node_install_legacy(args)
+        post_json(controller_url+'/enroll/result',{'node_id':plan['node_id'],'success':True},token)
+        receipt['status']='completed'; atomic_write(receipt_path,receipt)
+        receipt_path.unlink()
+    except Exception:
+        if not receipt_path.exists(): raise  # Commit was definitively rejected before any local apply.
+        receipt['status']='needs_cleanup'; atomic_write(receipt_path,receipt)
+        try:
+            cleanup_edge_receipt(receipt); receipt_path.unlink()
+            print('本次失败安装已回滚；请查看主控注册任务：未消费可用原命令重试，已消费则重新签发。',file=sys.stderr)
+        except Exception:
+            print('安装未完成，恢复记录已私密保存。先在边缘执行 sudo ep controller node-cleanup；成功后回主控重新签发。',file=sys.stderr)
+        raise
+    print('边缘安装完成：%s；等待健康观察后才允许切流。' % plan['node_id'])
+
+def node_install_legacy(a):
     if os.geteuid() != 0: raise SystemExit('node-install 需要 root 或 sudo')
     controller_url=validate_endpoint(a.controller_url, allow_http=True, label='主控 URL')
     address_family=normalize_address_family(getattr(a,'address_family','ipv4'))
@@ -4020,7 +4416,7 @@ def node_install(a):
             raise RuntimeError('本机已有边缘节点 %s；一台 VPS 只支持一个 node-id，请先卸载旧节点再注册。' % old.get('node_id'))
     result=None; registered=False; node_backup=None; node_written=False; unit_backups=[]; unit_created=[]; certificate_before=None
     try:
-        result=post_json(controller_url+'/enroll',{'entry_id':a.entry_id,'node_id':a.node_id,'name':a.name,'priority':a.priority,'quota_bytes':a.quota_bytes,'enroll_token':a.enroll_token,'public_ip':a.public_ip,'address_family':address_family,'detected_engine':detected_engine,'version':'single-script-0.2'})
+        result=getattr(a,'registration',None) or post_json(controller_url+'/enroll',{'entry_id':a.entry_id,'node_id':a.node_id,'name':a.name,'priority':a.priority,'quota_bytes':a.quota_bytes,'enroll_token':a.enroll_token,'public_ip':a.public_ip,'address_family':address_family,'detected_engine':detected_engine,'version':'single-script-0.2'})
         registered=True
         engine=result.get('engine','caddy'); domain=result['domain']
         # 兼容旧主控：旧版可能忽略预检字段，仍必须在执行安装后端前阻止冲突。
@@ -4031,6 +4427,7 @@ def node_install(a):
         access_log='%s/emby-proxy-%s-access.log' % (log_root, domain)
         offset=Path('/var/lib/emby-proxy/usage.offset')
         state={'controller':controller_url,'entry_id':a.entry_id,'node_id':a.node_id,'node_token':result['node_token'],'domain':domain,'source':result['source'],'engine':engine,'public_ip':a.public_ip,'address_family':address_family,'used_file':str(used),'access_log':access_log,'usage_offset_file':str(offset),'telemetry_enabled':result.get('telemetry_enabled') is True}
+        if getattr(a,'transaction',''): state['registration_transaction']=a.transaction
         certificate_args=[]
         if result.get('certificate_managed'):
             state['certificate_directory']='/etc/emby-proxy-tls'
@@ -4045,7 +4442,8 @@ def node_install(a):
         if not backend.exists(): raise RuntimeError('未找到安装后端，请先用同一个 emby-proxy 脚本完成本机反代配置。')
         # 边缘节点的域名通常仍指向当前活动节点，不能因为 DNS 尚未切换就阻止预配置。
         # 只跳过安装阶段探测；参与选路前，心跳仍要求本机已有有效 HTTPS 证书。
-        setup_result=subprocess.run([str(backend),'--engine',state['engine'],'--domain',state['domain'],'--upstream',state['source'],'--address-family',address_family,'--skip-dns-check','--skip-verify']+certificate_args,check=False)
+        setup_result=subprocess.run([str(backend),'--engine',state['engine'],'--domain',state['domain'],'--domain-mode','subdomain','--upstream',state['source'],'--address-family',address_family,'--skip-dns-check','--skip-verify']+certificate_args,check=False,
+            env=dict(os.environ,EMBY_PROXY_REGISTRATION_TRANSACTION=getattr(a,'transaction','')))
         if setup_result.returncode != 0: raise RuntimeError('边缘反代预配置失败，请先修复本机 '+state['engine']+' 配置。')
         node_backup=backup_file(node_file); atomic_write(node_file,state); node_written=True; os.chmod(node_file,0o600)
         service_unit='# MANAGED EMBY CONTROLLER\n[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nTimeoutStartSec=25s\nNoNewPrivileges=true\nPrivateTmp=true\nProtectHome=true\nRestrictSUIDSGID=true\nLockPersonality=true\nRestrictNamespaces=true\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nLimitNOFILE=2048\nTasksMax=32\nUMask=0077\nExecStart=/usr/local/sbin/emby-proxy controller node --state /etc/emby-proxy/multiline-node.json\n'
@@ -4054,6 +4452,9 @@ def node_install(a):
         # expression is deterministic for a 30-second heartbeat and keeps
         # working after a service restart or a long VPS suspend/resume.
         timer_unit='# MANAGED EMBY CONTROLLER\n[Unit]\n[Timer]\nUnit=emby-proxy-node.service\nOnCalendar=*-*-* *:*:00,30\nAccuracySec=1s\nPersistent=true\n[Install]\nWantedBy=timers.target\n'
+        if getattr(a,'transaction',''):
+            marker='# REGISTRATION TRANSACTION: '+a.transaction+'\n'
+            service_unit=marker+service_unit; timer_unit=marker+timer_unit
         service_path=Path('/etc/systemd/system/emby-proxy-node.service'); timer_path=Path('/etc/systemd/system/emby-proxy-node.timer')
         if not service_path.exists(): unit_created.append('emby-proxy-node.service')
         if not timer_path.exists(): unit_created.append('emby-proxy-node.timer')
@@ -4065,7 +4466,7 @@ def node_install(a):
             subprocess.run(command,check=True)
         node_once(type('A',(),{'state':str(node_file)})())
         if certificate_args:
-            install_certificate_timer('emby-proxy-cert-sync',['node-cert-sync','--state',str(node_file)],'1h')
+            install_certificate_timer('emby-proxy-cert-sync',['node-cert-sync','--state',str(node_file)],'1h',transaction=getattr(a,'transaction',''))
     except Exception:
         if certificate_before:
             root,old,metadata,engine=certificate_before
@@ -4085,11 +4486,11 @@ def node_install(a):
         for unit_name in unit_created:
             _restore_systemd_state(unit_name,False,False)
         if node_written: restore_file(node_file,node_backup)
-        if registered and result and result.get('node_token'):
+        if registered and result and result.get('node_token') and not getattr(a,'registration',None):
             try: post_json(controller_url+'/revoke',{'node_id':a.node_id},result['node_token'])
             except Exception as revoke_error: print('提醒：注册回滚失败，请在主控删除节点 %s：%s' % (a.node_id,revoke_error),file=sys.stderr)
         raise
-    print('边缘节点注册成功：'+a.node_id)
+    if not getattr(a,'registration',None): print('边缘节点注册成功：'+a.node_id)
 def local_entry_health(st):
     """Verify this VPS serves its own HTTPS health route, not just a live daemon."""
     domain=str(st.get('domain','')).strip().lower().rstrip('.')
@@ -4437,6 +4838,9 @@ def main():
     x=sub.add_parser('set-schedule'); x.add_argument('--state',required=True); x.add_argument('--provider',choices=('cloudflare','dnspod'),default=''); x.add_argument('--slot',action='append',default=[]); x.set_defaults(fn=set_schedule)
     x=sub.add_parser('clear-schedule'); x.add_argument('--state',required=True); x.set_defaults(fn=clear_schedule)
     x=sub.add_parser('issue'); x.add_argument('--state',required=True); x.add_argument('--controller-url',default=''); x.add_argument('--node-id',default=''); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--address-family',choices=ADDRESS_FAMILIES,default=''); x.add_argument('--public-ip',default='',help='公网地址；省略时在边缘检测 (auto-ip)'); x.set_defaults(fn=issue)
+    for command,fn in (('ticket-show',ticket_show),('ticket-revoke',ticket_revoke),('ticket-reissue',ticket_reissue),('registration-cleanup',registration_cleanup)):
+        x=sub.add_parser(command); x.add_argument('--state',required=True); x.add_argument('--node-id',required=True); x.set_defaults(fn=fn)
+    x=sub.add_parser('tickets'); x.add_argument('--state',required=True); x.set_defaults(fn=lambda a: print(json.dumps(Controller(a.state).private_status()['registration_tasks'],ensure_ascii=False,indent=2)))
     x=sub.add_parser('serve'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=serve)
     x=sub.add_parser('master-install'); x.add_argument('--state',required=True); x.add_argument('--listen',default='127.0.0.1:19090'); x.add_argument('--reconcile-interval',type=int,default=30); x.set_defaults(fn=master_install)
     x=sub.add_parser('telegram-config'); x.add_argument('--state',required=True); x.add_argument('--token-file',required=True); x.add_argument('--chat-ids',required=True); x.add_argument('--persist-token',default=''); x.add_argument('--test',action='store_true'); x.set_defaults(fn=telegram_configure)
@@ -4444,7 +4848,8 @@ def main():
     x=sub.add_parser('telegram-disable'); x.add_argument('--state',required=True); x.set_defaults(fn=telegram_disable)
     x=sub.add_parser('telegram-status'); x.add_argument('--state',required=True); x.set_defaults(fn=telegram_status)
     x=sub.add_parser('telegram-serve'); x.add_argument('--state',required=True); x.set_defaults(fn=telegram_serve)
-    x=sub.add_parser('node-install', description='边缘安装：auto-ip / address-family / engine-preflight-cert-v1'); x.add_argument('--controller-url',required=True); x.add_argument('--entry-id',required=True); x.add_argument('--node-id',required=True); x.add_argument('--name',required=True); x.add_argument('--priority',type=int,required=True); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--address-family',choices=ADDRESS_FAMILIES,default='ipv4'); x.add_argument('--public-ip',default='',help='公网地址；省略时在边缘检测 (auto-ip)'); x.add_argument('--enroll-token',required=True); x.set_defaults(fn=node_install)
+    x=sub.add_parser('node-install', description='边缘安装：ticket-v2 / auto-ip / address-family / engine-preflight-cert-v1'); x.add_argument('--controller-url',required=True); x.add_argument('--ticket',default='',help='绑定主控配置的一次性注册票据'); x.add_argument('--entry-id',default=''); x.add_argument('--node-id',default=''); x.add_argument('--name',default=''); x.add_argument('--priority',type=int,default=None); x.add_argument('--quota-bytes',type=int,default=0); x.add_argument('--address-family',choices=ADDRESS_FAMILIES,default='ipv4'); x.add_argument('--public-ip',default='',help='公网地址；省略时在边缘检测 (auto-ip)'); x.add_argument('--enroll-token',default=''); x.set_defaults(fn=node_install)
+    x=sub.add_parser('node-cleanup',description='清理本机失败安装恢复记录，不删除运行中的边缘节点'); x.set_defaults(fn=node_cleanup)
     x=sub.add_parser('node'); x.add_argument('--state',default='/etc/emby-proxy/multiline-node.json'); x.set_defaults(fn=node_once)
     x=sub.add_parser('status'); x.add_argument('--state',required=True); x.set_defaults(fn=lambda a: print(json.dumps(Controller(a.state).private_status(),ensure_ascii=False,indent=2)))
     x=sub.add_parser('reconcile'); x.add_argument('--state',required=True); x.set_defaults(fn=lambda a: print(json.dumps(Controller(a.state).reconcile(),ensure_ascii=False)))
@@ -4808,7 +5213,85 @@ controller_issue_menu() {
   local -a args=(issue --state "$state" --controller-url "$controller_url" --name "$name" --priority "$priority" --quota-bytes "$quota" --address-family "$address_family")
   [[ -z "$public_ip" ]] || args+=(--public-ip "$public_ip")
   controller_cli "${args[@]}" || return 1
-  printf '\n复制上面整条命令到边缘 VPS 执行（含一次性注册码，请勿公开）。\n完成后选 4 查看节点是否收到心跳；选 6 排查主控日志。\n'
+  printf '\n复制上面整条命令到边缘 VPS 执行（含一次性注册码，请勿公开）。\n预检失败可在 15 分钟内用原命令重试；过期或安装后失败，选 14 查看任务、清理与重新签发。\n完成后选 4 查看健康观察和心跳；选 6 排查主控日志。\n'
+}
+
+controller_registration_detail_menu() {
+  local state="$1" node_id="$2" tasks task choice answer
+  while true; do
+    tasks="$(controller_cli tickets --state "$state")" || return 1
+    task="$(jq -ce --arg id "$node_id" '.[$id]' <<<"$tasks")" || return 0
+    ui_header "注册任务详情" "$node_id · 安装失败先清理边缘，再重新签发"
+    jq -r '"节点备注：" + (.name // .node_id // "未设置"),
+      "任务状态：" + (.status_label // .status),
+      "优先级：" + ((.priority // 0) | tostring) + " · 配额：" + ((.quota_bytes // 0) | tostring) + " bytes（0 不限额）",
+      "地址族：" + (.address_family // "未知") + " · 引擎：" + (.engine // "未知"),
+      (if .expires_at then "票据到期：" + (.expires_at | todateiso8601) else empty end),
+      (if (.last_error // "") != "" then "提示：" + .last_error else empty end)' <<<"$task"
+    printf '\n预检失败：修复后用原命令重试，不消耗票据。\n安装后失败：先在边缘执行 sudo ep controller node-cleanup；清理成功后再重新签发。\n'
+    ui_item 1 "再次显示安装命令" "仅有效且未消费的票据；请勿公开"
+    ui_item 2 "撤销未消费票据" "原命令失效，不修改边缘服务"
+    ui_item 3 "重新签发票据" "保留节点备注和配额，旧命令失效"
+    ui_item 4 "清理主控失败注册" "仅明确上报失败；不删除边缘文件"
+    ui_item 0 "返回任务列表" "q 也可返回"
+    ui_prompt; IFS= read -r choice || return 0
+    case "$choice" in
+      1) menu_run controller_cli ticket-show --state "$state" --node-id "$node_id" ;;
+      2|3|4)
+        answer=n
+        if [[ "$choice" == 4 ]]; then
+          warn "仅在边缘 node-cleanup 已完成本机清理、但主控仍残留失败注册时使用；不能替代边缘卸载。"
+          ui_read_field answer "确认已清理边缘，继续清理主控失败注册？y/n" n ui_valid_yes_no || continue
+        else
+          ui_read_field answer "确认操作？原安装命令将失效 y/n" n ui_valid_yes_no || continue
+        fi
+        [[ "$answer" =~ ^[Yy]$ ]] || continue
+        case "$choice" in
+          2) menu_run controller_cli ticket-revoke --state "$state" --node-id "$node_id" ;;
+          3) menu_run controller_cli ticket-reissue --state "$state" --node-id "$node_id" ;;
+          4) menu_run controller_cli registration-cleanup --state "$state" --node-id "$node_id" ;;
+        esac ;;
+      0|q|Q) return 0 ;;
+      *) warn "请输入有效序号。" ;;
+    esac
+  done
+}
+
+controller_registration_menu() {
+  local state tasks choice answer node_id
+  local -a ids=()
+  state="$(controller_state_path)"
+  while true; do
+    ui_header "节点注册任务" "查看状态 → 修复/清理 → 重新签发"
+    tasks='{}'; ids=()
+    if [[ -f "$state" ]]; then
+      tasks="$(controller_cli tickets --state "$state")" || return 1
+      while IFS= read -r node_id; do ids+=("$node_id"); done < <(jq -r 'keys[]' <<<"$tasks")
+      jq -r 'to_entries | sort_by(.key) | to_entries[] |
+        "  " + ((.key+1)|tostring) + "  " + .value.key + " · " + (.value.value.name // "未设置备注") +
+        " · " + (.value.value.status_label // .value.value.status)' <<<"$tasks"
+    fi
+    (( ${#ids[@]} )) || printf '  没有注册任务；添加节点请返回选 3。\n'
+    printf '\n请输入任务序号查看详情。列表不显示注册码。\n'
+    ui_item c "清理本机失败安装" "在失败的边缘 VPS 执行；不删除运行中的节点"
+    ui_item 0 "返回上一级" "q 也可返回"
+    ui_prompt; IFS= read -r choice || return 0
+    case "$choice" in
+      0|q|Q) return 0 ;;
+      c|C)
+        answer=n
+        ui_read_field answer "确认只清理本机未完成的节点安装？y/n" n ui_valid_yes_no || continue
+        [[ "$answer" =~ ^[Yy]$ ]] && menu_run controller_cli node-cleanup
+        ;;
+      *)
+        # Limit digits before arithmetic so huge input cannot overflow into a valid index.
+        if [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && (( choice <= ${#ids[@]} )); then
+          if ! controller_registration_detail_menu "$state" "${ids[choice-1]}"; then
+            warn "任务详情读取失败，已返回任务列表。"
+          fi
+        else warn "序号无效，请重新选择；0 返回。"; fi ;;
+    esac
+  done
 }
 
 controller_master_menu() {
@@ -4887,6 +5370,7 @@ controller_status_menu() {
     (if (.nodes // {} | length) == 0 then "还没有节点。选 3 生成注册命令，在边缘 VPS 上执行。" else empty end)
   ' <<<"$status" || return 1
   printf '\n心跳正常不等于媒体可播放；当前用量来自节点托管 JSON 访问日志的累计响应字节。\n'
+  printf '注册任务：%s 个；票据过期、安装中或失败清理请选 14 查看。\n' "$(jq -r '(.registration_tasks // {}) | length' <<<"$status")"
   printf '切换规则：连续失败 3 次；恢复需成功 3 次且持续 60 秒；健康节点间抢占冷却 180 秒。\n'
   printf '失联超过 90 秒或配额耗尽不等待冷却；DNS 确认不代表客户端缓存已刷新。\n'
 }
@@ -5293,11 +5777,13 @@ controller_quickstart_phase() {
     printf 'master'
     return 0
   fi
-  if [[ "$(jq -r '(.nodes // {}) | length' "$state" 2>/dev/null || printf 0)" == 0 ]]; then
+  if jq -e 'any((.nodes // {})[]; (.registration_status // "installed") == "installed")' "$state" >/dev/null 2>&1; then
+    printf 'ready'
+  elif jq -e '((.nodes // {}) | length) > 0 or ((.enroll_tokens // {}) | length) > 0 or ((.registration_tasks // {}) | length) > 0' "$state" >/dev/null 2>&1; then
+    printf 'registration'
+  else
     printf 'node'
-    return 0
   fi
-  printf 'ready'
 }
 
 controller_quickstart_next_step() {
@@ -5307,6 +5793,7 @@ controller_quickstart_next_step() {
     certificate) printf '下一步：配置主控 HTTPS；完成后边缘才能安全注册。\n' ;;
     master) printf '下一步：启动主控服务并确认主控 URL 可从边缘访问。\n' ;;
     node) printf '下一步：添加边缘节点；复制命令到每台边缘 VPS。\n' ;;
+    registration) printf '下一步：选 14 查看注册任务；继续执行原命令，或清理失败安装后重新签发。\n' ;;
     ready) printf '下一步：查看节点状态，确认 DNS 已回读，再配置流量策略。\n' ;;
     *) printf '下一步：运行控制器诊断。\n' ;;
   esac
@@ -5321,7 +5808,7 @@ controller_quickstart_menu() {
     case "$phase" in
       entry)
         printf '首次部署只需完成：业务域名、固定源站、DNS 提供商和地址族。\n'
-        printf '任一步输入 q 或遇到错误都会保留已写入的状态，不会创建半成品节点。\n\n'
+        printf '任一步输入 q 或遇到错误都会保留已写入的状态；未完成安装的节点不会投入切流。\n\n'
         if ! ( controller_init_menu ); then
           warn "入口配置没有完成；已保留原状态。"
         fi
@@ -5373,20 +5860,27 @@ controller_quickstart_menu() {
         controller_quickstart_next_step ready
         return 0
         ;;
+      registration)
+        printf '已生成注册任务，但边缘安装尚未完成；不会重复签发或将半成品节点当作就绪。\n'
+        controller_quickstart_next_step registration
+        return 0
+        ;;
     esac
   done
 }
 
 controller_menu() {
-  local choice quick_label quick_hint
+  local choice quick_label quick_hint record_type
   while true; do
     ui_header "多线路控制器 · 实验版" "1 开始/继续部署 → 8 自动证书/HTTPS → 3 接入节点"
     controller_menu_summary
     ui_section "推荐流程"
     if [[ -f "$(controller_state_path)" ]]; then
       quick_label="继续部署"; quick_hint="从当前阶段继续，不清空已完成配置"
+      record_type="$(jq -r 'if (.address_family // "ipv4") == "ipv6" then "AAAA" else "A" end' "$(controller_state_path)" 2>/dev/null || printf A)"
     else
       quick_label="开始部署"; quick_hint="按阶段完成入口、HTTPS、主控和节点"
+      record_type=A
     fi
     ui_item 1 "$quick_label" "$quick_hint"
     ui_item 8 "配置自动证书" "主控 HTTPS、签发续期、边缘领取"
@@ -5394,9 +5888,10 @@ controller_menu() {
     ui_section "日常管理"
     ui_item 2 "启动已有主控服务" "沿用已配置的服务；首次默认本机监听"
     ui_item 4 "节点状态与用量" "心跳、配额、当前节点"
+    ui_item 14 "节点注册任务" "票据状态、失败清理、重新签发"
     ui_item 5 "立即同步 DNS" "优先级选路，不中转媒体"
     ui_item 10 "DNSPod 运营商线路" "DNSPod：默认/电信/联通/移动"
-    ui_item 11 "Cloudflare 多节点权重" "多条 $(jq -r 'if (.address_family // "ipv4") == "ipv6" then "AAAA" else "A" end' "$(controller_state_path)") 记录、权重和健康摘除"
+    ui_item 11 "Cloudflare 多节点权重" "多条 ${record_type} 记录、权重和健康摘除"
     ui_item 12 "定时调度策略" "按时间切换 Cloudflare 权重或 DNSPod 线路"
     ui_item 13 "Telegram 通知与查询" "节点、流量、访问 IP、设备和源站"
     ui_item 6 "服务状态与日志" "排查主控启动问题"
@@ -5410,6 +5905,7 @@ controller_menu() {
       2) menu_run controller_master_menu ;;
       3) menu_run controller_issue_menu ;;
       4) menu_run controller_status_menu ;;
+      14) menu_run controller_registration_menu ;;
       5) menu_run controller_reconcile_menu ;;
       10) controller_dnspod_menu ;;
       11) menu_run controller_pool_menu ;;

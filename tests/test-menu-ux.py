@@ -238,6 +238,63 @@ class MenuUX(unittest.TestCase):
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertIn('继续部署', resumed.stdout)
 
+    def test_registration_menu_retries_invalid_selection_and_show_failure(self):
+        self.data['registration_tasks'] = {'edge-a': dict(node_id='edge-a', name='线路 A',
+            status='pending', priority=100, quota_bytes=1024, expires_at=int(time.time())+900,
+            token='SECRET_TICKET')}
+        self.state.write_text(json.dumps(self.data))
+        r = self.run_menu('original_cli="$(declare -f controller_cli)"; '
+                          'eval "${original_cli/controller_cli ()/real_controller_cli ()}"; '
+                          'controller_cli() { if [[ "$1" == ticket-show ]]; then echo SHOW_FAILED; return 1; '
+                          'else real_controller_cli "$@"; fi; }; controller_registration_menu; echo RETURNED',
+                          '99\n1\n1\n0\n0\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('序号无效', r.stderr)
+        self.assertIn('SHOW_FAILED', r.stdout)
+        self.assertGreaterEqual(r.stdout.count('注册任务详情'), 2)
+        self.assertNotIn('SECRET_TICKET', r.stdout+r.stderr)
+        self.assertIn('RETURNED', r.stdout)
+
+    def test_registration_reissue_confirmation_and_local_cleanup_cancel(self):
+        self.data['registration_tasks'] = {'edge-a': dict(node_id='edge-a', status='revoked')}
+        self.state.write_text(json.dumps(self.data))
+        code = 'controller_cli() { if [[ "$1" == tickets ]]; then jq .registration_tasks "$EMBY_PROXY_STATE_HOME/controller.json"; '
+        code += 'else printf "ARG:%s\\n" "$@"; fi; }; controller_registration_menu'
+        r = self.run_menu(code, '1\n3\nn\n3\ny\n0\nc\nn\n0\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.count('ARG:ticket-reissue'), 1)
+        self.assertIn('ARG:--node-id\nARG:edge-a', r.stdout)
+        self.assertNotIn('ARG:node-cleanup', r.stdout)
+
+    def test_edge_can_reach_cleanup_from_controller_menu_without_controller_state(self):
+        self.state.unlink()
+        r = self.run_menu('systemctl() { return 3; }; controller_cli() { printf "ARG:%s\\n" "$@"; }; '
+                          'controller_menu; echo RETURNED', '14\nc\ny\n0\n0\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('ARG:node-cleanup', r.stdout)
+        self.assertIn('RETURNED', r.stdout)
+        self.assertNotIn('jq: error', r.stderr)
+
+    def test_quickstart_pending_registration_does_not_issue_another_ticket(self):
+        self.data.update(dns={'provider':'dnspod'}, controller_url='https://control.example.com',
+                         controller_front_proxy='caddy', enroll_tokens={'edge-a': {'protocol':2, 'status':'pending'}})
+        self.state.write_text(json.dumps(self.data))
+        r = self.run_menu('systemctl() { return 0; }; controller_issue_menu() { echo SHOULD_NOT_ISSUE; }; '
+                          'controller_quickstart_menu')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('SHOULD_NOT_ISSUE', r.stdout)
+        self.assertIn('选 14', r.stdout)
+
+    def test_quickstart_unfinished_registration_is_not_ready(self):
+        self.data.update(dns={'provider':'dnspod'}, controller_url='https://control.example.com', controller_front_proxy='caddy',
+                         nodes={'edge-a': {'registration_status':'provisioning'}})
+        self.state.write_text(json.dumps(self.data))
+        r = self.run_menu('systemctl() { return 0; }; controller_quickstart_menu')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('至少一个节点已配置', r.stdout)
+        self.assertIn('尚未完成', r.stdout)
+        self.assertIn('选 14', r.stdout)
+
     def test_master_defaults_no_status_question(self):
         r = self.run_menu('controller_cli() { printf "ARG:%s\\n" "$@"; }; '
                           'systemctl() { echo SERVICE_STATUS; }; controller_master_menu', '\n\n')

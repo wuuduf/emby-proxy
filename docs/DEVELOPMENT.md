@@ -56,6 +56,7 @@ PY
 | 防抖与确认 | `test-controller-failover.py` | 恢复窗口、冷却、引擎冲突、Cloudflare 回读；无真实 systemd/DNS 修改 |
 | 状态机 | `test-controller-model.py` | 固定时钟下注册、配额、优先级、DNS 失败重试；禁止出网 |
 | 回环服务 | `test-controller.sh` | 真实 Python 服务与 CLI 并发写状态，监听 127.0.0.1 |
+| 注册事务 | `test-registration.py`、`test-node-preflight.sh`、菜单回归 | CLI 票据生命周期、回环 HTTP 两阶段注册/并发消费、错误恢复、事务归属与菜单重试；OS/网络写入隔离，不连接 VPS |
 | 实机验收 | 用户单独授权后执行 | 真正的 systemd、Caddy/Nginx、DNS、TLS 和媒体播放 |
 
 `.github/workflows/check.yml` 配置 Ubuntu 22.04/24.04 与 macOS 验证。同一 `scripts/check.py` 本地与 CI 共用。

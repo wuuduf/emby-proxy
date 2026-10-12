@@ -136,6 +136,14 @@ sudo emby-proxy logs <入口ID> --follow
 sudo emby-proxy stats <入口ID> --since 24h
 ```
 
+多线路控制器仍是实验功能。推荐先在主控配置 HTTPS，再从“多线路控制器 → 14 节点注册任务”签发一次性命令；边缘节点会依次执行只读预检、提交注册、安装和健康观察。预检失败可直接重试原命令，安装中断时先在边缘执行：
+
+```bash
+sudo ep controller node-cleanup
+```
+
+清理成功后回主控重新签发票据。票据只通过 HTTPS 使用、15 分钟失效且不能重复消费；主控只做节点注册、心跳、选路和 DNS 切换，不转发媒体流量。
+
 更新成功后，交互终端会自动打开新版本菜单；不会重启 Caddy/Nginx，也不会中断正在播放的媒体。
 
 ## 安全卸载
@@ -174,6 +182,8 @@ python3 scripts/check.py          # 完整回归
 ```
 
 需要 Python 3.9+、Bash、jq、curl 和常规 Unix 工具。完整测试结果写入 `.test-results/`。
+
+最近一次本地回归（2026-10-12）：**24/24 测试套件通过**，包含 26 项注册票据测试、40 项菜单 UX 测试、IPv4/IPv6、Caddy/Nginx、失败清理和并发提交。该结果不代表真实 VPS、DNS、ACME 或 Emby 播放验收；实机测试请按 [`docs/TESTING.md`](docs/TESTING.md) 执行。
 
 ## 许可证
 

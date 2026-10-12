@@ -324,7 +324,7 @@ class ControllerTests(unittest.TestCase):
         self.assertIn('edge-node', pending)
         self.assertIn('edge-node-2', pending)
         self.assertNotIn('--public-ip', out.getvalue())
-        self.assertIn("grep -q -- '--address-family'", out.getvalue())
+        self.assertIn("grep -q -- '--ticket'", out.getvalue())
         self.assertIn(') && sudo ep', out.getvalue())
 
     def test_issue_prefers_saved_controller_url_over_domain_fallback(self):
@@ -348,8 +348,8 @@ class ControllerTests(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             ns['issue'](args)
-        self.assertIn('--controller-url http://control.example.com:19090', out.getvalue())
-        self.assertEqual(json.loads(self.path.read_text())['controller_url'], 'http://control.example.com:19090')
+        self.assertIn('--controller-url https://control.example.com:19090', out.getvalue())
+        self.assertEqual(json.loads(self.path.read_text())['controller_url'], 'https://control.example.com:19090')
 
     def test_edge_ip_detection_is_bounded_and_tls_verified(self):
         with patch.object(ns['subprocess'], 'run', return_value=SimpleNamespace(stdout='8.8.8.8\n')) as run:
@@ -387,7 +387,8 @@ class ControllerTests(unittest.TestCase):
         self.assertIn('address_family', result['error'])
 
     def test_edge_detection_failure_does_not_consume_registration(self):
-        args = SimpleNamespace(controller_url='https://control.example.com', public_ip='', node_id='edge-node')
+        args = SimpleNamespace(controller_url='https://control.example.com', public_ip='', node_id='edge-node',
+                               entry_id='domain-test.example.com',name='fixture',priority=100,enroll_token='fixture')
         with patch.object(ns['os'], 'geteuid', return_value=0), \
              patch.dict(ns, resolve_edge_ipv4=Mock(side_effect=RuntimeError('detect failed')), post_json=Mock()) as _:
             with self.assertRaisesRegex(RuntimeError, 'detect failed'):

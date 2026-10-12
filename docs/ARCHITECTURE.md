@@ -22,8 +22,12 @@ setup-emby-proxy.sh（无参数）
 **多线路实验控制面**：
 ```text
 controller init → 业务入口域名 + 可选独立主控域名 → controller.json
-controller issue → 一次性注册命令（默认不携带边缘 IP）
-node-install → 边缘按入口地址族自动检测公网 IPv4/IPv6 / 本机引擎预检 → POST /enroll → 节点配置/服务/定时器
+controller issue → 绑定入口配置和节点策略的 15 分钟票据 → 一条安装命令
+node-install → HTTPS POST /enroll/prepare（只读）
+  → 边缘公网 IP / 系统 / 引擎 / 端口 / 源站 / 同名站点预检
+  → 私密恢复记录落盘 → HTTPS POST /enroll/commit（消费票据）
+  → 节点配置/服务/定时器 → POST /enroll/result（安装结果）
+  → 健康观察 → 允许进入候选
 node → POST /heartbeat → 健康、用量、last_seen
 serve 的周期 reconcile → 带防抖/冷却的 select → DNS Provider 写入 + API 回读确认
 ```
@@ -52,11 +56,14 @@ DNS Provider 目前有两种：Cloudflare 单 A/AAAA 记录主备/多记录权�
   索引不是运行中的 Web 配置；诊断时必须比较实际配置/服务。
 - `/etc/emby-proxy/backups/`：修改/更新前备份及校验信息。
 - `controller.json`：入口、待使用注册码、节点及 DNS 状态；进程锁+文件锁协调读写。
+- `registration_tasks`：票据代数、签发/到期时间及安装进度；CLI/菜单只输出字段白名单，不显示注册码或内部清理凭据哈希。
 - `multiline-node.json`：边缘节点与主控关系、节点令牌、用量文件路径。
+- `node-install-recovery.json`：边缘提交注册前落盘的 0600 恢复记录，包含票据、节点令牌和安装事务 ID。请求/响应丢失或进程终止后用 `node-cleanup` 恢复；不能把该文件公开或纳入普通日志。
 - `/var/lib/emby-proxy/used_bytes`：边缘从托管 Caddy/Nginx JSON 访问日志累计的响应字节；`usage.offset` 使用 v2 原子检查点记录累计值、日志 inode/device、偏移和上下文指纹，兼容旧格式并补偿保留的轮转归档。
 - `/status` 只用于添加节点时核对入口 ID，只返回入口 ID 和域名；完整节点状态仅由本机 CLI 读取。仍应放在 HTTPS、WireGuard 或 IP 白名单之后。
 - `/reconcile` 不再提供公网 POST 路由；主控服务直接调用本地状态机，避免未认证请求触发 DNS 变更。
 - `/revoke` 只接受已注册节点令牌，用于边缘安装事务失败时撤销刚建立的节点；主控不会提供未认证的节点删除接口。
+- 新票据只接受 HTTPS `prepare/commit/result`，不能经旧 `/enroll` 绕过策略绑定；旧长命令仅兼容此前签发的 v1 注册码。主控程序升级后需重启主控服务才能加载新路由，媒体 Web 服务不需要重启。
 - 同源 SHA256 清单用于检测文件一致性，不等同于独立签名或可信发布认证。
 
 ## 实验功能的实际边界
@@ -64,6 +71,7 @@ DNS Provider 目前有两种：Cloudflare 单 A/AAAA 记录主备/多记录权�
 `node_once` 当前同时检查 Web 服务进程和本机 `https://域名/_emby_proxy_health`（使用 `--resolve` 指向 127.0.0.1，保持 TLS 校验），**仍尚未证明源站或媒体播放正常**。
 边缘已形成基于 JSON 访问日志的累计读取和轮转处理，支持保留窗口内的多归档补偿；**仍没有账期重置或“只统计媒体响应”的精细口径**。
 控制器状态文件使用 0600；已有状态的 `init` 必须显式 `--force`，并先保存带时间戳的备份。注册码使用后删除，且 15 分钟后失效。
+新协议预检不消费票据；提交时在锁内再次检查 TTL、入口契约、引擎和地址族。已注册节点不能被新票据覆盖。安装失败退出候选并尝试清理，网络或归属检查失败保留恢复记录；只删除带本次事务标记的节点单元和严格匹配索引的入口。证书缓存、备份和诊断日志保留，不移除 Web 引擎或其他站点。`provisioning` 节点即使已发送心跳也不能参与切流，必须先完成安装，再经过原有健康观察。
 这些需要独立设计与回归，不应因为几个模拟切换测试通过就宣布生产可用。
 
 ## 可选集中证书

@@ -82,7 +82,7 @@ done
 grep -F 'domain-test.example.com' "$TMP_DIR/status.json" >/dev/null || fail "主控状态错误"
 for i in $(seq 1 8); do
   output="$(run_cli issue \
-    --state "$STATE" --controller-url "http://127.0.0.1:$PORT" \
+    --state "$STATE" --controller-url "https://control.example.com" \
     --node-id "edge-$i" --name "edge-$i" --priority "$i" \
     --quota-bytes 0 --public-ip "192.0.2.$i")"
   if [[ "$i" == 1 ]]; then
@@ -108,8 +108,43 @@ PY
 # CLI 也允许省略 --node-id，按公网 IPv4 生成可读且唯一的节点 ID。
 AUTO_STATE="$TMP_DIR/auto-issue.json"
 run_cli init --state "$AUTO_STATE" --domain auto.example.com --source https://origin.example.com --engine caddy >/dev/null
-auto_output="$(run_cli issue --state "$AUTO_STATE" --controller-url http://127.0.0.1:19090 --name auto --priority 1 --quota-bytes 0 --public-ip 192.0.2.99)"
-grep -F -- '--node-id edge-192-0-2-99' <<<"$auto_output" >/dev/null || fail "CLI 省略 node-id 时未自动生成"
+auto_output="$(run_cli issue --state "$AUTO_STATE" --controller-url https://control.example.com --name auto --priority 1 --quota-bytes 0 --public-ip 192.0.2.99)"
+grep -F -- '--ticket' <<<"$auto_output" >/dev/null || fail "CLI 未生成票据安装命令"
+python3 - "$AUTO_STATE" <<'PY'
+import json,sys
+assert 'edge-192-0-2-99' in json.load(open(sys.argv[1]))['enroll_tokens']
+PY
+
+# Exercise the actual CLI parser, not just Python function calls: private list,
+# same-command lookup, explicit rotation/revoke and invalid cleanup.
+run_cli tickets --state "$AUTO_STATE" >"$TMP_DIR/tickets.json"
+run_cli ticket-show --state "$AUTO_STATE" --node-id edge-192-0-2-99 >"$TMP_DIR/show.txt"
+python3 - "$AUTO_STATE" "$TMP_DIR/tickets.json" "$TMP_DIR/show.txt" <<'PY'
+import json,sys
+state=json.load(open(sys.argv[1])); token=state['enroll_tokens']['edge-192-0-2-99']['token']
+tasks=json.load(open(sys.argv[2])); assert tasks['edge-192-0-2-99']['status']=='pending'
+assert token not in json.dumps(tasks)
+assert token in open(sys.argv[3]).read()
+PY
+cp "$AUTO_STATE" "$TMP_DIR/before-reissue.json"
+run_cli ticket-reissue --state "$AUTO_STATE" --node-id edge-192-0-2-99 >"$TMP_DIR/reissue.txt"
+python3 - "$AUTO_STATE" "$TMP_DIR/before-reissue.json" <<'PY'
+import json,sys
+new=json.load(open(sys.argv[1]))['enroll_tokens']['edge-192-0-2-99']
+old=json.load(open(sys.argv[2]))['enroll_tokens']['edge-192-0-2-99']
+assert new['token']!=old['token'] and new['generation']==2
+PY
+run_cli ticket-revoke --state "$AUTO_STATE" --node-id edge-192-0-2-99 >/dev/null
+if run_cli ticket-show --state "$AUTO_STATE" --node-id edge-192-0-2-99 >"$TMP_DIR/revoked.log" 2>&1; then
+  fail "撤销的票据仍可显示"
+fi
+if run_cli registration-cleanup --state "$AUTO_STATE" --node-id nonexistent >"$TMP_DIR/cleanup.log" 2>&1; then
+  fail "允许清理非失败注册"
+fi
+! grep -F 'Traceback' "$TMP_DIR/cleanup.log" >/dev/null || fail "失败 CLI 泄露 traceback"
+for command in node-install node-cleanup tickets ticket-show ticket-revoke ticket-reissue registration-cleanup; do
+  run_cli "$command" --help >/dev/null || fail "注册命令帮助不可用：$command"
+done
 
 kill "$PID" 2>/dev/null || true
 wait "$PID" 2>/dev/null || true

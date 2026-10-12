@@ -50,6 +50,7 @@ python3 scripts/check.py --suite config-generation
 python3 scripts/check.py --suite controller-model
 python3 scripts/check.py --suite controller-failover
 python3 scripts/check.py --suite controller-certificates
+python3 scripts/check.py --suite registration --suite node-preflight
 
 # 真实本地回环控制器
 python3 scripts/check.py --suite controller
@@ -73,6 +74,32 @@ python3 scripts/check.py
 ```
 
 通过条件：所有测试套件退出码为 0，最后显示 `N/N suites passed`。日志和汇总在 `.test-results/`，该目录不提交仓库。
+
+### 2.4.1 最近一次本地结果
+
+2026-10-12 在固定审查点 `9088ea5` 到当前工作区的变更上完成回归：
+
+- `python3 tests/test-registration.py`：26 项通过；
+- `python3 tests/test-menu-ux.py`：40 项通过；
+- `python3 tests/test-controller-model.py`：42 项通过；
+- `python3 scripts/check.py --timeout 120`：24/24 测试套件通过；
+- Shell/Python 语法、发布 SHA256 和 `git diff --check` 通过。
+
+本次只使用本地隔离适配器，没有连接真实 VPS、DNS、CA 或源站；不能把该结果当作公网部署验收。
+
+### 2.5 注册票据与安装恢复
+
+本轮按三个入口回归：真实 controller CLI、回环注册 HTTP、真实 Bash 菜单；公网检测、systemd、安装后端与文件写入使用隔离适配器。重点覆盖：
+
+- `issue/tickets/ticket-show/ticket-revoke/ticket-reissue` 的参数解析、状态展示、过期和凭据轮换；列表不暴露票据或清理哈希；
+- `prepare` 不消费、不写状态，旧 `/enroll` 不能消费 v2 票据；错误地址族、引擎、TTL 和入口契约不建立节点；两个并发提交仅一个成功；
+- 预检失败、本机已有节点、同名站点/端口冲突不覆盖原服务、不消费票据；
+- 请求未送达、提交响应丢失、systemd 启动失败、完成/清理响应丢失，恢复记录可重试；明确拒绝的提交不留半成品记录；
+- 清理只针对本次事务；站点索引或服务归属变化时保留它们与恢复记录；运行节点没有失败记录时不删除；
+- IPv4/IPv6、Caddy/Nginx 注册路径、未完成节点不切流、安装完成后健康观察；
+- 菜单无效序号和动作失败回到当前菜单；撤销/重新签发需确认，边缘没有主控状态时仍可从菜单清理。
+
+这些测试不能证明真实 CA 签发、Web 服务加载、云防火墙和播放器已经通过。授权实机测试时，在独立测试节点再演练一次：预检端口冲突 → 原命令重试；票据过期 → 重新签发；安装中断 → `node-cleanup` → 重新签发；每次对比原站点仍正常，验证未完成节点始终没有进入业务 DNS。
 
 ## 3. 单机反代验收
 
