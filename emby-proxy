@@ -1724,7 +1724,7 @@ def migrate_state(state):
     entry.setdefault('address_family',state.get('address_family','ipv4'))
     control=state.setdefault('control',{})
     for key in ('control_domain','controller_url','controller_front_proxy'):
-        if key in state: control.setdefault(key,state[key])
+        if key in state: control[key]=state[key]
     state['provider']=copy.deepcopy(state.get('dns') or {})
     policy=state.setdefault('policy',{})
     policy['routing']=copy.deepcopy(state.get('routing') or {})
