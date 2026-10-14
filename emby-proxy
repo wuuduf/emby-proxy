@@ -1680,6 +1680,7 @@ def legacy_sync_scope(item):
     if item.get('confirmed_record_ips'):
         confirmed['records'] = dict(item['confirmed_record_ips'])
     if confirmed:
+        scope['desired'] = dict(confirmed)
         scope['applied'] = dict(confirmed)
         scope['confirmed'] = dict(confirmed)
     reason = item.get('reason')
@@ -1709,16 +1710,53 @@ def migrate_state(state):
             scopes[str(line)] = legacy_sync_scope(item)
         state['dns_sync']={'version':int(existing.get('version',1) or 1),'scopes':scopes}
         state['schema_version']=2
-    else:
-        dns_sync=state.setdefault('dns_sync',{})
-        dns_sync.setdefault('version',1)
-        scopes=dns_sync.setdefault('scopes',{})
-        scopes.setdefault('default',empty_sync_scope())
-        for name,value in list(scopes.items()):
-            if not isinstance(value,dict): scopes[name]=empty_sync_scope()
-        for scope in scopes.values():
-            for key,value in empty_sync_scope().items(): scope.setdefault(key,value)
+    dns_sync=state.setdefault('dns_sync',{})
+    dns_sync.setdefault('version',1)
+    scopes=dns_sync.setdefault('scopes',{})
+    scopes.setdefault('default',empty_sync_scope())
+    for name,value in list(scopes.items()):
+        if not isinstance(value,dict): scopes[name]=empty_sync_scope()
+    for scope in scopes.values():
+        for key,value in empty_sync_scope().items(): scope.setdefault(key,value)
+    entry=state.setdefault('entry',{})
+    entry.setdefault('id',state.get('entry_id','')); entry.setdefault('domain',state.get('domain',''))
+    entry.setdefault('source',state.get('source','')); entry.setdefault('engine',state.get('engine','caddy'))
+    entry.setdefault('address_family',state.get('address_family','ipv4'))
+    control=state.setdefault('control',{})
+    for key in ('control_domain','controller_url','controller_front_proxy'):
+        if key in state: control.setdefault(key,state[key])
+    state['provider']=copy.deepcopy(state.get('dns') or {})
+    policy=state.setdefault('policy',{})
+    policy['routing']=copy.deepcopy(state.get('routing') or {})
+    policy['schedule']=copy.deepcopy((state.get('dns') or {}).get('schedule') or [])
+    state.setdefault('audit',{})
+    state.setdefault('setup_step','ready' if state.get('nodes') else 'entry')
     return state
+def ensure_migration_backup(path, source_hash=''):
+    path=Path(path)
+    if path.exists() and not source_hash:
+        source_hash=hashlib.sha256(path.read_bytes()).hexdigest()
+    if source_hash:
+        for candidate in sorted(path.parent.glob(path.name+'.bak-*')):
+            try:
+                if hashlib.sha256(candidate.read_bytes()).hexdigest() == source_hash:
+                    return candidate
+            except OSError:
+                continue
+    return backup_file(path)
+def migrate_controller_state(path, state):
+    try: version=int(state.get('schema_version',1) or 1)
+    except (TypeError,ValueError): version=1
+    if version < 2:
+        source_hash=hashlib.sha256(Path(path).read_bytes()).hexdigest() if Path(path).exists() else ''
+        backup=ensure_migration_backup(path,source_hash)
+        state=migrate_state(state)
+        migration=state.setdefault('audit',{}).setdefault('schema_migration',{})
+        migration.update(from_version=version,to_version=2,migrated_at=now())
+        if backup:
+            migration.update(backup_path=str(backup),backup_sha256=hashlib.sha256(Path(backup).read_bytes()).hexdigest())
+        return state
+    return migrate_state(state)
 def sync_scope(state, name):
     migrate_state(state)
     scopes=state['dns_sync']['scopes']
@@ -1737,13 +1775,15 @@ def sync_update(state, name, desired=None, result=None, status=None):
         if result is not None:
             error=result.get('error') or result.get('errors') or result.get('skipped') or ('write not read back' if result.get('ok') is True else 'unconfirmed')
             scope['last_error']=str(error)[:512]
+        elif status in ('confirmed','unchanged','no_eligible_nodes'):
+            scope['last_error']=''
     scope['updated_at']=now()
     return scope
 def atomic_write(path, data):
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
     if (isinstance(data,dict) and 'entry_id' in data and 'domain' in data and
             ('nodes' in data or 'enroll_tokens' in data)):
-        data=migrate_state(data)
+        data=migrate_controller_state(path,data)
     # A fixed ``.tmp`` is both observable and racy when a heartbeat and the
     # long-running controller update the same state.  Create the file with its
     # private mode from the first byte, fsync it, then atomically replace the
@@ -2496,11 +2536,24 @@ def cert_renew(a):
 class Controller:
     def __init__(self, path):
         self.path = Path(path); self.lock = threading.RLock(); self.state = {}
+        self._migration_pending=False; self._migration_source_hash=''
         self.reload()
     def reload(self):
-        self.state = migrate_state(json.loads(self.path.read_text()))
+        raw=json.loads(self.path.read_text())
+        try: version=int(raw.get('schema_version',1) or 1)
+        except (TypeError,ValueError): version=1
+        self._migration_pending=version < 2
+        self._migration_source_hash=hashlib.sha256(self.path.read_bytes()).hexdigest() if self._migration_pending else ''
+        self.state = migrate_state(raw)
         self.state.setdefault('address_family', 'ipv4')
-    def save(self): atomic_write(self.path, migrate_state(self.state))
+    def save(self):
+        if self._migration_pending:
+            backup=ensure_migration_backup(self.path,self._migration_source_hash)
+            migration=self.state.setdefault('audit',{}).setdefault('schema_migration',{})
+            migration.update(from_version=1,to_version=2,migrated_at=now())
+            if backup: migration.update(backup_path=str(backup),backup_sha256=hashlib.sha256(Path(backup).read_bytes()).hexdigest())
+            self._migration_pending=False
+        atomic_write(self.path, self.state)
     def pending_ticket(self, credential):
         if not isinstance(credential,str) or not re.fullmatch(r'[A-Za-z0-9_-]{24,128}',credential):
             return None,None
@@ -2807,7 +2860,7 @@ class Controller:
             duplicate_error=self.cloudflare_pool_duplicate_error(assignments)
             result={'ok':False,'verified':False,'error':duplicate_error} if duplicate_error else self.update_dns_pool(assignments)
             sync_update(self.state,'default',desired=desired_sync,result=result,status='unconfirmed')
-            if result.get('ok'):
+            if result.get('ok') is True and result.get('verified') is True:
                 self.state['active_nodes']=desired; self.state['active_node']=desired[0]
                 self.state['confirmed_record_ips']=desired_ips; self.state['confirmed_dns_ip']=desired_ips.get(assignments[0][0])
                 self.state['dns_needs_confirmation']=False; self.state['dns_confirmed_at']=now()
@@ -3879,7 +3932,7 @@ def init_state(a):
             suffix += 1
         backup.write_bytes(path.read_bytes())
         os.chmod(backup, 0o600)
-    state={'schema_version':2,'entry_id':entry_id,'domain':domain,'source':source,'engine':a.engine,'address_family':address_family,'active_node':None,'active_nodes':[],'enroll_tokens':{},'nodes':{},'dns_sync':{'version':1,'scopes':{'default':empty_sync_scope()}}}
+    state={'schema_version':2,'entry_id':entry_id,'domain':domain,'source':source,'engine':a.engine,'address_family':address_family,'active_node':None,'active_nodes':[],'enroll_tokens':{},'nodes':{},'dns_sync':{'version':1,'scopes':{'default':empty_sync_scope()}},'entry':{'id':entry_id,'domain':domain,'source':source,'engine':a.engine,'address_family':address_family},'control':{},'provider':{},'policy':{'routing':{},'schedule':[]},'audit':{},'setup_step':'entry'}
     if control_domain: state['control_domain']=control_domain
     record_ids=[]
     raw_record_ids=str(getattr(a,'record_ids','') or '').strip()

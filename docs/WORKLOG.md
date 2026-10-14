@@ -2,7 +2,7 @@
 
 ## 2026-10-14：P2 状态与 DNS 同步收口（本地完成）
 
-- 控制器状态迁移到 schema v2，旧状态保留原字段并补齐 `dns_sync.scopes`；保存时可安全落盘，不改变旧 CLI/菜单读取路径。
+- 控制器状态迁移到 schema v2，首次写入前生成带 SHA256 的备份；旧状态保留原字段并补齐 `entry/control/provider/policy/nodes/audit` 与 `dns_sync.scopes`，不改变旧 CLI/菜单读取路径。
 - Cloudflare 单记录、Cloudflare 记录池和 DNSPod 线路统一记录 `desired / applied / confirmed / status / last_error`，DNS API 写入或回读失败时明确保持 `unconfirmed`，不把目标节点误报为已确认。
 - 新增状态迁移、Cloudflare 回读失败、DNSPod 线路确认回归；本轮只做本地隔离测试，尚未进行新一轮真实 VPS/DNS/ACME 验收。
 

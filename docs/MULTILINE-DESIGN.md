@@ -287,8 +287,8 @@ DNSPod 只在用户明确选择“运营商分流”时显示。向导先检查 
 
 ### P2：状态和 Provider 收口（第一步已实现）
 
-- schema v1 → v2 迁移；控制器保存旧状态时自动补齐迁移字段，并保留旧字段兼容；
-- DNS 同步统一记录 `desired / applied / confirmed / status / last_error`，覆盖 Cloudflare 单记录、Cloudflare 记录池和 DNSPod 线路；
+- schema v1 → v2 迁移；首次写入前生成带 SHA256 的备份，补齐 `entry/control/provider/policy/nodes/audit` 分区，并保留旧字段兼容；
+- DNS 同步统一记录 `desired / applied / confirmed / status / last_error`，覆盖 Cloudflare 单记录、Cloudflare 记录池和 DNSPod 线路；`applied` 在完成写入并通过回读确认后更新，无法确认时保留旧值；
 - 显式节点生命周期；
 - 普通 Cloudflare 隐藏伪权重。
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests of the actual embedded controller; never starts systemd or calls DNS."""
 import json
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -135,6 +136,13 @@ class ControllerTests(unittest.TestCase):
         controller.save()
         saved = json.loads(self.path.read_text())
         self.assertEqual(saved["schema_version"], 2)
+        self.assertEqual(saved['entry']['domain'], 'test.example.com')
+        self.assertEqual(saved['provider'], saved.get('dns', {}))
+        self.assertIn('routing', saved['policy'])
+        migration = saved["audit"]["schema_migration"]
+        backup = Path(migration["backup_path"])
+        self.assertTrue(backup.exists())
+        self.assertEqual(migration["backup_sha256"], hashlib.sha256(backup.read_bytes()).hexdigest())
         confirmed = saved["dns_sync"]["scopes"]["default"]["confirmed"]
         self.assertEqual(confirmed["node_id"], "edge-a")
         self.assertEqual(confirmed["ip"], "192.0.2.1")
@@ -528,8 +536,8 @@ class ControllerTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             ns["init_state"](args)
         backups = list(self.path.parent.glob("state.json.bak-*"))
-        self.assertEqual(len(backups), 1)
-        self.assertEqual(stat.S_IMODE(backups[0].stat().st_mode), 0o600)
+        self.assertEqual(len(backups), 2)
+        self.assertTrue(all(stat.S_IMODE(item.stat().st_mode) == 0o600 for item in backups))
 
     def test_reconcile_endpoint_is_not_publicly_mutable(self):
         handler = object.__new__(ns["Handler"])
