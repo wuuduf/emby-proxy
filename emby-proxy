@@ -1696,7 +1696,10 @@ def migrate_state(state):
     state.setdefault('schema_version',1)
     state.setdefault('enroll_tokens',{}); state.setdefault('nodes',{})
     state.setdefault('active_node',None); state.setdefault('active_nodes',[])
-    if int(state.get('schema_version',1) or 1) < 2:
+    try: state_version=int(state.get('schema_version',1) or 1)
+    except (TypeError,ValueError): state_version=1
+    legacy=state_version < 2
+    if legacy:
         existing=state.get('dns_sync') if isinstance(state.get('dns_sync'),dict) else {}
         scopes=dict(existing.get('scopes') or {})
         scopes.setdefault('default',legacy_sync_scope({
@@ -1719,16 +1722,20 @@ def migrate_state(state):
     for scope in scopes.values():
         for key,value in empty_sync_scope().items(): scope.setdefault(key,value)
     entry=state.setdefault('entry',{})
-    entry.setdefault('id',state.get('entry_id','')); entry.setdefault('domain',state.get('domain',''))
-    entry.setdefault('source',state.get('source','')); entry.setdefault('engine',state.get('engine','caddy'))
-    entry.setdefault('address_family',state.get('address_family','ipv4'))
+    if legacy or not entry:
+        entry.update(id=state.get('entry_id',''),domain=state.get('domain',''),source=state.get('source',''),
+                    engine=state.get('engine','caddy'),address_family=state.get('address_family','ipv4'))
+    else:
+        for key in ('id','domain','source','engine','address_family'): entry.setdefault(key,'')
     control=state.setdefault('control',{})
     for key in ('control_domain','controller_url','controller_front_proxy'):
-        if key in state: control[key]=state[key]
-    state['provider']=copy.deepcopy(state.get('dns') or {})
+        if legacy and key in state: control[key]=state[key]
+        elif key not in control and key in state: control[key]=state[key]
+    if legacy or 'provider' not in state:
+        state['provider']=copy.deepcopy(state.get('dns') or {})
     policy=state.setdefault('policy',{})
-    policy['routing']=copy.deepcopy(state.get('routing') or {})
-    policy['schedule']=copy.deepcopy((state.get('dns') or {}).get('schedule') or [])
+    if legacy or 'routing' not in policy: policy['routing']=copy.deepcopy(state.get('routing') or {})
+    if legacy or 'schedule' not in policy: policy['schedule']=copy.deepcopy((state.get('dns') or {}).get('schedule') or [])
     state.setdefault('audit',{})
     state.setdefault('setup_step','ready' if state.get('nodes') else 'entry')
     return state
@@ -1763,12 +1770,24 @@ def sync_scope(state, name):
     scope=scopes.setdefault(str(name),empty_sync_scope())
     for key,value in empty_sync_scope().items(): scope.setdefault(key,value)
     return scope
+def refresh_partitions_from_flat(state):
+    """Keep legacy writer fields and schema-v2 partitions in sync."""
+    migrate_state(state)
+    state['entry'].update(id=state.get('entry_id',''),domain=state.get('domain',''),source=state.get('source',''),
+                          engine=state.get('engine','caddy'),address_family=state.get('address_family','ipv4'))
+    for key in ('control_domain','controller_url','controller_front_proxy'):
+        if key in state: state['control'][key]=state[key]
+    state['provider']=copy.deepcopy(state.get('dns') or {})
+    state['policy']['routing']=copy.deepcopy(state.get('routing') or {})
+    state['policy']['schedule']=copy.deepcopy((state.get('dns') or {}).get('schedule') or [])
+    return state
 def sync_update(state, name, desired=None, result=None, status=None):
     scope=sync_scope(state,name)
     if desired is not None: scope['desired']=dict(desired)
     if result is not None and result.get('ok') is True and result.get('verified') is True:
         applied=dict(desired or scope.get('desired') or {})
-        scope['applied']=applied; scope['confirmed']=dict(applied)
+        snapshot=result.get('readback') or ({'records':result.get('readback_records')} if result.get('readback_records') else None)
+        scope['applied']=applied; scope['confirmed']=copy.deepcopy(snapshot or applied)
         scope['status']='confirmed'; scope['last_error']=''
     elif status:
         scope['status']=status
@@ -2943,7 +2962,8 @@ class Controller:
                     record.get('name','').lower().rstrip('.') == self.state['domain'].lower().rstrip('.') and
                     record.get('content') == ip and record.get('proxied') is False):
                 return {'ok':False,'error':'DNS read-back mismatch; retry on next reconcile'}
-            return {'ok':True,'content':ip,'record_id':record_id,'verified':True}
+            readback={key:record.get(key) for key in ('id','name','type','content','proxied','ttl')}
+            return {'ok':True,'content':ip,'record_id':record_id,'verified':True,'readback':readback}
         except (OSError, urllib.error.URLError, ValueError): return {'ok':False,'error':'Cloudflare DNS API 请求失败或响应格式无效'}
     def update_dns_pool(self, assignments):
         dns=self.state.get('dns') or {}
@@ -2952,15 +2972,15 @@ class Controller:
         try: token=Path(dns['token_file']).read_text().strip()
         except OSError as e: return {'ok':False,'error':str(e)}
         if not token: return {'ok':False,'error':'empty Cloudflare token file'}
-        records={}; errors={}
+        records={}; readback_records={}; errors={}
         for record_id,nid in assignments:
             ip=self.state['nodes'].get(nid,{}).get('public_ip')
             if not ip: errors[record_id]='selected node has no public_ip'; continue
             response=self.update_cloudflare_record(record_id,ip,token)
-            if response.get('ok'): records[record_id]=dict(response,node_id=nid)
+            if response.get('ok'): records[record_id]=dict(response,node_id=nid); readback_records[record_id]=response.get('readback',{})
             else: errors[record_id]=response.get('error','unconfirmed')
         return {'ok':bool(records) and not errors,'verified':bool(records) and not errors,
-                'records':records,'errors':errors}
+                'records':records,'readback_records':readback_records,'errors':errors}
     def update_dnspod(self, fallback):
         plans = self.line_plan()
         results = {}; errors = {}
@@ -3067,7 +3087,8 @@ class Controller:
             # DNSPod locks repeatedly submitted no-op writes; read first, even after
             # timeout/partial failure. Preserve user TTL instead of resetting it.
             if original.get('value') == ip:
-                return {'ok': True, 'verified': True, 'content': ip, 'unchanged': True}
+                return {'ok': True, 'verified': True, 'content': ip, 'unchanged': True,
+                        'readback':{key:original.get(key) for key in ('id','sub_domain','record_type','record_line','record_line_id','value','enabled','weight','monitor_status','ttl')}}
             snapshots = self.state.setdefault('dnspod_record_backups', [])
             snapshots.append({'at': now(), 'line': line, 'record': original})
             self.state['dnspod_record_backups'] = snapshots[-40:]
@@ -3078,9 +3099,11 @@ class Controller:
                       'ttl': int(original['ttl'])}
             if original.get('weight') not in (None, ''): params['weight'] = str(original['weight'])
             dnspod_call('Record.Modify', params, token)
-            if self.dnspod_record(line, token).get('value') != ip:
+            readback=self.dnspod_record(line, token)
+            if readback.get('value') != ip:
                 raise RuntimeError('DNSPod 回读 IP 不匹配，下轮重新读取后重试。')
-            return {'ok': True, 'verified': True, 'content': ip}
+            return {'ok': True, 'verified': True, 'content': ip,
+                    'readback':{key:readback.get(key) for key in ('id','sub_domain','record_type','record_line','record_line_id','value','enabled','weight','monitor_status','ttl')}}
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             return {'ok': False, 'error': 'DNSPod 线路未确认；检查凭据、记录身份、TTL/套餐及网络。'}
 
@@ -3089,14 +3112,14 @@ class Controller:
         if not assignments: return {'ok':False,'error':'no eligible node'}
         try:
             token=Path(dns['token_file']).read_text().strip()
-            records={str(r['id']):r for r in self.dnspod_records(line,token)}; results={}; errors={}
+            records={str(r['id']):r for r in self.dnspod_records(line,token)}; results={}; readback_records={}; errors={}
             for record_id,nid in assignments:
                 original=records.get(str(record_id)); ip=self.state['nodes'].get(nid,{}).get('public_ip')
                 if not original or not ip: errors[str(record_id)]='record or node IP unavailable'; continue
                 try: ip=str((ipaddress.IPv6Address if record_type == 'AAAA' else ipaddress.IPv4Address)(str(ip)))
                 except ValueError: errors[str(record_id)]='selected node IP does not match DNS record type'; continue
                 if original.get('value') == ip:
-                    results[str(record_id)]={'ok':True,'unchanged':True,'content':ip,'node_id':nid}; continue
+                    results[str(record_id)]={'ok':True,'unchanged':True,'content':ip,'node_id':nid}; readback_records[str(record_id)]=original; continue
                 params={'domain_id':dns['domain_id'],'record_id':str(record_id),'sub_domain':dns['sub_domain'],
                         'record_type':record_type,'record_line_id':original['record_line_id'],'value':ip,'ttl':int(original['ttl'])}
                 if original.get('weight') not in (None, ''): params['weight'] = str(original['weight'])
@@ -3104,8 +3127,10 @@ class Controller:
                 verified=self.dnspod_records(line,token)
                 check=next((item for item in verified if str(item.get('id'))==str(record_id)),{})
                 if check.get('value') != ip: errors[str(record_id)]='DNSPod 回读 IP 不匹配'
-                else: results[str(record_id)]={'ok':True,'content':ip,'node_id':nid,'verified':True}
-            return {'ok':bool(results) and not errors,'verified':bool(results) and not errors,'records':results,'errors':errors}
+                else:
+                    results[str(record_id)]={'ok':True,'content':ip,'node_id':nid,'verified':True}
+                    readback_records[str(record_id)]=check
+            return {'ok':bool(results) and not errors,'verified':bool(results) and not errors,'records':results,'readback_records':readback_records,'errors':errors}
         except (OSError,RuntimeError,ValueError,KeyError,TypeError):
             return {'ok':False,'error':'DNSPod 多记录未确认；检查凭据、记录身份、TTL/套餐及网络。'}
 
@@ -3171,9 +3196,10 @@ class Controller:
         # no eligible node. Clearing it after a partial success made the menu
         # claim DNS was fully synchronized and could delay a failed line's
         # retry until a later unrelated change.
+        active_lines={line for line in DNSPOD_LINES if self.dnspod_line_records(line)}
         self.state['dns_needs_confirmation'] = any(
-            bool(item.get('needs_confirmation')) or item.get('reason') in ('dns_unconfirmed', 'no_eligible_nodes')
-            for item in states.values())
+            bool(states.get(line,{}).get('needs_confirmation')) or states.get(line,{}).get('reason') in ('dns_unconfirmed', 'no_eligible_nodes')
+            for line in active_lines)
         default = states.get('默认') or {}
         self.state['active_node'] = default.get('active_node')
         self.state['confirmed_dns_ip'] = default.get('confirmed_ip')
@@ -3963,7 +3989,7 @@ def set_dns_routes(a):
         if routes != (dns.get('routes') or {}):
             # Explicit operator policy changes may override preemption cooldown.
             for previous in (state.get('line_states') or {}).values(): previous['last_switch_at']=0
-        dns['routes']=routes; state['dns']=dns; backup_file(path); atomic_write(path,state)
+        dns['routes']=routes; state['dns']=dns; refresh_partitions_from_flat(state); backup_file(path); atomic_write(path,state)
     print('DNSPod 线路路由已保存：'+json.dumps(routes,ensure_ascii=False,sort_keys=True))
 
 def set_dnspod_line_pool(a):
@@ -3983,7 +4009,7 @@ def set_dnspod_line_pool(a):
         unknown=sorted(set(weights)-set(state.get('nodes',{})))
         if unknown: raise RuntimeError('权重包含未注册节点：'+','.join(unknown))
         if not weights: raise RuntimeError('至少配置一个节点权重。')
-        backup_file(path); dns.setdefault('line_weights',{})[a.line]=weights; state['dns']=dns
+        backup_file(path); dns.setdefault('line_weights',{})[a.line]=weights; state['dns']=dns; refresh_partitions_from_flat(state)
         state['dns_needs_confirmation']=True; atomic_write(path,state)
     print('%s 线路权重已保存：%s' % (a.line,json.dumps(weights,ensure_ascii=False,sort_keys=True)))
 
@@ -4004,7 +4030,7 @@ def set_cloudflare_records(a):
             state.pop('routing', None)
             state['active_nodes'] = []
             state.pop('confirmed_record_ips', None)
-        state['dns_needs_confirmation']=True; atomic_write(path,state)
+        state['dns_needs_confirmation']=True; refresh_partitions_from_flat(state); atomic_write(path,state)
     print('Cloudflare 记录池已保存：'+','.join(record_ids))
 
 def set_pool_weights(a):
@@ -4025,7 +4051,7 @@ def set_pool_weights(a):
         if unknown: raise RuntimeError('权重包含未注册节点：'+','.join(unknown))
         if not weights: raise RuntimeError('至少配置一个节点权重。')
         backup_file(path); state['routing']={'mode':'weighted','weights':weights,'schedule':[]}
-        state['active_nodes']=[]; state['dns_needs_confirmation']=True; atomic_write(path,state)
+        state['active_nodes']=[]; state['dns_needs_confirmation']=True; refresh_partitions_from_flat(state); atomic_write(path,state)
     print('多节点权重已保存：'+json.dumps(weights,ensure_ascii=False,sort_keys=True))
 
 def parse_schedule_time(value):
@@ -4086,7 +4112,7 @@ def set_schedule(a):
             state['routing']={'mode':'weighted','weights':(state.get('routing') or {}).get('weights') or {},'schedule':slots}
         else:
             dns=state['dns']; dns['schedule']=slots; state['dns']=dns
-        state['dns_needs_confirmation']=True; state['last_switch_at']=0; atomic_write(path,state)
+        state['dns_needs_confirmation']=True; state['last_switch_at']=0; refresh_partitions_from_flat(state); atomic_write(path,state)
     print('定时调度已保存：%s 个时间档位（按主控服务器本地时间）' % len(slots))
 
 def clear_schedule(a):
@@ -4097,7 +4123,7 @@ def clear_schedule(a):
             state['dns'].pop('schedule',None)
         else:
             state.setdefault('routing',{}).pop('schedule',None)
-        state['dns_needs_confirmation']=True; state['last_switch_at']=0; atomic_write(path,state)
+        state['dns_needs_confirmation']=True; state['last_switch_at']=0; refresh_partitions_from_flat(state); atomic_write(path,state)
     print('定时调度已清除。')
 def auto_node_id(state, public_ip):
     base='edge-'+re.sub(r'[^A-Za-z0-9]+','-',str(public_ip).strip()).strip('-').lower()
@@ -4195,6 +4221,7 @@ def issue(a):
         state['enroll_tokens'][node_id]=ticket
         state.setdefault('registration_tasks',{})[node_id]=safe_ticket(ticket)
         state['controller_url']=controller_url
+        refresh_partitions_from_flat(state)
         backup_file(path)
         atomic_write(path,state)
     print_registration_command(ticket)

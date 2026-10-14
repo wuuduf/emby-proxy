@@ -183,7 +183,7 @@ python3 scripts/check.py          # 完整回归
 
 需要 Python 3.9+、Bash、jq、curl 和常规 Unix 工具。完整测试结果写入 `.test-results/`。
 
-最近一次本地回归（2026-10-12）：**24/24 测试套件通过**，包含 26 项注册票据测试、40 项菜单 UX 测试、IPv4/IPv6、Caddy/Nginx、失败清理和并发提交。该结果不代表真实 VPS、DNS、ACME 或 Emby 播放验收；实机测试请按 [`docs/TESTING.md`](docs/TESTING.md) 执行。
+最近一次本地回归（2026-10-14）：**24/24 测试套件通过**，包含 26 项注册票据测试、46 项控制器模型测试、29 项故障切换测试、40 项菜单 UX 测试、IPv4/IPv6、Caddy/Nginx、失败清理和并发提交。该结果不代表真实 VPS、DNS、ACME 或 Emby 播放验收；实机测试请按 [`docs/TESTING.md`](docs/TESTING.md) 执行。
 
 ## 许可证
 

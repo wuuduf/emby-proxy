@@ -83,6 +83,22 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(saved['schema_version'], 2)
         self.assertIn('default', saved['dns_sync']['scopes'])
 
+    def test_v2_partitions_survive_reload_and_save(self):
+        state = json.loads(self.path.read_text())
+        state.update(schema_version=2, dns={'provider':'cloudflare','zone_id':'legacy'},
+                     provider={'provider':'dnspod','domain_id':'partition'},
+                     policy={'routing':{'mode':'weighted'},'schedule':[{'start':'08:00'}]},
+                     entry={'id':'partition-entry','domain':'partition.example.com'},
+                     control={'controller_url':'https://control.partition.example.com'})
+        self.path.write_text(json.dumps(state))
+        controller = ns['Controller'](self.path)
+        controller.save()
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved['provider']['domain_id'], 'partition')
+        self.assertEqual(saved['policy']['routing']['mode'], 'weighted')
+        self.assertEqual(saved['entry']['id'], 'partition-entry')
+        self.assertEqual(saved['control']['controller_url'], 'https://control.partition.example.com')
+
     def test_enrollment_token_expires(self):
         body = dict(entry_id=self.state["entry_id"], node_id="edge-a", enroll_token="fixture-token")
         self.controller.state["enroll_tokens"]["edge-a"] = {"token": "fixture-token", "issued_at": 1000 - 901}
@@ -163,11 +179,13 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(scope["confirmed"], {})
         self.assertEqual(scope["status"], "unconfirmed")
         self.assertEqual(scope["last_error"], "readback failed")
-        with patch.object(self.controller, "update_dns", return_value={"ok": True, "verified": True}):
+        with patch.object(self.controller, "update_dns", return_value={"ok": True, "verified": True,
+                                                                          "readback":{"id":"record-a","name":"test.example.com","type":"A","content":"192.0.2.1","proxied":False}}):
             self.controller.reconcile()
         scope = self.controller.state["dns_sync"]["scopes"]["default"]
         self.assertEqual(scope["applied"], {"node_id": "edge-a", "ip": "192.0.2.1"})
-        self.assertEqual(scope["confirmed"], {"node_id": "edge-a", "ip": "192.0.2.1"})
+        self.assertEqual(scope["confirmed"]["content"], "192.0.2.1")
+        self.assertEqual(scope["confirmed"]["proxied"], False)
         self.assertEqual(scope["status"], "confirmed")
 
     def test_weighted_pool_expands_records_by_configured_ratio(self):

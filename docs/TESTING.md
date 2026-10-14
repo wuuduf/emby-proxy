@@ -81,8 +81,8 @@ python3 scripts/check.py
 
 - `python3 tests/test-registration.py`：26 项通过；
 - `python3 tests/test-menu-ux.py`：40 项通过；
-- `python3 tests/test-controller-model.py`：45 项通过；
-- `python3 tests/test-controller-failover.py`：28 项通过；
+- `python3 tests/test-controller-model.py`：46 项通过；
+- `python3 tests/test-controller-failover.py`：29 项通过；
 - `python3 scripts/check.py --timeout 120`：24/24 测试套件通过；
 - Shell/Python 语法、发布 SHA256 和 `git diff --check` 通过。
 

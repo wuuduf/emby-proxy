@@ -164,21 +164,24 @@ class FailoverTests(unittest.TestCase):
     def test_dnspod_reconcile_persists_per_line_failover(self):
         self.configure_dnspod()
         with patch.object(self.c, 'update_dnspod_line', side_effect=lambda line, ip:
-                          {'ok': True, 'verified': True, 'content': ip}):
+                          {'ok': True, 'verified': True, 'content': ip,
+                           'readback': {'record_line': line, 'value': ip}}):
             first=self.c.reconcile()
         self.assertEqual(first['reason'], 'dns_confirmed')
         self.assertEqual(self.c.state['line_states']['联通']['active_node'], 'b')
         self.c.state['nodes']['b']['healthy']=False
         self.c.save()
         with patch.object(self.c, 'update_dnspod_line', side_effect=lambda line, ip:
-                          {'ok': True, 'verified': True, 'content': ip}) as update:
+                          {'ok': True, 'verified': True, 'content': ip,
+                           'readback': {'record_line': line, 'value': ip}}) as update:
             second=self.c.reconcile()
         self.assertEqual(second['reason'], 'dns_confirmed')
         self.assertEqual(self.c.state['line_states']['联通']['active_node'], 'a')
         self.assertEqual(self.c.state['line_states']['移动']['active_node'], 'a')
         line_sync=self.c.state['dns_sync']['scopes']['联通']
         self.assertEqual(line_sync['desired'], {'node_id':'a','ip':'192.0.2.1'})
-        self.assertEqual(line_sync['confirmed'], {'node_id':'a','ip':'192.0.2.1'})
+        self.assertEqual(line_sync['confirmed']['record_line'], '联通')
+        self.assertEqual(line_sync['confirmed']['value'], '192.0.2.1')
         self.assertEqual(line_sync['status'], 'confirmed')
         self.assertGreaterEqual(update.call_count, 2)
 
@@ -221,6 +224,16 @@ class FailoverTests(unittest.TestCase):
             result = self.c.reconcile()
         self.assertEqual(result['reason'], 'dns_confirmed')
         self.assertEqual(self.c.state['line_states']['默认']['active_nodes'], ['a', 'b'])
+
+    def test_dnspod_stale_line_state_does_not_keep_global_retry_flag(self):
+        self.configure_dnspod()
+        self.c.state['line_states']={'旧线路': {'needs_confirmation': True, 'reason': 'dns_unconfirmed'}}
+        self.c.save()
+        with patch.object(self.c, 'update_dnspod_line', side_effect=lambda line, ip:
+                          {'ok': True, 'verified': True, 'content': ip,
+                           'readback': {'record_line': line, 'value': ip}}):
+            self.c.reconcile()
+        self.assertFalse(self.c.state['dns_needs_confirmation'])
 
     def test_dnspod_discovery_requires_all_operator_records(self):
         token=self.path.parent/'token'; token.write_text('12345,fixture-token')
