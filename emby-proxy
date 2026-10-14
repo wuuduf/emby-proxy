@@ -1665,8 +1665,85 @@ def manager_binary():
     if path.is_symlink() or not path.is_file():
         raise RuntimeError('未找到可用于清理的 emby-proxy 管理命令；请先修复管理器安装，恢复记录已保留。')
     return str(path)
+def empty_sync_scope():
+    return {'desired':{},'applied':{},'confirmed':{},'status':'unknown','last_error':'','updated_at':0}
+def legacy_sync_scope(item):
+    item = item if isinstance(item,dict) else {}
+    scope = empty_sync_scope()
+    confirmed = {}
+    if item.get('active_node'):
+        confirmed['node_id'] = item['active_node']
+    if item.get('confirmed_ip'):
+        confirmed['ip'] = item['confirmed_ip']
+    if item.get('active_nodes'):
+        confirmed['nodes'] = list(item['active_nodes'])
+    if item.get('confirmed_record_ips'):
+        confirmed['records'] = dict(item['confirmed_record_ips'])
+    if confirmed:
+        scope['applied'] = dict(confirmed)
+        scope['confirmed'] = dict(confirmed)
+    reason = item.get('reason')
+    scope['status'] = {'dns_confirmed':'confirmed','dns_unconfirmed':'unconfirmed',
+                       'no_eligible_nodes':'no_eligible_nodes'}.get(reason,
+                       'confirmed' if confirmed else 'unknown')
+    scope['last_error'] = ''
+    scope['updated_at'] = int(item.get('confirmed_at',0) or 0)
+    return scope
+def migrate_state(state):
+    """Upgrade controller state while retaining v1 fields for compatibility."""
+    if not isinstance(state,dict): raise ValueError('controller state must be an object')
+    state.setdefault('schema_version',1)
+    state.setdefault('enroll_tokens',{}); state.setdefault('nodes',{})
+    state.setdefault('active_node',None); state.setdefault('active_nodes',[])
+    if int(state.get('schema_version',1) or 1) < 2:
+        existing=state.get('dns_sync') if isinstance(state.get('dns_sync'),dict) else {}
+        scopes=dict(existing.get('scopes') or {})
+        scopes.setdefault('default',legacy_sync_scope({
+            'active_node':state.get('active_node'),
+            'active_nodes':state.get('active_nodes'),
+            'confirmed_ip':state.get('confirmed_dns_ip'),
+            'confirmed_record_ips':state.get('confirmed_record_ips'),
+            'confirmed_at':state.get('dns_confirmed_at'),
+            'reason':state.get('last_reconcile_reason')}))
+        for line,item in (state.get('line_states') or {}).items():
+            scopes[str(line)] = legacy_sync_scope(item)
+        state['dns_sync']={'version':int(existing.get('version',1) or 1),'scopes':scopes}
+        state['schema_version']=2
+    else:
+        dns_sync=state.setdefault('dns_sync',{})
+        dns_sync.setdefault('version',1)
+        scopes=dns_sync.setdefault('scopes',{})
+        scopes.setdefault('default',empty_sync_scope())
+        for name,value in list(scopes.items()):
+            if not isinstance(value,dict): scopes[name]=empty_sync_scope()
+        for scope in scopes.values():
+            for key,value in empty_sync_scope().items(): scope.setdefault(key,value)
+    return state
+def sync_scope(state, name):
+    migrate_state(state)
+    scopes=state['dns_sync']['scopes']
+    scope=scopes.setdefault(str(name),empty_sync_scope())
+    for key,value in empty_sync_scope().items(): scope.setdefault(key,value)
+    return scope
+def sync_update(state, name, desired=None, result=None, status=None):
+    scope=sync_scope(state,name)
+    if desired is not None: scope['desired']=dict(desired)
+    if result is not None and result.get('ok') is True and result.get('verified') is True:
+        applied=dict(desired or scope.get('desired') or {})
+        scope['applied']=applied; scope['confirmed']=dict(applied)
+        scope['status']='confirmed'; scope['last_error']=''
+    elif status:
+        scope['status']=status
+        if result is not None:
+            error=result.get('error') or result.get('errors') or result.get('skipped') or ('write not read back' if result.get('ok') is True else 'unconfirmed')
+            scope['last_error']=str(error)[:512]
+    scope['updated_at']=now()
+    return scope
 def atomic_write(path, data):
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    if (isinstance(data,dict) and 'entry_id' in data and 'domain' in data and
+            ('nodes' in data or 'enroll_tokens' in data)):
+        data=migrate_state(data)
     # A fixed ``.tmp`` is both observable and racy when a heartbeat and the
     # long-running controller update the same state.  Create the file with its
     # private mode from the first byte, fsync it, then atomically replace the
@@ -2421,9 +2498,9 @@ class Controller:
         self.path = Path(path); self.lock = threading.RLock(); self.state = {}
         self.reload()
     def reload(self):
-        self.state = json.loads(self.path.read_text())
-        self.state.setdefault('schema_version', 1); self.state.setdefault('address_family', 'ipv4'); self.state.setdefault('enroll_tokens', {}); self.state.setdefault('nodes', {}); self.state.setdefault('active_node', None); self.state.setdefault('active_nodes', [])
-    def save(self): atomic_write(self.path, self.state)
+        self.state = migrate_state(json.loads(self.path.read_text()))
+        self.state.setdefault('address_family', 'ipv4')
+    def save(self): atomic_write(self.path, migrate_state(self.state))
     def pending_ticket(self, credential):
         if not isinstance(credential,str) or not re.fullmatch(r'[A-Za-z0-9_-]{24,128}',credential):
             return None,None
@@ -2716,17 +2793,20 @@ class Controller:
     def reconcile_cloudflare_pool(self):
         assignments=self.weighted_pool_assignments(); previous=list(self.state.get('active_nodes') or [])
         if not assignments:
+            sync_update(self.state,'default',desired={},status='no_eligible_nodes')
             self.state['last_reconcile']=now(); self.state['last_reconcile_reason']='no_eligible_nodes'; self.save()
             return {'selected_nodes':[], 'active_nodes':previous, 'previous_nodes':previous,
                     'changed':False, 'reason':'no_eligible_nodes'}
         desired=[nid for _,nid in assignments]
         desired_ips={rid:self.state['nodes'][nid].get('public_ip') for rid,nid in assignments}
+        desired_sync={'nodes':desired,'records':desired_ips}
         confirmed=self.state.get('confirmed_record_ips') or {}
         needs=desired != previous or any(confirmed.get(rid) != ip for rid,ip in desired_ips.items()) or self.state.get('dns_needs_confirmation')
         result=None; reason='unchanged'
         if needs:
             duplicate_error=self.cloudflare_pool_duplicate_error(assignments)
             result={'ok':False,'verified':False,'error':duplicate_error} if duplicate_error else self.update_dns_pool(assignments)
+            sync_update(self.state,'default',desired=desired_sync,result=result,status='unconfirmed')
             if result.get('ok'):
                 self.state['active_nodes']=desired; self.state['active_node']=desired[0]
                 self.state['confirmed_record_ips']=desired_ips; self.state['confirmed_dns_ip']=desired_ips.get(assignments[0][0])
@@ -2736,6 +2816,8 @@ class Controller:
             else:
                 self.state['dns_needs_confirmation']=True; reason='dns_unconfirmed'
             self.state['last_dns_result']=result
+        else:
+            sync_update(self.state,'default',desired=desired_sync,status='confirmed')
         self.state['last_reconcile']=now(); self.state['last_reconcile_reason']=reason; self.save()
         return {'selected_nodes':desired, 'active_nodes':self.state.get('active_nodes',previous),
                 'previous_nodes':previous, 'changed':self.state.get('active_nodes',previous) != previous,
@@ -2750,9 +2832,11 @@ class Controller:
             ip=self.state['nodes'][selected].get('public_ip') if selected else None
             needs_update=bool(selected and (changed or self.state.get('confirmed_dns_ip') != ip or self.state.get('dns_needs_confirmation')))
             reason='no_eligible_nodes' if selected is None else 'unchanged'
+            desired_sync={'node_id':selected,'ip':ip} if selected else {}
             if needs_update:
                 dns_result=self.update_dns(selected)
-                if dns_result.get('ok') is True:
+                sync_update(self.state,'default',desired=desired_sync,result=dns_result,status='unconfirmed')
+                if dns_result.get('ok') is True and dns_result.get('verified') is True:
                     self.state['active_node']=selected; self.state['confirmed_dns_ip']=ip
                     self.state['dns_needs_confirmation']=False
                     self.state['dns_confirmed_at']=now()
@@ -2763,6 +2847,10 @@ class Controller:
                     self.state['dns_needs_confirmation']=True
                     reason='dns_unconfirmed'
                 self.state['last_dns_result']=dns_result
+            elif selected:
+                sync_update(self.state,'default',desired=desired_sync,status='confirmed')
+            else:
+                sync_update(self.state,'default',desired={},status='no_eligible_nodes')
             # active_node 只代表最近一次 API 回读确认的节点，不代表递归 DNS 缓存已刷新。
             self.state['last_reconcile']=now(); self.state['last_reconcile_reason']=reason; self.save()
             return {'selected_node':selected,'active_node':self.state.get('active_node'),'previous_node':previous,'changed':self.state.get('active_node') != previous,'reason':reason,'dns':dns_result}
@@ -2978,6 +3066,7 @@ class Controller:
             nid = plan['selected_node']; ip = plan['content']
             if not nid:
                 item['reason'] = 'no_eligible_nodes'; item['needs_confirmation'] = True
+                sync_update(self.state,line,desired={},status='no_eligible_nodes')
                 results[line] = dict(plan, reason=item['reason'])
                 continue
             if len(self.dnspod_line_records(line)) > 1:
@@ -2986,18 +3075,22 @@ class Controller:
                 previous_pool=item.get('active_nodes') or []
                 confirmed_pool=item.get('confirmed_record_ips') or {}
                 desired_ips={record_id:self.state['nodes'][node].get('public_ip') for record_id,node in assignments}
+                desired_sync={'nodes':desired,'records':desired_ips}
                 check=(desired != previous_pool or any(confirmed_pool.get(record_id) != value for record_id,value in desired_ips.items()) or
                        item.get('needs_confirmation') or self.state.get('dns_needs_confirmation'))
                 if check:
                     item['needs_confirmation']=True; self.save()
                     response=self.update_dnspod_pool(line,assignments); item['last_result']=response
-                    if response.get('ok') is True:
+                    sync_update(self.state,line,desired=desired_sync,result=response,status='unconfirmed')
+                    if response.get('ok') is True and response.get('verified') is True:
                         if desired != previous_pool: item['last_switch_at']=now()
                         item.update(active_nodes=desired, active_node=desired[0] if desired else None,
                                     confirmed_record_ips=desired_ips, confirmed_ip=desired_ips.get(assignments[0][0]) if assignments else None,
                                     confirmed_at=now(), needs_confirmation=False, reason='dns_confirmed')
                     else: item['reason']='dns_unconfirmed'
-                else: item['reason']='unchanged'
+                else:
+                    item['reason']='unchanged'
+                    sync_update(self.state,line,desired=desired_sync,status='confirmed')
                 results[line]=dict(plan, selected_nodes=desired, active_nodes=item.get('active_nodes',previous_pool),
                                    active_node=item.get('active_node'), reason=item['reason'])
                 self.save()
@@ -3010,12 +3103,15 @@ class Controller:
                 self.save()
                 response = self.update_dnspod_line(line, ip)
                 item['last_result'] = response
-                if response.get('ok') is True:
+                sync_update(self.state,line,desired={'node_id':nid,'ip':ip},result=response,status='unconfirmed')
+                if response.get('ok') is True and response.get('verified') is True:
                     if changed: item['last_switch_at'] = now()
                     item.update(active_node=nid, confirmed_ip=ip, confirmed_at=now(),
                                 needs_confirmation=False, reason='dns_confirmed')
                 else: item['reason'] = 'dns_unconfirmed'
-            else: item['reason'] = 'unchanged'
+            else:
+                item['reason'] = 'unchanged'
+                sync_update(self.state,line,desired={'node_id':nid,'ip':ip},status='confirmed')
             results[line] = dict(plan, active_node=item.get('active_node'), reason=item['reason'])
             self.save()  # partial success is explicit; only failed lines retry
         # Keep the global retry flag set while any line is unconfirmed or has
@@ -3783,7 +3879,7 @@ def init_state(a):
             suffix += 1
         backup.write_bytes(path.read_bytes())
         os.chmod(backup, 0o600)
-    state={'schema_version':1,'entry_id':entry_id,'domain':domain,'source':source,'engine':a.engine,'address_family':address_family,'active_node':None,'active_nodes':[],'enroll_tokens':{},'nodes':{}}
+    state={'schema_version':2,'entry_id':entry_id,'domain':domain,'source':source,'engine':a.engine,'address_family':address_family,'active_node':None,'active_nodes':[],'enroll_tokens':{},'nodes':{},'dns_sync':{'version':1,'scopes':{'default':empty_sync_scope()}}}
     if control_domain: state['control_domain']=control_domain
     record_ids=[]
     raw_record_ids=str(getattr(a,'record_ids','') or '').strip()

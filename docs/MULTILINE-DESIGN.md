@@ -285,10 +285,10 @@ DNSPod 只在用户明确选择“运营商分流”时显示。向导先检查 
 
 实现保持现有菜单编号，新增 `14 节点注册任务`；票据绑定固定入口和节点策略。边缘在提交前保存私密恢复记录，安装中的节点不进入候选。新协议与旧 `/enroll` 明确分流，旧命令只兼容已有 v1 票据。CLI、回环 HTTP 和真实 Bash 菜单均纳入本地回归；不代表真实 VPS/CA/DNS 已完成验收。schema v2 分区迁移和备用节点证书死锁仍在后续阶段。
 
-### P2：状态和 Provider 收口
+### P2：状态和 Provider 收口（第一步已实现）
 
-- schema v1 → v2 迁移；
-- `desired/applied` 与逐线路错误；
+- schema v1 → v2 迁移；控制器保存旧状态时自动补齐迁移字段，并保留旧字段兼容；
+- DNS 同步统一记录 `desired / applied / confirmed / status / last_error`，覆盖 Cloudflare 单记录、Cloudflare 记录池和 DNSPod 线路；
 - 显式节点生命周期；
 - 普通 Cloudflare 隐藏伪权重。
 

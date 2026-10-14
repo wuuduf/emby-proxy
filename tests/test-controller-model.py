@@ -72,6 +72,16 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(status, {"entry_id": "domain-test.example.com", "domain": "test.example.com"})
         self.assertNotIn("enroll_tokens", status)
 
+    def test_controller_write_paths_migrate_legacy_state(self):
+        args = SimpleNamespace(state=str(self.path), controller_url='https://control.example.com',
+                               node_id='edge-b', name='线路 B', priority=50, quota_bytes=0,
+                               public_ip='192.0.2.2', address_family='ipv4')
+        with redirect_stdout(io.StringIO()):
+            ns['issue'](args)
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved['schema_version'], 2)
+        self.assertIn('default', saved['dns_sync']['scopes'])
+
     def test_enrollment_token_expires(self):
         body = dict(entry_id=self.state["entry_id"], node_id="edge-a", enroll_token="fixture-token")
         self.controller.state["enroll_tokens"]["edge-a"] = {"token": "fixture-token", "issued_at": 1000 - 901}
@@ -112,8 +122,45 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(result["selected_node"], "edge-a")
             self.assertEqual(result["active_node"], "edge-b")
             dns.assert_called_once_with("edge-a")
-        with patch.object(self.controller, "update_dns", return_value={"ok": True}):
+        with patch.object(self.controller, "update_dns", return_value={"ok": True, "verified": True}):
             self.assertEqual(self.controller.reconcile()["active_node"], "edge-a")
+
+    def test_state_upgrade_preserves_legacy_dns_confirmation(self):
+        state = json.loads(self.path.read_text())
+        state.update(active_node="edge-a", confirmed_dns_ip="192.0.2.1",
+                     dns_confirmed_at=900, active_nodes=["edge-a"],
+                     confirmed_record_ips={"record-a": "192.0.2.1"})
+        self.path.write_text(json.dumps(state))
+        controller = ns["Controller"](self.path)
+        controller.save()
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["schema_version"], 2)
+        confirmed = saved["dns_sync"]["scopes"]["default"]["confirmed"]
+        self.assertEqual(confirmed["node_id"], "edge-a")
+        self.assertEqual(confirmed["ip"], "192.0.2.1")
+        self.assertEqual(confirmed["records"], {"record-a": "192.0.2.1"})
+
+    def test_dns_sync_separates_desired_from_confirmed_after_api_failure(self):
+        nodes = self.nodes()
+        nodes["edge-a"]["public_ip"] = "192.0.2.1"
+        self.controller.state["dns"] = dict(provider="cloudflare", record_id="record-a",
+                                             token_file=str(self.path.parent / "cf-token"))
+        (self.path.parent / "cf-token").write_text("fixture-token")
+        self.controller.save()
+        with patch.object(self.controller, "update_dns", return_value={"ok": False, "error": "readback failed"}):
+            result = self.controller.reconcile()
+        self.assertEqual(result["reason"], "dns_unconfirmed")
+        scope = self.controller.state["dns_sync"]["scopes"]["default"]
+        self.assertEqual(scope["desired"], {"node_id": "edge-a", "ip": "192.0.2.1"})
+        self.assertEqual(scope["confirmed"], {})
+        self.assertEqual(scope["status"], "unconfirmed")
+        self.assertEqual(scope["last_error"], "readback failed")
+        with patch.object(self.controller, "update_dns", return_value={"ok": True, "verified": True}):
+            self.controller.reconcile()
+        scope = self.controller.state["dns_sync"]["scopes"]["default"]
+        self.assertEqual(scope["applied"], {"node_id": "edge-a", "ip": "192.0.2.1"})
+        self.assertEqual(scope["confirmed"], {"node_id": "edge-a", "ip": "192.0.2.1"})
+        self.assertEqual(scope["status"], "confirmed")
 
     def test_weighted_pool_expands_records_by_configured_ratio(self):
         nodes = self.nodes()

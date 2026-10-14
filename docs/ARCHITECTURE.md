@@ -56,6 +56,7 @@ DNS Provider 目前有两种：Cloudflare 单 A/AAAA 记录主备/多记录权�
   索引不是运行中的 Web 配置；诊断时必须比较实际配置/服务。
 - `/etc/emby-proxy/backups/`：修改/更新前备份及校验信息。
 - `controller.json`：入口、待使用注册码、节点及 DNS 状态；进程锁+文件锁协调读写。
+- `controller.json` 的 `schema_version=2` 增加 `dns_sync.scopes`：每个默认入口或 DNSPod 线路记录 `desired`（选路目标）、`applied`（已写入目标）、`confirmed`（API 回读目标）、`status` 和 `last_error`；旧 v1 状态在控制器保存时迁移并保留旧字段，便于回滚和兼容旧菜单。
 - `registration_tasks`：票据代数、签发/到期时间及安装进度；CLI/菜单只输出字段白名单，不显示注册码或内部清理凭据哈希。
 - `multiline-node.json`：边缘节点与主控关系、节点令牌、用量文件路径。
 - `node-install-recovery.json`：边缘提交注册前落盘的 0600 恢复记录，包含票据、节点令牌和安装事务 ID。请求/响应丢失或进程终止后用 `node-cleanup` 恢复；不能把该文件公开或纳入普通日志。

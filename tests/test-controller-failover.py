@@ -48,7 +48,7 @@ class FailoverTests(unittest.TestCase):
             self.assertEqual(self.c.select(), 'a')
         self.beat(False)
         self.assertEqual(self.c.select(), 'b')
-        with patch.object(self.c, 'update_dns', return_value={'ok': True}):
+        with patch.object(self.c, 'update_dns', return_value={'ok': True, 'verified': True}):
             self.c.reconcile()
         self.c = ns['Controller'](self.path)
         for t in (1030, 1060, 1090):
@@ -176,6 +176,10 @@ class FailoverTests(unittest.TestCase):
         self.assertEqual(second['reason'], 'dns_confirmed')
         self.assertEqual(self.c.state['line_states']['联通']['active_node'], 'a')
         self.assertEqual(self.c.state['line_states']['移动']['active_node'], 'a')
+        line_sync=self.c.state['dns_sync']['scopes']['联通']
+        self.assertEqual(line_sync['desired'], {'node_id':'a','ip':'192.0.2.1'})
+        self.assertEqual(line_sync['confirmed'], {'node_id':'a','ip':'192.0.2.1'})
+        self.assertEqual(line_sync['status'], 'confirmed')
         self.assertGreaterEqual(update.call_count, 2)
 
     def test_dnspod_same_line_pool_updates_each_record_and_reads_back(self):
@@ -325,7 +329,7 @@ class FailoverTests(unittest.TestCase):
         opener=Mock(); opener.open=Mock(side_effect=[self.response({'success': True}), OSError('timeout')])
         with patch.object(ns['urllib'].request, 'build_opener', return_value=opener):
             self.assertEqual(self.c.reconcile()['active_node'], 'b')
-        with patch.object(self.c, 'update_dns', return_value={'ok': True}) as dns:
+        with patch.object(self.c, 'update_dns', return_value={'ok': True, 'verified': True}) as dns:
             self.assertEqual(self.c.reconcile()['active_node'], 'a')
             dns.assert_called_once_with('a')
 
@@ -343,7 +347,7 @@ class FailoverTests(unittest.TestCase):
             self.c.reconcile()
         self.c.state['nodes']['a']['healthy'] = False
         self.c.save()
-        with patch.object(self.c, 'update_dns', return_value={'ok': True}) as dns:
+        with patch.object(self.c, 'update_dns', return_value={'ok': True, 'verified': True}) as dns:
             self.c.reconcile()
             dns.assert_called_once_with('b')
 
@@ -351,7 +355,7 @@ class FailoverTests(unittest.TestCase):
         self.configure_dns()
         self.c.state['confirmed_dns_ip'] = '192.0.2.99'
         self.c.save()
-        with patch.object(self.c, 'update_dns', return_value={'ok': True}) as dns:
+        with patch.object(self.c, 'update_dns', return_value={'ok': True, 'verified': True}) as dns:
             self.c.reconcile()
             dns.assert_called_once_with('a')
         with patch.object(self.c, 'update_dns') as dns:
